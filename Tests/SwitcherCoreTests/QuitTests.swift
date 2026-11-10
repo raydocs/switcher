@@ -5,10 +5,8 @@ import Testing
 @Suite(.serialized) struct QuitTests {
     /// A fake app whose main program is not running but whose helper is (Antigravity's sidecars).
     @Test func helpersLeftAfterTheAppAreStopped() throws {
-        // Not under /var/folders: Foundation's symlink resolution drops its /private, the process list keeps it.
-        let build = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent(".build", isDirectory: true)
-        let root = build.appendingPathComponent("quit-test-\(UUID().uuidString)", isDirectory: true)
+        // Under /var/folders on purpose: its /private must still match what the process list reports.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("quit-test-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let app = root.appendingPathComponent("Fake.app", isDirectory: true)
         let helperDir = app.appendingPathComponent("Contents/Frameworks", isDirectory: true)

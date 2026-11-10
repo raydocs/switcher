@@ -71,9 +71,17 @@ public final class MacApp: AppController {
 
     public var isInstalled: Bool { bundleURL != nil }
 
+    /// The bundle's path as the process list reports programs: every link resolved, `/private` kept
+    /// (Foundation's `resolvingSymlinksInPath` drops it, so nothing under /tmp or /var would match).
+    var realBundlePath: String? {
+        guard let url = bundleURL, let c = realpath(url.path, nil) else { return nil }
+        defer { free(c) }
+        return String(cString: c)
+    }
+
     /// Processes whose program lives inside the app's bundle; nil when the process list can't be read.
     func processes() -> [(pid: pid_t, path: String)]? {
-        guard let bundle = bundleURL?.resolvingSymlinksInPath().path else { return [] }
+        guard let bundle = realBundlePath else { return [] }
         let prefix = bundle.hasSuffix("/") ? bundle : bundle + "/"
         guard let list = Proc.list() else { return nil }
         let mine = list.resolved.filter { proc in
@@ -98,7 +106,7 @@ public final class MacApp: AppController {
     public var isRunning: Bool { processes().map { !$0.isEmpty } ?? true }
 
     public func quit(timeout: TimeInterval, cancel: CancelToken?, waiting: ((TimeInterval) -> Void)?) throws {
-        guard let bundle = bundleURL?.resolvingSymlinksInPath().path else { return }
+        guard let bundle = realBundlePath else { return }
         let main = bundle + "/Contents/MacOS/"
         for proc in processes() ?? [] where proc.path.hasPrefix(main) {
             kill(proc.pid, SIGTERM)
