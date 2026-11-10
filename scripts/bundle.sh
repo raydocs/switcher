@@ -3,9 +3,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 VERSION="${VERSION:-0.1.0}"
-swift build -c release --product SwitcherApp
-swift build -c release --product switcher
-BIN="$(swift build -c release --show-bin-path)"
+# UNIVERSAL=1 builds for Apple silicon and Intel (release downloads).
+ARCH=()
+[ "${UNIVERSAL:-0}" = 1 ] && ARCH=(--arch arm64 --arch x86_64)
+swift build -c release ${ARCH[@]+"${ARCH[@]}"} --product SwitcherApp
+swift build -c release ${ARCH[@]+"${ARCH[@]}"} --product switcher
+BIN="$(swift build -c release ${ARCH[@]+"${ARCH[@]}"} --show-bin-path)"
 APP="dist/Switcher.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
