@@ -4,7 +4,7 @@ import SwitcherCore
 let usage = """
 switcher: switch Claude Desktop and Antigravity between your accounts.
 
-  switcher list [--json]               every app's accounts, numbered, with plan usage
+  switcher list [--json]               every app's accounts, numbered
   switcher switch <app> [<who>]        switch to an account, or the next one (Claude restarts)
   switcher add <app>                   restart the app signed out, to sign in to another account
   switcher remove <app> <who>          take an account off the list, forgetting its saved sign-in
@@ -91,11 +91,6 @@ do {
                 if b.rows.isEmpty { print("  no accounts yet: sign in once in the app") }
                 for r in b.rows {
                     var line = "  \(r.isCurrent ? "●" : " ") \(r.slot.number). \(r.slot.label)"
-                    if r.slot.alias != nil, let e = r.slot.email { line += "  \(e)" }
-                    if let u = r.usage {
-                        line += "  5h \(u.fiveHour.map { "\($0)%" } ?? "–")  week \(u.weekly.map { "\($0)%" } ?? "–")"
-                        if u.isStale() { line += " (\(ago(u.sampledAt)))" }
-                    }
                     if !r.isCurrent && !r.canSwitch { line += "  [sign in once to switch]" }
                     if r.probablyExpired { line += "  [may need signing in again]" }
                     if r.slot.disabled { line += "  [left out of Next]" }
