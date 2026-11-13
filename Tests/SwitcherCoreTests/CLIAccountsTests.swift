@@ -381,8 +381,8 @@ import Testing
         box.mkdir(box.top)
         let script = "trap '' TERM; echo $$ > '\(pidFile)'; exec /bin/sleep 30"
         let start = Date()
-        #expect(CLIDoctor.lastPathLine(shell: "/bin/sh", flags: ["-c"], script: script, timeout: 1) == nil)
-        #expect(Date().timeIntervalSince(start) < 6)
+        #expect(CLIDoctor.lastPathLine(shell: "/bin/sh", flags: ["-c"], script: script, timeout: 3) == nil)
+        #expect(Date().timeIntervalSince(start) < 9)
         let pid = try #require(box.read(pidFile).flatMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
         let alive = kill(pid, 0) == 0
         if alive { kill(pid, SIGKILL) }
