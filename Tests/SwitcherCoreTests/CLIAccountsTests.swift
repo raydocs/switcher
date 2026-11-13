@@ -363,3 +363,29 @@ import Testing
         }
     }
 }
+
+/// Real child processes (`/bin/sh` only), never the user's shell or rc files.
+@Suite struct CLIDoctorProcessTests {
+    // Review finding 8: output larger than a pipe is drained while waiting.
+    @Test func aLargeStartupOutputDoesNotBlockTheResolver() {
+        let script = "head -c 1048576 /dev/zero | tr '\\0' x; echo; command -v sh"
+        let start = Date()
+        let path = CLIDoctor.lastPathLine(shell: "/bin/sh", flags: ["-c"], script: script, timeout: 3)
+        #expect(path?.hasSuffix("/sh") == true)
+        #expect(Date().timeIntervalSince(start) < 2.5)
+    }
+
+    @Test func aStuckShellIsKilledAndWaitedFor() throws {
+        let box = CLIBox()
+        let pidFile = box.top + "/pid"
+        box.mkdir(box.top)
+        let script = "trap '' TERM; echo $$ > '\(pidFile)'; exec /bin/sleep 30"
+        let start = Date()
+        #expect(CLIDoctor.lastPathLine(shell: "/bin/sh", flags: ["-c"], script: script, timeout: 1) == nil)
+        #expect(Date().timeIntervalSince(start) < 6)
+        let pid = try #require(box.read(pidFile).flatMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+        let alive = kill(pid, 0) == 0
+        if alive { kill(pid, SIGKILL) }
+        #expect(!alive)
+    }
+}

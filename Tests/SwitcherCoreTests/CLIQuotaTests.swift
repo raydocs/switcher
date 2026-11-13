@@ -533,3 +533,22 @@ private extension Date {
     /// The cache and the statusline keep whole seconds.
     var roundedToSecond: Date { Date(timeIntervalSince1970: timeIntervalSince1970.rounded()) }
 }
+
+@Suite struct ClaudeRenewProcessTests {
+    // Review finding 7: a timed-out renew run that ignores SIGTERM is still killed and reaped.
+    @Test func aTimedOutRunThatIgnoresSIGTERMIsKilled() throws {
+        let box = CLIBox()
+        let pidFile = box.top + "/pid"
+        let script = box.top + "/fake-claude"
+        box.write(script, "#!/bin/sh\ntrap '' TERM\necho $$ > '\(pidFile)'\nexec /bin/sleep 30\n", mode: 0o755)
+        let start = Date()
+        #expect(throws: CLIQuotaError.self) {
+            try ClaudeCodeQuota.defaultRun(script, [], box.top, ["PATH": "/usr/bin:/bin"], 1)
+        }
+        #expect(Date().timeIntervalSince(start) < 6)
+        let pid = try #require(box.read(pidFile).flatMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+        let alive = kill(pid, 0) == 0
+        if alive { kill(pid, SIGKILL) }
+        #expect(!alive)
+    }
+}

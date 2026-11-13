@@ -154,3 +154,40 @@ public final class FileLock {
         close(fd)
     }
 }
+
+extension Process {
+    /// SIGTERM, wait up to `grace` seconds, then SIGKILL, and wait until the process has exited.
+    func terminateAndWait(grace: TimeInterval) {
+        guard isRunning else { return }
+        terminate()
+        let deadline = Date().addingTimeInterval(grace)
+        while isRunning, Date() < deadline { usleep(20_000) }
+        if isRunning { kill(processIdentifier, SIGKILL) }
+        waitUntilExit()
+    }
+}
+
+/// Reads a pipe to EOF on a background queue so the child never blocks on a full pipe.
+final class DrainedOutput: @unchecked Sendable {
+    private let handle: FileHandle
+    private let done = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var data = Data()
+
+    init(_ handle: FileHandle) {
+        self.handle = handle
+        DispatchQueue.global().async { [self] in
+            let all = handle.readDataToEndOfFile()
+            lock.lock(); data = all; lock.unlock()
+            done.signal()
+        }
+    }
+
+    /// What was read, waiting up to `waiting` seconds for EOF (a grandchild may hold the pipe open).
+    @discardableResult
+    func finish(waiting: TimeInterval) -> Data {
+        _ = done.wait(timeout: .now() + waiting)
+        lock.lock(); defer { lock.unlock() }
+        return data
+    }
+}

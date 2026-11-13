@@ -293,7 +293,9 @@ public enum ClaudeCodeQuota {
         let deadline = Date().addingTimeInterval(timeout)
         while p.isRunning, Date() < deadline { usleep(50_000) }
         if p.isRunning {
-            p.terminate()
+            // SIGTERM first; a Claude that ignores it must not outlive the timeout and keep
+            // requesting or writing credentials, so SIGKILL after a short grace and wait for it.
+            p.terminateAndWait(grace: 2)
             throw CLIQuotaError.unavailable("claude did not finish within \(Int(timeout)) s")
         }
         guard p.terminationStatus == 0 else { throw CLIQuotaError.unavailable("claude exited with \(p.terminationStatus)") }
