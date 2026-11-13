@@ -24,6 +24,10 @@ enum Metrics {
         let screen = NSScreen.main?.visibleFrame.height ?? 900
         return max(300, min(680, screen - 320))
     }
+    /// With the terminal accounts open under it, the app's list gives way down to this.
+    static let listMinHeight: CGFloat = 150
+    /// The terminal accounts scroll past this.
+    static var cliMaxHeight: CGFloat { max(listMinHeight, listMaxHeight - listMinHeight) }
 
     // The Settings window.
     static let settingsWidth: CGFloat = 560
