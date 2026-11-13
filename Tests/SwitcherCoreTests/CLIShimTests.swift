@@ -348,4 +348,64 @@ import Testing
         #expect(CLIShim.rcState("x\n" + b + "\n\n") == .last)
         #expect(CLIShim.rcState("x\n" + b + "y\n") == .notLast)
     }
+
+    // Review finding 1: only "does not exist" is an empty file.
+    @Test func anUnreadableOrNonUTF8RCIsNeverOverwritten() throws {
+        let box = CLIBox()
+        let path = box.home + "/.zshrc"
+        let bytes = Data([0x65, 0x78, 0xff, 0xfe, 0x0a])
+        try bytes.write(to: URL(fileURLWithPath: path))
+        #expect(throws: (any Error).self) { try CLIShim.installRC(path, env: box.env) }
+        #expect(try Data(contentsOf: URL(fileURLWithPath: path)) == bytes)
+        #expect(!FS.exists(URL(fileURLWithPath: path + ".before-switcher")))
+        #expect(throws: (any Error).self) { try CLIShim.uninstallRC(path) }
+        #expect(try Data(contentsOf: URL(fileURLWithPath: path)) == bytes)
+        // A path that is a folder cannot be read either.
+        let dir = box.home + "/.bashrc"
+        box.mkdir(dir)
+        #expect(throws: (any Error).self) { try CLIShim.installRC(dir, env: box.env) }
+    }
+
+    // Review finding 2: unbalanced marker lines change nothing.
+    @Test func anIncompleteBlockIsRefusedAndNothingChanges() throws {
+        let box = CLIBox()
+        let path = rc(box, nil)
+        let b = CLIShim.block(box.env)
+        let noEnd = "keep 1\n" + CLIShim.rcBegin + "\nexport PATH=/x:$PATH\nkeep 2\n"
+        let noBegin = "keep 1\n" + CLIShim.rcEnd + "\nkeep 2\n"
+        let twoBegins = "keep 1\n" + CLIShim.rcBegin + "\n" + b + "keep 2\n"
+        let swapped = "a\n" + CLIShim.rcEnd + "\nb\n" + CLIShim.rcBegin + "\nc\n"
+        for text in [noEnd, noBegin, twoBegins, swapped] {
+            box.write(path, text)
+            try? FileManager.default.removeItem(atPath: path + ".before-switcher")
+            #expect(throws: (any Error).self) { try CLIShim.installRC(path, env: box.env) }
+            #expect(box.read(path) == text)
+            #expect(throws: (any Error).self) { try CLIShim.uninstallRC(path) }
+            #expect(box.read(path) == text)
+            #expect(!FS.exists(URL(fileURLWithPath: path + ".before-switcher")))
+        }
+        let error = try #require({ () -> String? in
+            box.write(path, noEnd)
+            do { try CLIShim.installRC(path, env: box.env) } catch { return "\(error)" }
+            return nil
+        }())
+        #expect(error.contains("by hand"))
+    }
+
+    // Review finding 3: the backup is private, exclusive and never follows a symlink.
+    @Test func theBackupIsPrivateAndExclusive() throws {
+        let box = CLIBox()
+        let path = rc(box, "export KEY=secret\n", mode: 0o644)
+        try CLIShim.installRC(path, env: box.env)
+        #expect(box.mode(path + ".before-switcher") == 0o600)
+        #expect(box.read(path + ".before-switcher") == "export KEY=secret\n")
+
+        let box2 = CLIBox()
+        let path2 = rc(box2, "export KEY=secret\n")
+        let outside = box2.top + "/outside"
+        box2.symlink(path2 + ".before-switcher", to: outside)
+        #expect(throws: (any Error).self) { try CLIShim.installRC(path2, env: box2.env) }
+        #expect(!FS.exists(URL(fileURLWithPath: outside)))
+        #expect(box2.read(path2) == "export KEY=secret\n")
+    }
 }
