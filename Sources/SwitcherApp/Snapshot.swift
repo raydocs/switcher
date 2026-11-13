@@ -29,6 +29,12 @@ enum Snapshot {
                     try render(fixture, scheme: scheme, to: url)
                     print(url.path)
                 }
+                // The popover with the terminal accounts as the app lays it out: measured, scrolling lists.
+                if fixture.settings == nil, fixture.name.contains("cli"), ProcessInfo.processInfo.environment["SWITCHER_SNAPSHOT_NATIVE"] != nil {
+                    let url = out.appendingPathComponent("\(fixture.name)-native-\(lang).png")
+                    try renderInWindow(MenuView(model: fixture.model, staged: fixture.staged), to: url)
+                    print(url.path)
+                }
                 // The same page in a real (never shown) window: the system's switch, field and scrolling.
                 if let tab = fixture.settings, ProcessInfo.processInfo.environment["SWITCHER_SNAPSHOT_NATIVE"] != nil {
                     let url = out.appendingPathComponent("\(fixture.name)-native-\(lang).png")
@@ -155,11 +161,28 @@ enum Snapshot {
         foundRunning.running = true
 
         func model(_ boards: [AppBoard], ccSame: CCSameImport.Found? = nil, job: SwitchJob? = nil, banner: Banner? = nil,
-                   selected: ProviderID = .claude) -> AppModel {
-            let m = AppModel(preview: boards, ccSame: ccSame, job: job, banner: banner)
+                   selected: ProviderID = .claude, cli: [CLIBoard] = [], cliJustInstalled: Bool = false) -> AppModel {
+            let m = AppModel(preview: boards, ccSame: ccSame, job: job, banner: banner, cli: cli, cliJustInstalled: cliJustInstalled)
             m.selected = selected
             return m
         }
+
+        // The terminal accounts: two of each CLI, one sign-in about to run out, one not signed in.
+        let short = Array(claudeRows.prefix(2))
+        func cli(installed: Bool = true, renew: Bool = false) -> [CLIBoard] {
+            [
+                CLIBoard(kind: .claude, shimInstalled: installed, commandFound: true, rows: [
+                    s.cli(.claude, 1, "default", "ada@lovelace.dev", plan: "max", active: true, goodDays: 24,
+                          usage: (42, 18, 2.4, 3), error: renew ? .signInExpired : nil),
+                    s.cli(.claude, 2, "work", "ada@orbital.dev", plan: "pro", goodDays: 2.6, usage: (91, 64, 0.7, 48)),
+                ]),
+                CLIBoard(kind: .codex, shimInstalled: installed, commandFound: true, rows: [
+                    s.cli(.codex, 1, "default", "ada@lovelace.dev", plan: "plus", active: true, usage: (12, 37, 3.1, 1)),
+                    s.cli(.codex, 2, "side", nil, signedIn: false, usage: nil),
+                ]),
+            ]
+        }
+        let both = MenuView.Staged(cli: .init(expanded: [.claude, .codex]))
 
         return [
             Fixture(name: "01-claude", model: model(boards())),
@@ -181,6 +204,12 @@ enum Snapshot {
             Fixture(name: "11-remove-confirm", model: model(boards()), staged: MenuView.Staged(confirmRemove: kat)),
             Fixture(name: "12-add-confirm", model: model(boards()), staged: MenuView.Staged(confirmAdd: true)),
             Fixture(name: "13-not-installed", model: model(boards(antigravityInstalled: false), selected: .antigravity)),
+
+            Fixture(name: "14-cli", model: model(boards(claude: short), cli: cli()), staged: both),
+            Fixture(name: "15-cli-not-installed", model: model(boards(claude: short), cli: cli(installed: false)), staged: both),
+            Fixture(name: "16-cli-collapsed", model: model(boards(), cli: cli()), staged: MenuView.Staged(cli: .init(expanded: []))),
+            Fixture(name: "17-cli-add", model: model(boards(claude: short), cli: cli(renew: true), cliJustInstalled: true),
+                    staged: MenuView.Staged(cli: .init(expanded: [.claude], adding: .claude, name: "personal", hover: "claude:work"))),
 
             Fixture(name: "20-settings-general", model: model(boards()), settings: .general, page: .init(openAtLogin: true)),
             Fixture(name: "21-settings-accounts", model: model(boards(claude: edgeRows)), settings: .accounts,
@@ -253,6 +282,24 @@ struct Make {
         AccountRow(
             slot: Slot(number: number, account: email, email: email, alias: alias), isCurrent: current, canSwitch: true,
             setAsideAt: current ? nil : Date().addingTimeInterval(-9 * 86400), quota: quota)
+    }
+
+    func cli(_ kind: CLIKind, _ number: Int, _ name: String, _ email: String?, plan: String? = nil, active: Bool = false,
+             signedIn: Bool = true, goodDays: Double? = nil,
+             usage: (five: Double, week: Double, resetHours: Double, minutesAgo: Double)?, error: CLIQuotaError? = nil) -> CLIRow {
+        let folder = "/Users/ada/" + (kind == .claude ? ".claude" : ".codex")
+        let path = name == "default" ? "" : "\(kind.envVar)='\(folder)-profiles/\(name)' "
+        return CLIRow(
+            kind: kind, number: number, name: name, isDefault: name == "default", isActive: active, email: email, plan: plan,
+            signIn: signedIn ? .good(until: goodDays.map { Date().addingTimeInterval($0 * 86400) }) : .out,
+            loginCommand: path + (kind == .claude ? "claude   # then type /login" : "codex login"),
+            quota: usage.map { u in
+                CLIQuota(windows: [
+                    CLIQuotaWindow(label: "5h", usedPercent: u.five, resetsAt: Date().addingTimeInterval(u.resetHours * 3600)),
+                    CLIQuotaWindow(label: "week", usedPercent: u.week, resetsAt: Date().addingTimeInterval(90 * 3600)),
+                ], source: "fixture", observedAt: Date().addingTimeInterval(-u.minutesAgo * 60), plan: plan)
+            },
+            quotaError: error)
     }
 
     func quota(plan: String, gemini: (Int, Int), claude: (Int, Int), argon: Int, resetHours: Double, minutesAgo: Double, problem: String? = nil) -> AntigravityQuota {
