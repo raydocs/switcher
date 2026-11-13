@@ -36,7 +36,10 @@ import Testing
         #expect(fake.isRunning)
 
         let start = Date()
-        try fake.quit(timeout: 20, cancel: nil, waiting: nil)
+        do { try fake.quit(timeout: 20, cancel: nil, waiting: nil) } catch {
+            Issue.record("quit failed: \(error); still listed: \(fake.processes().map { "\($0)" } ?? "listing failed"); helper running: \(p.isRunning)")
+            throw error
+        }
         #expect(!fake.isRunning)
         #expect(Date().timeIntervalSince(start) < 15)
         p.waitUntilExit()
@@ -75,7 +78,10 @@ import Testing
         let listed = fake.processes() ?? []
         #expect(listed.contains { $0.pid == p.processIdentifier && $0.path.hasPrefix("?") })
 
-        try fake.quit(timeout: 20, cancel: nil, waiting: nil)
+        do { try fake.quit(timeout: 20, cancel: nil, waiting: nil) } catch {
+            Issue.record("quit failed: \(error); still listed: \(fake.processes().map { "\($0)" } ?? "listing failed"); helper running: \(p.isRunning)")
+            throw error
+        }
         #expect(!fake.isRunning)
         p.waitUntilExit()
         #expect(p.terminationReason == .uncaughtSignal)

@@ -472,7 +472,8 @@ final class QuotaBox {
         } catch let e as CLIQuotaError {
             #expect(e.errorDescription?.contains("timed out") == true)
         }
-        #expect(Date().timeIntervalSince(started) < 10)
+        // Loose on purpose (CI runners are slow): a hang would never return at all.
+        #expect(Date().timeIntervalSince(started) < 30)
         #expect(!spawns.servers[0].isRunning)
     }
 

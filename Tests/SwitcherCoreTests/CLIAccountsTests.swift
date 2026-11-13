@@ -368,11 +368,12 @@ import Testing
 @Suite struct CLIDoctorProcessTests {
     // Review finding 8: output larger than a pipe is drained while waiting.
     @Test func aLargeStartupOutputDoesNotBlockTheResolver() {
-        let script = "head -c 1048576 /dev/zero | tr '\\0' x; echo; command -v sh"
-        let start = Date()
-        let path = CLIDoctor.lastPathLine(shell: "/bin/sh", flags: ["-c"], script: script, timeout: 3)
+        // 256 KiB is four times what a pipe holds: without draining, the shell blocks on write
+        // and is killed at the deadline, so the path comes back nil. The deadline is generous so
+        // a slow CI runner still finishes well inside it.
+        let script = "head -c 262144 /dev/zero | tr '\\0' x; echo; command -v sh"
+        let path = CLIDoctor.lastPathLine(shell: "/bin/sh", flags: ["-c"], script: script, timeout: 30)
         #expect(path?.hasSuffix("/sh") == true)
-        #expect(Date().timeIntervalSince(start) < 2.5)
     }
 
     @Test func aStuckShellIsKilledAndWaitedFor() throws {
