@@ -52,7 +52,9 @@ public enum CLIKind: String, CaseIterable, Codable, Sendable, Identifiable {
 
     /// The command to sign a profile in, as the user types it.
     public func loginCommand(_ profile: CLIProfile) -> String {
-        let prefix = profile.isDefault ? "" : "\(envVar)=\(shellQuote(profile.path)) "
+        // The default account clears the variable and bypasses the shim, which would otherwise
+        // follow the pointer to another account.
+        let prefix = profile.isDefault ? "env -u \(envVar) SWITCHER_BYPASS=1 " : "\(envVar)=\(shellQuote(profile.path)) "
         switch self {
         case .claude: return "\(prefix)claude   # then type /login"
         case .codex: return "\(prefix)codex login"
@@ -117,8 +119,12 @@ public enum CLIPath {
 
     /// A profile name: a plain folder name, safe inside single quotes and a pointer file.
     public static func isValidName(_ name: String) -> Bool {
-        guard !name.isEmpty, name.count <= 64, name != "default", !name.hasPrefix("."), !name.hasPrefix("-") else { return false }
-        return name.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) && $0.isASCII || "-_.".unicodeScalars.contains($0) }
+        // The PATH shim enforces the same rule in sh: 1-64 of [A-Za-z0-9._-], not starting with . or -.
+        let bytes = Array(name.utf8)
+        guard !bytes.isEmpty, bytes.count <= 64, name != "default", bytes[0] != UInt8(ascii: "."), bytes[0] != UInt8(ascii: "-") else { return false }
+        return bytes.allSatisfy { b in
+            (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || b == 0x2D || b == 0x5F || b == 0x2E
+        }
     }
 
     /// Why `path` cannot be a profile path under `root`, or nil when it can: absolute, exactly
@@ -209,13 +215,45 @@ public final class CLIProfiles {
     public func add(_ kind: CLIKind, name: String) throws -> CLIProfile {
         guard CLIPath.isValidName(name) else { throw SwitcherError.message("use letters, digits, - _ . for the name (not \"default\")") }
         let path = env.profilesRoot(kind) + "/" + name
+        let root = env.profilesRoot(kind)
+        // The profiles folder is a real folder (not a symlink to somewhere else) before and after it is made.
+        func requireRealRoot() throws {
+            guard Self.isRealDirectory(root) else { throw SwitcherError.message("\(root) is not a real folder (a symlink or a file); not touching it") }
+        }
+        if Self.lstatMode(root) != nil { try requireRealRoot() }
         guard !FS.exists(URL(fileURLWithPath: path)) else { throw SwitcherError.message("\(path) already exists") }
-        try FS.makePrivateDir(URL(fileURLWithPath: env.profilesRoot(kind), isDirectory: true))
+        try FS.makePrivateDir(URL(fileURLWithPath: root, isDirectory: true))
+        try requireRealRoot()
         try FS.makePrivateDir(URL(fileURLWithPath: path, isDirectory: true))
         let profile = CLIProfile(kind: kind, name: name, path: path, isDefault: false)
         _ = try applyLinks(profile)
         if kind == .claude { try seedClaudeJSON(profile) }
         return profile
+    }
+
+    static func lstatMode(_ path: String) -> mode_t? {
+        var st = stat()
+        return lstat(path, &st) == 0 ? st.st_mode : nil
+    }
+
+    /// Why writing into `profile`'s folder is not safe right now, or nil: the path must still be
+    /// exactly `<profiles folder>/<valid name>`, and both the profiles folder and the profile
+    /// folder real directories (checked with `lstat`, so a symlink swapped in later is caught).
+    func folderProblem(_ profile: CLIProfile) -> String? {
+        guard !profile.isDefault else { return nil }
+        let root = env.profilesRoot(profile.kind)
+        if let p = CLIPath.problem(profile.path, root: root) { return "\(profile.path): \(p)" }
+        if !Self.isRealDirectory(root) { return "\(root) is not a real folder" }
+        if !Self.isRealDirectory(profile.path) { return "\(profile.path) is not a real folder (a symlink, a file or gone)" }
+        return nil
+    }
+
+    /// The profile folder opened without following a symlink; links are made relative to it.
+    func openFolder(_ profile: CLIProfile) throws -> Int32 {
+        if let why = folderProblem(profile) { throw SwitcherError.message("not writing into \(why)") }
+        let fd = open(profile.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard fd >= 0 else { throw POSIXError.current("opening \(profile.path)") }
+        return fd
     }
 
     static func isRealDirectory(_ path: String) -> Bool {
@@ -259,26 +297,44 @@ public final class CLIProfiles {
     }
 
     public func checkLinks(_ profile: CLIProfile) -> [LinkCheck] {
-        guard !profile.isDefault else { return [] }
+        guard !profile.isDefault, folderProblem(profile) == nil else { return [] }
+        let fd = open(profile.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard fd >= 0 else { return [] }
+        defer { close(fd) }
+        return linkChecks(profile, dirFD: fd)
+    }
+
+    /// Link states read relative to the open folder, so a path swapped meanwhile is not followed.
+    private func linkChecks(_ profile: CLIProfile, dirFD fd: Int32) -> [LinkCheck] {
         let source = env.defaultFolder(profile.kind)
         return Self.sharedItems(profile.kind).map { item in
-            let link = profile.path + "/" + item, target = source + "/" + item
+            let target = source + "/" + item
             var st = stat()
-            if lstat(link, &st) != 0 {
+            if fstatat(fd, item, &st, AT_SYMLINK_NOFOLLOW) != 0 {
                 return LinkCheck(item: item, state: FS.exists(URL(fileURLWithPath: target)) ? .missing : .nothingToShare)
             }
             guard (st.st_mode & S_IFMT) == S_IFLNK else { return LinkCheck(item: item, state: .replaced) }
-            let dest = (try? fm.destinationOfSymbolicLink(atPath: link)) ?? ""
+            var buf = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+            let n = readlinkat(fd, item, &buf, buf.count - 1)
+            let dest = n >= 0 ? String(decoding: buf[0..<n].map { UInt8(bitPattern: $0) }, as: UTF8.self) : ""
             return LinkCheck(item: item, state: dest == target ? .ok : .wrongTarget(dest))
         }
     }
 
     /// Make every missing link. Never replaces anything already there. Returns the items linked.
+    /// Re-checks the folder first and creates each link relative to a no-follow handle on it.
     @discardableResult
     public func applyLinks(_ profile: CLIProfile) throws -> [String] {
+        guard !profile.isDefault else { return [] }
+        let fd = try openFolder(profile)
+        defer { close(fd) }
         var made: [String] = []
-        for check in checkLinks(profile) where check.state == .missing {
-            try fm.createSymbolicLink(atPath: profile.path + "/" + check.item, withDestinationPath: env.defaultFolder(profile.kind) + "/" + check.item)
+        for check in linkChecks(profile, dirFD: fd) where check.state == .missing {
+            let target = env.defaultFolder(profile.kind) + "/" + check.item
+            if symlinkat(target, fd, check.item) != 0 {
+                if errno == EEXIST { continue }
+                throw POSIXError.current("linking \(profile.path)/\(check.item)")
+            }
             made.append(check.item)
         }
         return made
@@ -289,6 +345,7 @@ public final class CLIProfiles {
     public static let seededClaudeKeys = ["mcpServers", "projects", "hasCompletedOnboarding", "theme"]
 
     func seedClaudeJSON(_ profile: CLIProfile) throws {
+        if let why = folderProblem(profile) { throw SwitcherError.message("not writing into \(why)") }
         let dest = env.claudeJSON(profile)
         guard !FS.exists(URL(fileURLWithPath: dest)),
               let data = fm.contents(atPath: env.claudeJSON(defaultProfile(.claude))),

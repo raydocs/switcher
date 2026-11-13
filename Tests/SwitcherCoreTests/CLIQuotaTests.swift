@@ -7,9 +7,12 @@ final class QuotaFakeHTTP: HTTPGetter, @unchecked Sendable {
     var body = Data()
     var fail = false
     var calls: [(url: URL, headers: [String: String])] = []
+    /// Runs while the request is "in flight" (an account switch mid-read).
+    var onGet: (() -> Void)?
 
     func get(_ url: URL, headers: [String: String]) async throws -> (Int, Data) {
         calls.append((url, headers))
+        onGet?()
         if fail { throw URLError(.timedOut) }
         return (status, body)
     }
@@ -42,6 +45,10 @@ final class QuotaBox {
     func write(_ path: String, _ text: String) {
         try! FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
         try! Data(text.utf8).write(to: URL(fileURLWithPath: path))
+    }
+
+    func account(_ p: CLIProfile, _ uuid: String) {
+        write(p.path + "/.claude.json", #"{"oauthAccount":{"accountUuid":"\#(uuid)","organizationUuid":"o","emailAddress":"x@example.com"}}"#)
     }
 
     func credentials(_ p: CLIProfile, expiresIn: TimeInterval = 3600) {
@@ -163,6 +170,29 @@ final class QuotaBox {
         #expect(b.http.calls[0].url.absoluteString == "https://api.anthropic.com/api/oauth/usage")
         #expect(b.http.calls[0].headers["Authorization"] == "Bearer \(QuotaBox.token)")
         #expect(b.http.calls[0].headers["anthropic-beta"] == "oauth-2025-04-20")
+    }
+
+    // Review finding 6: a response for an account that changed mid-read is not accepted.
+    @Test func anAccountChangeDuringTheReadIsRejected() async throws {
+        let b = QuotaBox(), p = b.claude()
+        b.credentials(p)
+        b.account(p, "A")
+        b.http.body = Data(Self.namedShape.utf8)
+        b.http.onGet = { b.account(p, "B") }
+        await #expect(throws: CLIQuotaError.unavailable("the account changed during the read; try again")) { try await b.read(p) }
+    }
+
+    @Test func aTokenChangeDuringTheReadIsRejected() async throws {
+        let b = QuotaBox(), p = b.claude()
+        b.credentials(p)
+        b.account(p, "A")
+        b.http.body = Data(Self.namedShape.utf8)
+        b.http.onGet = { b.keychain.items[claudeKeychainService(configDir: p.envValue)] = #"{"claudeAiOauth":{"accessToken":"other","expiresAt":9999999999999}}"# }
+        await #expect(throws: CLIQuotaError.unavailable("the account changed during the read; try again")) { try await b.read(p) }
+        // Unchanged credentials still read.
+        b.http.onGet = nil
+        b.credentials(p)
+        #expect(try await b.read(p).windows.isEmpty == false)
     }
 
     @Test func tokenFromThePlaintextFileFallbackWorksToo() async throws {
@@ -465,14 +495,17 @@ final class QuotaBox {
         let quota = try await b.read(p)
         let cache = CLIQuotaCache(env: b.env)
         #expect(cache.load().isEmpty)
-        try cache.store(quota, for: p)
+        try cache.store(quota, for: p, accountKey: "A:o")
         let other = CLIQuota(windows: [CLIQuotaWindow(label: "week", usedPercent: 7, resetsAt: nil)], source: "codex app-server",
                              observedAt: Date(timeIntervalSince1970: 1_800_000_000), plan: "pro")
-        try cache.store(other, for: c)
+        try cache.store(other, for: c, accountKey: "acct-1")
 
         let again = CLIQuotaCache(env: b.env)
-        #expect(again.quota(for: p) == quota)
-        #expect(again.quota(for: c) == other)
+        #expect(again.quota(for: p, accountKey: "A:o") == quota)
+        #expect(again.quota(for: c, accountKey: "acct-1") == other)
+        // Another account in the same profile does not see the old entry.
+        #expect(again.quota(for: p, accountKey: "B:o") == nil)
+        #expect(again.quota(for: p, accountKey: nil) == nil)
         #expect(again.load().count == 2)
 
         let path = b.env.config + "/quota-cache.json"
@@ -490,12 +523,32 @@ final class QuotaBox {
         let cache = CLIQuotaCache(env: b.env)
         #expect(cache.load().isEmpty)
         let q = CLIQuota(windows: [], source: "statusline", observedAt: b.now)
-        try cache.store(q, for: p)
-        #expect(cache.quota(for: p) == q)
+        try cache.store(q, for: p, accountKey: nil)
+        #expect(cache.quota(for: p, accountKey: nil) == q)
+        #expect(cache.quota(for: p, accountKey: "A") == nil)
     }
 }
 
 private extension Date {
     /// The cache and the statusline keep whole seconds.
     var roundedToSecond: Date { Date(timeIntervalSince1970: timeIntervalSince1970.rounded()) }
+}
+
+@Suite struct ClaudeRenewProcessTests {
+    // Review finding 7: a timed-out renew run that ignores SIGTERM is still killed and reaped.
+    @Test func aTimedOutRunThatIgnoresSIGTERMIsKilled() throws {
+        let box = CLIBox()
+        let pidFile = box.top + "/pid"
+        let script = box.top + "/fake-claude"
+        box.write(script, "#!/bin/sh\ntrap '' TERM\necho $$ > '\(pidFile)'\nexec /bin/sleep 30\n", mode: 0o755)
+        let start = Date()
+        #expect(throws: CLIQuotaError.self) {
+            try ClaudeCodeQuota.defaultRun(script, [], box.top, ["PATH": "/usr/bin:/bin"], 3)
+        }
+        #expect(Date().timeIntervalSince(start) < 9)
+        let pid = try #require(box.read(pidFile).flatMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+        let alive = kill(pid, 0) == 0
+        if alive { kill(pid, SIGKILL) }
+        #expect(!alive)
+    }
 }

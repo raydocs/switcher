@@ -66,7 +66,9 @@ import Testing
         let p = CLIProfile(kind: .claude, name: "o'k", path: "/h/o'k", isDefault: false)
         #expect(CLIKind.claude.loginCommand(p).hasPrefix("CLAUDE_CONFIG_DIR='/h/o'\\''k' claude"))
         let d = CLIProfiles(env: CLIEnv(home: "/h")).defaultProfile(.codex)
-        #expect(CLIKind.codex.loginCommand(d) == "codex login")
+        #expect(CLIKind.codex.loginCommand(d) == "env -u CODEX_HOME SWITCHER_BYPASS=1 codex login")
+        let dc = CLIProfiles(env: CLIEnv(home: "/h")).defaultProfile(.claude)
+        #expect(CLIKind.claude.loginCommand(dc) == "env -u CLAUDE_CONFIG_DIR SWITCHER_BYPASS=1 claude   # then type /login")
     }
 }
 
@@ -274,6 +276,35 @@ import Testing
         #expect(state("settings.json") == .replaced)
         // The default account has nothing to link.
         #expect(profiles.checkLinks(profiles.defaultProfile(.claude)).isEmpty)
+    }
+
+    // Review finding 5: a profile folder swapped for a symlink never lets links or files land outside.
+    @Test func writesRefuseAProfileFolderSwappedForASymlink() throws {
+        let box = CLIBox()
+        let profiles = claudeWorld(box)
+        box.write(box.home + "/.claude.json", "{\"mcpServers\":{\"a\":{}},\"theme\":\"dark\"}")
+        let p = try profiles.add(.claude, name: "work")
+        let outside = box.top + "/outside"
+        box.mkdir(outside)
+        try FileManager.default.removeItem(atPath: p.path)
+        box.symlink(p.path, to: outside)
+        #expect(throws: (any Error).self) { try profiles.applyLinks(p) }
+        #expect(throws: (any Error).self) { try profiles.seedClaudeJSON(p) }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside).isEmpty)
+        #expect(profiles.checkLinks(p).isEmpty)
+    }
+
+    @Test func writesRefuseASymlinkedProfilesRoot() throws {
+        let box = CLIBox()
+        let profiles = claudeWorld(box)
+        let outside = box.top + "/outside"
+        box.mkdir(outside + "/work")
+        box.symlink(box.env.profilesRoot(.claude), to: outside)
+        #expect(throws: (any Error).self) { try profiles.add(.claude, name: "new") }
+        let p = CLIProfile(kind: .claude, name: "work", path: box.env.profilesRoot(.claude) + "/work", isDefault: false)
+        #expect(throws: (any Error).self) { try profiles.applyLinks(p) }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside) == ["work"])
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside + "/work").isEmpty)
     }
 
     @Test func applyLinksIsIdempotentAndNeverOverwrites() throws {

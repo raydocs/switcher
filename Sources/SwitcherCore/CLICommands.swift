@@ -42,11 +42,12 @@ public enum CLICommands {
         return ExecRequest(kind: kind, who: head[1], command: command)
     }
 
-    /// What to change in the environment before the exec: set the profile's variable, or unset it
-    /// for the default account (never set to `~/.claude`: that would read another keychain item),
-    /// and always drop `SWITCHER_BYPASS` so a shim further down still honours the choice.
+    /// What to change in the environment before the exec. A profile: set its variable (a shim
+    /// reached by the command passes it through) and drop `SWITCHER_BYPASS`. The default account:
+    /// unset the variable (never set it to `~/.claude`: that would read another keychain item) and
+    /// set `SWITCHER_BYPASS=1`, so a shim reached by the command does not pick the pointer's account.
     public static func envEdits(_ profile: CLIProfile) -> [(name: String, value: String?)] {
-        [(profile.kind.envVar, profile.envValue), ("SWITCHER_BYPASS", nil)]
+        [(profile.kind.envVar, profile.envValue), ("SWITCHER_BYPASS", profile.isDefault ? "1" : nil)]
     }
 
     /// `base` with `envEdits(profile)` applied.

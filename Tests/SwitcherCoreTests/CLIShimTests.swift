@@ -106,6 +106,24 @@ import Testing
         }
     }
 
+    // Review finding 9: the shim accepts exactly the names CLIPath.isValidName accepts.
+    @Test func shimAndAppAgreeOnProfileNames() throws {
+        let w = try world()
+        let long64 = String(repeating: "a", count: 64)
+        let names = ["has space", "über", "a:b", "a*b", "a?b", "a[b", "tab\there", String(repeating: "a", count: 65), "default", ".hid", "-dash",
+                     "ok.name_1-x", "A", long64]
+        for name in names {
+            w.box.mkdir(w.root + "/" + name)
+            w.pointer(w.root + "/" + name + "\n")
+            let r = try w.run()
+            let valid = CLIPath.isValidName(name)
+            #expect(r.value("CLAUDE_CONFIG_DIR") == (valid ? w.root + "/" + name : "<unset>"), "\(name.debugDescription)")
+            #expect(w.profiles.active(.claude).isDefault == !valid, "\(name.debugDescription)")
+        }
+        #expect(["ok.name_1-x", "A", long64].allSatisfy(CLIPath.isValidName))
+        #expect(!["has space", "über", "default", ".hid", "-dash", String(repeating: "a", count: 65), "", "ａb"].contains(where: CLIPath.isValidName))
+    }
+
     @Test func aVariableAlreadySetPassesThroughUnchanged() throws {
         let w = try world()
         w.pointer(w.root + "/a\n")
@@ -122,6 +140,19 @@ import Testing
         w.pointer(w.root + "/a\n")
         #expect(try w.run(extra: ["SWITCHER_BYPASS": "1"]).value("CLAUDE_CONFIG_DIR") == "<unset>")
         #expect(try w.run(extra: ["SWITCHER_BYPASS": "0"]).value("CLAUDE_CONFIG_DIR") == w.root + "/a")
+    }
+
+    // Review finding 4: an explicit default stays the default even when the pointer says otherwise.
+    @Test func anExplicitDefaultSurvivesTheShim() throws {
+        let w = try world()
+        w.pointer(w.root + "/a\n")
+        let base = ["CLAUDE_CONFIG_DIR": w.root + "/a"]
+        let env = CLICommands.environment(base: base, profile: w.profiles.defaultProfile(.claude))
+        let r = try w.run(extra: env)
+        #expect(r.value("CLAUDE_CONFIG_DIR") == "<unset>")
+        // A profile run through exec is passed through by the shim as it is.
+        let p = CLICommands.environment(base: [:], profile: w.profiles.resolve(.claude, "a")!)
+        #expect(try w.run(extra: p).value("CLAUDE_CONFIG_DIR") == w.root + "/a")
     }
 
     @Test func argumentsArriveIntact() throws {
@@ -347,5 +378,65 @@ import Testing
         #expect(CLIShim.rcState(b) == .last)
         #expect(CLIShim.rcState("x\n" + b + "\n\n") == .last)
         #expect(CLIShim.rcState("x\n" + b + "y\n") == .notLast)
+    }
+
+    // Review finding 1: only "does not exist" is an empty file.
+    @Test func anUnreadableOrNonUTF8RCIsNeverOverwritten() throws {
+        let box = CLIBox()
+        let path = box.home + "/.zshrc"
+        let bytes = Data([0x65, 0x78, 0xff, 0xfe, 0x0a])
+        try bytes.write(to: URL(fileURLWithPath: path))
+        #expect(throws: (any Error).self) { try CLIShim.installRC(path, env: box.env) }
+        #expect(try Data(contentsOf: URL(fileURLWithPath: path)) == bytes)
+        #expect(!FS.exists(URL(fileURLWithPath: path + ".before-switcher")))
+        #expect(throws: (any Error).self) { try CLIShim.uninstallRC(path) }
+        #expect(try Data(contentsOf: URL(fileURLWithPath: path)) == bytes)
+        // A path that is a folder cannot be read either.
+        let dir = box.home + "/.bashrc"
+        box.mkdir(dir)
+        #expect(throws: (any Error).self) { try CLIShim.installRC(dir, env: box.env) }
+    }
+
+    // Review finding 2: unbalanced marker lines change nothing.
+    @Test func anIncompleteBlockIsRefusedAndNothingChanges() throws {
+        let box = CLIBox()
+        let path = rc(box, nil)
+        let b = CLIShim.block(box.env)
+        let noEnd = "keep 1\n" + CLIShim.rcBegin + "\nexport PATH=/x:$PATH\nkeep 2\n"
+        let noBegin = "keep 1\n" + CLIShim.rcEnd + "\nkeep 2\n"
+        let twoBegins = "keep 1\n" + CLIShim.rcBegin + "\n" + b + "keep 2\n"
+        let swapped = "a\n" + CLIShim.rcEnd + "\nb\n" + CLIShim.rcBegin + "\nc\n"
+        for text in [noEnd, noBegin, twoBegins, swapped] {
+            box.write(path, text)
+            try? FileManager.default.removeItem(atPath: path + ".before-switcher")
+            #expect(throws: (any Error).self) { try CLIShim.installRC(path, env: box.env) }
+            #expect(box.read(path) == text)
+            #expect(throws: (any Error).self) { try CLIShim.uninstallRC(path) }
+            #expect(box.read(path) == text)
+            #expect(!FS.exists(URL(fileURLWithPath: path + ".before-switcher")))
+        }
+        let error = try #require({ () -> String? in
+            box.write(path, noEnd)
+            do { try CLIShim.installRC(path, env: box.env) } catch { return "\(error)" }
+            return nil
+        }())
+        #expect(error.contains("by hand"))
+    }
+
+    // Review finding 3: the backup is private, exclusive and never follows a symlink.
+    @Test func theBackupIsPrivateAndExclusive() throws {
+        let box = CLIBox()
+        let path = rc(box, "export KEY=secret\n", mode: 0o644)
+        try CLIShim.installRC(path, env: box.env)
+        #expect(box.mode(path + ".before-switcher") == 0o600)
+        #expect(box.read(path + ".before-switcher") == "export KEY=secret\n")
+
+        let box2 = CLIBox()
+        let path2 = rc(box2, "export KEY=secret\n")
+        let outside = box2.top + "/outside"
+        box2.symlink(path2 + ".before-switcher", to: outside)
+        #expect(throws: (any Error).self) { try CLIShim.installRC(path2, env: box2.env) }
+        #expect(!FS.exists(URL(fileURLWithPath: outside)))
+        #expect(box2.read(path2) == "export KEY=secret\n")
     }
 }

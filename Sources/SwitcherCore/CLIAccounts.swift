@@ -188,21 +188,33 @@ public struct CLIDoctor {
     /// How `zsh` finds a command in a login, an interactive and a plain shell.
     public static func zshResolve(_ command: String) -> [(String, String?)] {
         [("zsh -lc", ["-lc"]), ("zsh -ic", ["-ic"]), ("zsh -c", ["-c"])].map { label, flags in
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            p.arguments = flags + ["command -v \(command)"]
-            let out = Pipe()
-            p.standardOutput = out
-            p.standardError = FileHandle.nullDevice
-            p.standardInput = FileHandle.nullDevice
-            guard (try? p.run()) != nil else { return (label, nil) }
-            let deadline = Date().addingTimeInterval(10)
-            while p.isRunning, Date() < deadline { usleep(50_000) }
-            if p.isRunning { p.terminate(); return (label, nil) }
-            let s = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            let last = s.split(separator: "\n").last.map(String.init)
-            return (label, last?.hasPrefix("/") == true ? last : nil)
+            (label, lastPathLine(shell: "/bin/zsh", flags: flags, script: "command -v \(command)", timeout: 10))
         }
+    }
+
+    /// Runs `shell flags… script` and returns the last output line when it is an absolute path.
+    static func lastPathLine(shell: String, flags: [String], script: String, timeout: TimeInterval) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: shell)
+        p.arguments = flags + [script]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        // Drain stdout while the shell runs: a startup file that prints more than a pipe holds
+        // would otherwise block the shell on write and never let it exit.
+        let reader = DrainedOutput(out.fileHandleForReading)
+        let deadline = Date().addingTimeInterval(timeout)
+        while p.isRunning, Date() < deadline { usleep(20_000) }
+        if p.isRunning {
+            p.terminateAndWait(grace: 1)
+            reader.finish(waiting: 1)
+            return nil
+        }
+        let s = String(decoding: reader.finish(waiting: 1), as: UTF8.self)
+        let last = s.split(separator: "\n").last.map(String.init)
+        return last?.hasPrefix("/") == true ? last : nil
     }
 
     public func run() -> [DoctorFinding] {

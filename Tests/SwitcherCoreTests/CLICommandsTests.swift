@@ -57,10 +57,11 @@ import Testing
         #expect(a["SWITCHER_BYPASS"] == nil)
         #expect(a["PATH"] == "/usr/bin")
 
-        // The default account leaves the variable unset (never ~/.claude).
+        // The default account leaves the variable unset (never ~/.claude) and keeps a shim reached
+        // by the command from picking the pointer's account again.
         let b = CLICommands.environment(base: base, profile: profiles.defaultProfile(.claude))
         #expect(b["CLAUDE_CONFIG_DIR"] == nil)
-        #expect(b["SWITCHER_BYPASS"] == nil)
+        #expect(b["SWITCHER_BYPASS"] == "1")
 
         // Codex uses its own variable and leaves Claude's alone.
         let codex = try profiles.add(.codex, name: "alt")

@@ -26,9 +26,12 @@ public enum CLIShim {
             ''|default) ;;
             \(shellQuote(root + "/"))*)
               name=${p#\(shellQuote(root + "/"))}
+              # Exactly CLIPath.isValidName: 1-64 of [A-Za-z0-9._-] (spelled out: ranges follow the
+              # locale in some shells), not starting with . or -, not "default".
               case "$name" in
-                ''|*/*|.*|-*) p= ;;
+                ''|default|.*|-*|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*) p= ;;
               esac
+              if [ "${#name}" -gt 64 ]; then p=; fi
               if [ -n "$p" ] && [ -d "$p" ] && [ ! -L "$p" ]; then
                 \(v)=$p
                 export \(v)
@@ -104,17 +107,29 @@ public enum CLIShim {
         "\(rcBegin)\nexport PATH=\(shellQuote(env.shimDir)):\"$PATH\"\n\(rcEnd)\n"
     }
 
-    /// `text` without Switcher's block.
-    static func strip(_ text: String) -> String {
-        var out: [Substring] = [], inside = false
+    /// `text` without Switcher's blocks, and how many were removed. Only complete, well-formed
+    /// blocks (begin line, then end line, no nesting) are removed; any other arrangement of the
+    /// marker lines throws and nothing is changed, so a half-deleted block never swallows the
+    /// lines that follow it.
+    static func strip(_ text: String, rc: String) throws -> (text: String, removed: Int) {
+        var out: [Substring] = [], inside = false, removed = 0
+        let bad = SwitcherError.message("the Switcher lines in \(rc) are incomplete or duplicated: fix or remove the Switcher lines in \(rc) by hand")
         for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            if line == rcBegin { inside = true; continue }
-            if inside { if line == rcEnd { inside = false }; continue }
-            out.append(line)
+            if line == rcBegin {
+                if inside { throw bad }
+                inside = true
+            } else if line == rcEnd {
+                if !inside { throw bad }
+                inside = false
+                removed += 1
+            } else if !inside {
+                out.append(line)
+            }
         }
+        if inside { throw bad }
         var s = out.joined(separator: "\n")
         while s.hasSuffix("\n\n") { s.removeLast() }
-        return s
+        return (s, removed)
     }
 
     public enum RCState: Equatable, Sendable {
@@ -131,35 +146,83 @@ public enum CLIShim {
         return tail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .last : .notLast
     }
 
+    /// The rc file's text. Only "does not exist" is an empty file; any other read or decoding
+    /// problem throws so the file is never overwritten.
+    static func readRC(_ rc: String) throws -> String {
+        var st = stat()
+        if stat(rc, &st) != 0 {
+            if errno == ENOENT { return "" }
+            throw POSIXError.current("reading \(rc)")
+        }
+        let data: Data
+        do { data = try Data(contentsOf: URL(fileURLWithPath: rc)) } catch {
+            throw SwitcherError.message("cannot read \(rc) (\(error.localizedDescription)); it was left untouched")
+        }
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw SwitcherError.message("\(rc) is not valid UTF-8; it was left untouched")
+        }
+        return text
+    }
+
     /// Put the block at the very end of `rc` (moving it if it is elsewhere). Keeps a one-time
     /// backup of the file as it was before Switcher first touched it.
     public static func installRC(_ rc: String) throws {
-        let fm = FileManager.default
-        let old = (try? String(contentsOfFile: rc, encoding: .utf8)) ?? ""
-        let env = CLIEnv(home: NSHomeDirectory())
-        try installRC(rc, env: env, old: old, fm: fm)
+        try installRC(rc, env: CLIEnv(home: NSHomeDirectory()))
     }
 
     public static func installRC(_ rc: String, env: CLIEnv) throws {
-        let old = (try? String(contentsOfFile: rc, encoding: .utf8)) ?? ""
-        try installRC(rc, env: env, old: old, fm: .default)
-    }
-
-    static func installRC(_ rc: String, env: CLIEnv, old: String, fm: FileManager) throws {
+        let old = try readRC(rc)
+        let stripped = try strip(old, rc: rc)
         if rcState(old) == .last, old.contains(block(env)) { return }
-        let backup = rc + ".before-switcher"
-        if !old.isEmpty, !fm.fileExists(atPath: backup) { try Data(old.utf8).write(to: URL(fileURLWithPath: backup)) }
-        var base = strip(old)
+        if !old.isEmpty { try writeBackupOnce(Data(old.utf8), to: rc + ".before-switcher") }
+        var base = stripped.text
         if !base.isEmpty, !base.hasSuffix("\n") { base += "\n" }
         let new = base + (base.isEmpty ? "" : "\n") + block(env)
         try writeKeepingMode(new, to: rc)
     }
 
     public static func uninstallRC(_ rc: String) throws {
-        guard let old = try? String(contentsOfFile: rc, encoding: .utf8), rcState(old) != .absent else { return }
-        var s = strip(old)
+        let old = try readRC(rc)
+        let stripped = try strip(old, rc: rc)
+        guard stripped.removed > 0 else { return }
+        var s = stripped.text
         if !s.isEmpty, !s.hasSuffix("\n") { s += "\n" }
         try writeKeepingMode(s, to: rc)
+    }
+
+    /// The one-time backup: created exclusively (never through a symlink), 0600 whatever the
+    /// original's mode or the umask (the file may hold API keys), flushed to disk. An existing
+    /// regular file is the earlier backup and stays; anything else in the way is an error.
+    static func writeBackupOnce(_ data: Data, to path: String) throws {
+        let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+        if fd < 0 {
+            if errno == EEXIST {
+                var st = stat()
+                if lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG { return }
+                throw SwitcherError.message("\(path) exists and is not a regular file; move it away and run install again")
+            }
+            throw POSIXError.current("creating the backup \(path)")
+        }
+        var ok = fchmod(fd, 0o600) == 0
+        if ok {
+            ok = data.withUnsafeBytes { raw -> Bool in
+                var off = 0
+                while off < raw.count {
+                    let n = write(fd, raw.baseAddress! + off, raw.count - off)
+                    if n < 0 { if errno == EINTR { continue }; return false }
+                    off += n
+                }
+                return true
+            }
+        }
+        if ok { ok = fsync(fd) == 0 }
+        let err = errno
+        close(fd)
+        if !ok {
+            unlink(path)
+            errno = err
+            throw POSIXError.current("writing the backup \(path)")
+        }
     }
 
     /// The user's rc file keeps its permissions (and stays a regular file: a symlinked rc is
