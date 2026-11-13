@@ -278,6 +278,35 @@ import Testing
         #expect(profiles.checkLinks(profiles.defaultProfile(.claude)).isEmpty)
     }
 
+    // Review finding 5: a profile folder swapped for a symlink never lets links or files land outside.
+    @Test func writesRefuseAProfileFolderSwappedForASymlink() throws {
+        let box = CLIBox()
+        let profiles = claudeWorld(box)
+        box.write(box.home + "/.claude.json", "{\"mcpServers\":{\"a\":{}},\"theme\":\"dark\"}")
+        let p = try profiles.add(.claude, name: "work")
+        let outside = box.top + "/outside"
+        box.mkdir(outside)
+        try FileManager.default.removeItem(atPath: p.path)
+        box.symlink(p.path, to: outside)
+        #expect(throws: (any Error).self) { try profiles.applyLinks(p) }
+        #expect(throws: (any Error).self) { try profiles.seedClaudeJSON(p) }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside).isEmpty)
+        #expect(profiles.checkLinks(p).isEmpty)
+    }
+
+    @Test func writesRefuseASymlinkedProfilesRoot() throws {
+        let box = CLIBox()
+        let profiles = claudeWorld(box)
+        let outside = box.top + "/outside"
+        box.mkdir(outside + "/work")
+        box.symlink(box.env.profilesRoot(.claude), to: outside)
+        #expect(throws: (any Error).self) { try profiles.add(.claude, name: "new") }
+        let p = CLIProfile(kind: .claude, name: "work", path: box.env.profilesRoot(.claude) + "/work", isDefault: false)
+        #expect(throws: (any Error).self) { try profiles.applyLinks(p) }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside) == ["work"])
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside + "/work").isEmpty)
+    }
+
     @Test func applyLinksIsIdempotentAndNeverOverwrites() throws {
         let box = CLIBox()
         let profiles = claudeWorld(box)
