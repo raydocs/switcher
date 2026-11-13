@@ -21,7 +21,46 @@ public struct SignInLayout {
     public struct SecretRef: Codable, Equatable {
         public var service: String
         public var account: String
+        /// What a healthy value looks like. A value of another shape is refused, never moved.
+        public var shape: Shape = .any
         var tag: String { "\(service)/\(account)" }
+
+        public enum Shape: String, Codable, Equatable {
+            case any
+            /// A JSON object or array.
+            case json
+            /// What zalando/go-keyring writes: `go-keyring-base64:<base64>`, `go-keyring-encoded:<hex>`,
+            /// or the JSON itself. Bare hex (what `security -w` prints for a value with non-printable
+            /// bytes) is none of these.
+            case goKeyring
+        }
+
+        /// Whether `value` is of the expected shape.
+        func accepts(_ value: String) -> Bool {
+            switch shape {
+            case .any:
+                return true
+            case .json:
+                return Self.isJSONContainer(value)
+            case .goKeyring:
+                let b64 = "go-keyring-base64:", enc = "go-keyring-encoded:"
+                if value.hasPrefix(b64) {
+                    let body = String(value.dropFirst(b64.count))
+                    guard !body.isEmpty, let data = Data(base64Encoded: body) else { return false }
+                    return !data.isEmpty
+                }
+                if value.hasPrefix(enc) {
+                    let body = value.dropFirst(enc.count)
+                    return !body.isEmpty && body.count % 2 == 0 && body.allSatisfy { $0.isHexDigit }
+                }
+                return Self.isJSONContainer(value)
+            }
+        }
+
+        private static func isJSONContainer(_ value: String) -> Bool {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(value.utf8)) else { return false }
+            return obj is [String: Any] || obj is [Any]
+        }
     }
 }
 
@@ -137,6 +176,19 @@ public final class SignInVault {
         try FS.move(url, to: FS.uniquePath(bin.appendingPathComponent("\(provider.rawValue)-\(url.lastPathComponent)")))
     }
 
+    /// How long a trashed sign-in is kept before it is deleted for good.
+    static let trashRetention: TimeInterval = 14 * 86_400
+
+    /// Delete trash entries older than the retention. Only direct children of the trash folder that
+    /// are real folders (what `trash()` makes) are considered; nothing outside it is touched.
+    func pruneTrash(now: TimeInterval = FS.now) {
+        guard FS.isDirectory(trashRoot) else { return }
+        for bin in FS.children(trashRoot) where FS.isDirectory(bin) {
+            guard let modified = FS.mtime(bin), now - modified.timeIntervalSince1970 > Self.trashRetention else { continue }
+            FS.removeIfExists(bin)
+        }
+    }
+
     // MARK: Swap
 
     struct Journal: Codable {
@@ -177,6 +229,15 @@ public final class SignInVault {
                 throw SwitcherError.message(L10n.t(
                     "Can't tell which account the app is signed in to, so its sign-in can't be set aside safely. Open the app once so it finishes signing in, then try again.",
                     "无法判断该应用当前登录的是哪个账号，无法安全地保存它的登录。先打开一次该应用让它完成登录，再试。"))
+            }
+        }
+        // A live value that isn't the shape the app writes (the keychain tool prints hex for bytes it
+        // can't show) would be saved wrong and put back corrupted: refuse before anything moves.
+        for s in layout.secrets {
+            if let value = try keychain.get(service: s.service, account: s.account), !s.accepts(value) {
+                throw SwitcherError.message(L10n.t(
+                    "The keychain item \(s.service)/\(s.account) isn't in the form the app writes, so its sign-in can't be set aside safely. Nothing was changed.",
+                    "钥匙串项目 \(s.service)/\(s.account) 的格式不是应用写入的格式，无法安全地保存其登录。未做任何改动。"))
             }
         }
         try FS.makePrivateDir(stage)
