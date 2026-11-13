@@ -46,9 +46,11 @@ switcher cli: Claude Code and Codex accounts, chosen per new terminal session.
 
   switcher cli [list] [--json]         every profile, who it is signed in as, and which is active
   switcher cli use <cli> [<who>]       new claude/codex processes use this account (or the next)
-  switcher cli add <cli> [<name>]      add an account: make its folder, sign in, offer to switch
+  switcher cli add [<cli>] [<name>]    add an account: sign in in the browser, then offer to switch
                                        (--no-login: only the folder; --use: switch without asking)
   switcher cli login <cli> [<who>]     sign an account in again (default: the active one)
+  switcher cli remove <cli> <who> [--yes]
+                                       sign an account out and move its folder to the Trash
   switcher cli link [<cli>]            link shared settings into every profile
   switcher cli exec <cli> <who> [-- <command> [args]]
                                        run a command (default: the real CLI) as one account
@@ -57,7 +59,7 @@ switcher cli: Claude Code and Codex accounts, chosen per new terminal session.
   switcher cli doctor                  check shims, sign-ins, links and keychain items
   switcher cli usage [<cli>] [--renew] read each profile's quota now (--renew: let the CLI renew an expired sign-in)
 
-<cli> is claude or codex (cc / co). <who> is a number (1 = the default account), a name or default.
+<cli> is claude or codex (cc / co). <who> is a number (1 = the default account), a name, an email or default.
 """
 
 /// A line from the terminal, trimmed; nil at end of input.
@@ -69,12 +71,12 @@ func ask(_ prompt: String) -> String? {
 
 /// Run the CLI's own sign-in inside `profile`'s folder, in this terminal, then say who it is
 /// signed in as and (for a new account) offer to point new sessions at it.
-func signIn(_ profile: CLIProfile, env: CLIEnv, profiles: CLIProfiles, offerToUse: Bool, useWithoutAsking: Bool) {
+func signIn(_ profile: CLIProfile, env: CLIEnv, profiles: CLIProfiles, createdNow: Bool, offerToUse: Bool, useWithoutAsking: Bool) -> Never {
     let kind = profile.kind
     guard let real = CLIShim.findRealBinary(kind, env: env) else {
         fail("no real \(kind.command) found on PATH; sign in later with:\n  \(kind.loginCommand(profile))")
     }
-    print("Signing in \(kind.displayName) · \(profile.name) (your browser opens; finish there)…\n")
+    print("Signing in a \(kind.displayName) account: finish in the browser that opens (Ctrl-C cancels)…\n")
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: real)
     proc.arguments = kind.loginArguments
@@ -89,23 +91,31 @@ func signIn(_ profile: CLIProfile, env: CLIEnv, profiles: CLIProfiles, offerToUs
     print("")
     let state = profiles.signIn(profile, keychain: LiveCLIKeychain()).state
     guard state != .signedOut else {
-        print("Not signed in yet. Try again any time with:\n  switcher cli login \(kind.command) \(profile.name)")
+        if createdNow {
+            try? profiles.discardUnsignedIn(profile, keychain: LiveCLIKeychain())
+            print("Not signed in, so nothing was added. Run `switcher cli add \(kind.command)` to try again.")
+        } else {
+            print("Not signed in yet. Try again any time with:\n  switcher cli login \(kind.command) \(profile.name)")
+        }
         exit(1)
     }
     let who = profiles.identity(profile)
     let label = [who?.email, who?.plan.map { "(\($0))" }].compactMap { $0 }.joined(separator: " ")
-    print("✓ \(profile.name) is signed in\(label.isEmpty ? "" : " as " + label).")
+    print("✓ Signed in\(label.isEmpty ? "" : " as " + label) · account \(profile.name)")
+    if let twin = profiles.duplicates(of: profile).first {
+        print("  This is the same account as \(twin.name). If that was not meant: `switcher cli remove \(kind.command) \(profile.name)`.")
+    }
     guard offerToUse, !profile.isDefault, profiles.active(kind) != profile else { exit(0) }
     var use = useWithoutAsking
     if !use {
-        let answer = ask("Use \(profile.name) for new \(kind.command) sessions now? [Y/n] ")?.lowercased() ?? "n"
+        let answer = ask("Use it for new \(kind.command) sessions now? [Y/n] ")?.lowercased() ?? "n"
         use = answer.isEmpty || answer.hasPrefix("y")
     }
     if use {
         do { try profiles.setActive(profile) } catch { fail(error.localizedDescription) }
-        print("New \(kind.command) sessions now use \(profile.name). Switch back with `switcher cli use \(kind.command) default`.")
+        print("New \(kind.command) sessions now use \(label.isEmpty ? profile.name : who?.email ?? profile.name). Back: `switcher cli use \(kind.command) default`.")
     } else {
-        print("Switch to it any time with `switcher cli use \(kind.command) \(profile.name)`.")
+        print("Switch any time: `switcher cli use \(kind.command) \(who?.email ?? profile.name)`.")
     }
     exit(0)
 }
@@ -150,29 +160,61 @@ func runCLI(_ args: [String]) -> Never {
                 print("The \(kind.command) shim is not installed, so this pointer has no effect until `switcher cli install`.")
             }
         case "add":
-            let kind = cli(args.first)
-            let flags = Set(args.dropFirst().filter { $0.hasPrefix("--") })
-            let rest = args.dropFirst().filter { !$0.hasPrefix("--") }
             let tty = isatty(0) == 1 && isatty(1) == 1
-            var name = rest.first ?? ""
-            if name.isEmpty {
-                guard tty else { fail("say a name for the new account: `switcher cli add \(kind.command) <name>`") }
-                let taken = Set(profiles.list(kind).map(\.name))
-                let suggestion = (2...99).map { "account\($0)" }.first { !taken.contains($0) } ?? "account"
-                name = ask("Name for the new \(kind.displayName) account (letters, digits, - _ .) [\(suggestion)]: ") ?? ""
-                if name.isEmpty { name = suggestion }
+            let flags = Set(args.filter { $0.hasPrefix("--") })
+            var rest = args.filter { !$0.hasPrefix("--") }
+            let kind: CLIKind
+            if let k = CLICommands.kind(rest.first) {
+                kind = k
+                rest.removeFirst()
+            } else if rest.isEmpty, tty {
+                let answer = ask("Add which account? 1 Claude Code, 2 Codex [1]: ") ?? ""
+                guard let k = answer.isEmpty ? .claude : (answer == "2" ? .codex : (answer == "1" ? .claude : CLICommands.kind(answer))) else { fail("say claude or codex") }
+                kind = k
+            } else {
+                kind = cli(rest.first)
+            }
+            let name = rest.first ?? profiles.suggestedName(kind)
+            // An account that exists but is not signed in is signed in, not added again.
+            if let existing = profiles.list(kind).first(where: { $0.name.lowercased() == name.lowercased() }) {
+                guard profiles.signIn(existing, keychain: LiveCLIKeychain()).state == .signedOut else {
+                    let email = profiles.identity(existing)?.email
+                    fail("\(existing.name) is already signed in\(email.map { " as \($0)" } ?? ""); `switcher cli add \(kind.command)` adds another")
+                }
+                guard tty, !flags.contains("--no-login") else { print("Sign it in with:\n  \(kind.loginCommand(existing))"); exit(0) }
+                signIn(existing, env: env, profiles: profiles, createdNow: false, offerToUse: true, useWithoutAsking: flags.contains("--use"))
             }
             let p = try profiles.add(kind, name: name)
-            print("Created \(p.path)")
             guard tty, !flags.contains("--no-login") else {
+                print("Created \(p.path)")
                 print("Sign it in with:\n  \(kind.loginCommand(p))")
                 exit(0)
             }
-            signIn(p, env: env, profiles: profiles, offerToUse: true, useWithoutAsking: flags.contains("--use"))
+            signIn(p, env: env, profiles: profiles, createdNow: true, offerToUse: true, useWithoutAsking: flags.contains("--use"))
         case "login":
             let kind = cli(args.first)
             let p = args.count > 1 ? try CLICommands.profile(profiles, kind, args[1]) : profiles.active(kind)
-            signIn(p, env: env, profiles: profiles, offerToUse: false, useWithoutAsking: false)
+            signIn(p, env: env, profiles: profiles, createdNow: false, offerToUse: false, useWithoutAsking: false)
+        case "remove", "rm":
+            let kind = cli(args.first)
+            let rest = args.dropFirst().filter { !$0.hasPrefix("--") }
+            guard let who = rest.first else { fail("say which account: a number, a name or an email") }
+            let p = try CLICommands.profile(profiles, kind, who)
+            guard !p.isDefault else { fail("the default account stays (it is \(env.defaultFolder(kind)))") }
+            let email = profiles.identity(p)?.email
+            let label = p.name + (email.map { " (\($0))" } ?? "")
+            if !args.contains("--yes") {
+                guard isatty(0) == 1 else { fail("add --yes to remove \(label) without asking") }
+                let answer = ask("Sign \(label) out and move its folder to the Trash? Shared sessions and settings stay. [y/N] ")?.lowercased() ?? ""
+                guard answer.hasPrefix("y") else { print("Nothing was removed."); exit(0) }
+            }
+            if profiles.signIn(p, keychain: LiveCLIKeychain()).state != .signedOut, let real = CLIShim.findRealBinary(kind, env: env) {
+                let run = CLILoginRun(profile: p, binary: real, arguments: kind.logoutArguments)
+                try run.start()
+                run.wait()
+            }
+            try profiles.remove(p)
+            print("Removed \(label). New \(kind.command) sessions use \(profiles.active(kind).name).")
         case "link":
             let kinds = args.isEmpty ? CLIKind.allCases : [cli(args.first)]
             var any = false

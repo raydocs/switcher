@@ -38,7 +38,12 @@ struct CLIRow: Equatable, Identifiable {
 
     var id: String { "\(kind.rawValue):\(name)" }
     /// The account in a sentence: its own name, or who the default account is.
-    var label: String { isDefault ? (email ?? name) : name }
+    var label: String { email ?? name }
+    /// Under the email: the folder's name (the email is the title), or nothing when there is no email.
+    var secondary: String? {
+        guard email != nil else { return nil }
+        return isDefault ? L.t("default", "默认") : name
+    }
 }
 
 /// One CLI: whether its command goes through Switcher, and its accounts.
@@ -71,12 +76,17 @@ extension L {
           "已为 \(kind.command) 选用 \(who)，但要先安装终端设置才会生效。")
     }
 
-    static var cliNameRule: String {
-        t("Use letters, digits, - _ or . for the name (and not \"default\").", "名称只能用字母、数字、- _ 和 .（不能是 default）。")
+    static func cliSignedIn(_ kind: CLIKind, _ who: String) -> String {
+        t("Signed in as \(who). Click it to use it for new \(kind.command) sessions.", "已登录 \(who)。点它即可让新的 \(kind.command) 会话使用这个账号。")
     }
 
-    static func cliAdded(_ kind: CLIKind, _ name: String) -> String {
-        t("Added \(name). Finish signing in in the Terminal window that opened.", "已添加 \(name)，在打开的终端窗口里完成登录即可。")
+    static func cliDuplicate(_ who: String, _ other: String) -> String {
+        t("Signed in as \(who), the same account as \(other).", "已登录 \(who)，和 \(other) 是同一个账号。")
+    }
+
+    static func cliSignInFailed(status: Int32, detail: String) -> String {
+        let d = detail.trimmingCharacters(in: .whitespaces)
+        return t("The sign-in did not finish (exit \(status))." + (d.isEmpty ? "" : " " + d), "登录没有完成（退出码 \(status)）。" + (d.isEmpty ? "" : d))
     }
 
     static func cliNotFound(_ kind: CLIKind) -> String {
@@ -116,7 +126,6 @@ struct CLISection: View {
     struct Staged {
         var expanded: Set<CLIKind>?
         var adding: CLIKind?
-        var name = ""
         var hover: String?
     }
 
@@ -216,12 +225,12 @@ struct CLISection: View {
             ForEach(board.rows) { row in
                 CLIRowView(model: model, row: row, forcedHover: staged.hover == row.id)
             }
-            if adding == board.kind {
-                CLIAddCard(model: model, kind: board.kind, stagedName: staged.name) { adding = nil }
+            if model.cliSigningIn[board.kind] != nil || adding == board.kind {
+                CLISigningInCard(model: model, kind: board.kind)
                     .padding(.vertical, 4)
             } else {
                 Button {
-                    adding = board.kind
+                    model.addCLIAccount(board.kind)
                 } label: {
                     // A last, quiet line of the list: the plus under the numbers, the words under the names.
                     HStack(spacing: Metrics.avatarGap) {
@@ -234,8 +243,8 @@ struct CLISection: View {
                 }
                 .buttonStyle(QuietButtonStyle())
                 .font(.callout)
-                .help(L.t("Make another \(board.kind.displayName) account for the terminal, then sign in to it there",
-                          "为终端新建一个 \(board.kind.displayName) 账号，然后在终端里登录"))
+                .help(L.t("Sign in to another \(board.kind.displayName) account in your browser",
+                          "在浏览器里登录另一个 \(board.kind.displayName) 账号"))
                 .padding(.bottom, 4)
             }
         }
@@ -245,7 +254,6 @@ struct CLISection: View {
         var now = expanded
         if now.contains(kind) {
             now.remove(kind)
-            if adding == kind { adding = nil }
         } else {
             now.insert(kind)
             model.loadCLIQuota(kind)
@@ -354,8 +362,8 @@ struct CLIRowView: View {
                     VStack(alignment: .leading, spacing: 5) {
                         VStack(alignment: .leading, spacing: 1) {
                             titleLine
-                            if let email = row.email {
-                                Text(email)
+                            if let tag = row.secondary {
+                                Text(tag)
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
@@ -398,7 +406,7 @@ struct CLIRowView: View {
 
     private var titleLine: some View {
         HStack(spacing: 6) {
-            Text(row.name)
+            Text(row.email ?? row.name)
                 .font(.body.weight(row.isActive ? .semibold : .medium))
                 .foregroundStyle(needsSignIn && !row.isActive ? .secondary : .primary)
                 .lineLimit(1)
@@ -527,15 +535,13 @@ struct CLIRowView: View {
 
     private var signInNote: some View {
         let lead = ranOut ? L.t("The sign-in has run out.", "登录已失效。") : L.t("Not signed in.", "未登录。")
-        let how = L.t("Sign in opens Terminal; or run this yourself:", "点“登录”会打开终端；也可以自己运行：")
+        let how = L.t("Sign in opens your browser; or run this in a terminal:", "点“登录”会打开浏览器；也可以在终端运行：")
         return Note(symbol: ranOut ? "exclamationmark.circle" : "info.circle", text: lead + (L.zh ? "" : " ") + how, tint: ranOut ? .orange : nil)
     }
 
     private var signInSteps: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Button(L.t("Sign in…", "登录…")) {
-                model.openSignIn(row.kind, name: row.isDefault ? "default" : row.name, loginCommand: shellCommand)
-            }
+            Button(L.t("Sign In…", "登录…")) { model.signInCLI(row) }
             .buttonStyle(SoftButtonStyle(kind: .tinted, compact: true))
             .fixedSize()
             CommandBox(model: model, command: shellCommand)
@@ -616,87 +622,36 @@ struct CommandBox: View {
 
 // MARK: Adding an account
 
-/// A short name for the new account's folder. Signing in happens in a terminal afterwards: the new
-/// row shows the command.
-struct CLIAddCard: View {
+/// While the CLI's own sign-in runs in the background: the browser is open, finish there.
+struct CLISigningInCard: View {
     let model: AppModel
     let kind: CLIKind
-    let close: () -> Void
-
-    @State private var name: String
-    @State private var problem: String?
-    @State private var working = false
-    @FocusState private var focused: Bool
-    @Environment(\.staticRender) private var staticRender
-
-    init(model: AppModel, kind: CLIKind, stagedName: String = "", close: @escaping () -> Void) {
-        self.model = model
-        self.kind = kind
-        self.close = close
-        _name = State(initialValue: stagedName)
-    }
-
-    private var trimmed: String { name.trimmingCharacters(in: .whitespaces) }
-    private var placeholder: String { L.t("Name, like work", "名称，例如 work") }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(L.t("Add a \(kind.displayName) account", "添加 \(kind.displayName) 账号"))
-                .font(.body.weight(.semibold))
-            Text(L.t("Give it a short name. It gets its own folder, and Terminal opens to sign it in. Nothing running changes.",
-                     "起一个简短的名称。它会有自己的文件夹，随后自动打开终端登录。正在运行的会话不受影响。"))
+            HStack(spacing: 8) {
+                Spinner(size: 12)
+                Text(L.t("Waiting for the browser…", "等待浏览器…"))
+                    .font(.body.weight(.semibold))
+            }
+            Text(L.t("Sign in to the \(kind.displayName) account you want in the browser window that opened. It shows up here when you are done.",
+                     "在打开的浏览器窗口里登录想添加的 \(kind.displayName) 账号，完成后会出现在这里。"))
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Group {
-                if staticRender {
-                    Text(name.isEmpty ? placeholder : name)
-                        .foregroundStyle(name.isEmpty ? .tertiary : .primary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    TextField(placeholder, text: $name)
-                        .textFieldStyle(.plain)
-                        .autocorrectionDisabled()
-                        .focused($focused)
-                        .onSubmit(add)
-                }
-            }
-            .font(.body)
-            .padding(.horizontal, 8)
-            .frame(height: Metrics.control)
-            .background(Fill.hover, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-            .overlay {
-                if focused || staticRender {
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .strokeBorder(Color.accentColor.opacity(0.7), lineWidth: 2)
-                }
-            }
-            if let problem {
-                Note(symbol: "exclamationmark.circle", text: problem, tint: .orange)
-            }
             HStack(spacing: 6) {
+                Button(L.t("Use Terminal Instead", "改用终端")) { model.continueCLISignInInTerminal(kind) }
+                    .buttonStyle(QuietButtonStyle())
+                    .font(.subheadline)
+                    .help(L.t("If no browser opened: sign in in a Terminal window", "如果没有打开浏览器：在终端窗口里登录"))
                 Spacer()
-                Button(L.t("Cancel", "取消"), action: close)
+                Button(L.t("Cancel", "取消")) { model.cancelCLISignIn(kind) }
                     .buttonStyle(SoftButtonStyle(compact: true))
                     .keyboardShortcut(.cancelAction)
-                Button(L.t("Add", "添加"), action: add)
-                    .buttonStyle(SoftButtonStyle(kind: .tinted, compact: true))
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(trimmed.isEmpty || working)
             }
         }
         .padding(Metrics.gap)
         .background(Fill.card, in: RoundedRectangle(cornerRadius: Metrics.radius, style: .continuous))
-        .onAppear { focused = true }
-        .onChange(of: name) { problem = nil }
-    }
-
-    private func add() {
-        guard !trimmed.isEmpty, !working else { return }
-        working = true
-        model.addCLIProfile(kind, name: trimmed) { failure in
-            working = false
-            if let failure { problem = failure } else { close() }
-        }
+        .accessibilityElement(children: .contain)
     }
 }

@@ -209,7 +209,7 @@ enum Snapshot {
             Fixture(name: "15-cli-not-installed", model: model(boards(claude: short), cli: cli(installed: false)), staged: both),
             Fixture(name: "16-cli-collapsed", model: model(boards(), cli: cli()), staged: MenuView.Staged(cli: .init(expanded: []))),
             Fixture(name: "17-cli-add", model: model(boards(claude: short), cli: cli(renew: true), cliJustInstalled: true),
-                    staged: MenuView.Staged(cli: .init(expanded: [.claude], adding: .claude, name: "personal", hover: "claude:work"))),
+                    staged: MenuView.Staged(cli: .init(expanded: [.claude], adding: .claude, hover: "claude:work"))),
 
             Fixture(name: "20-settings-general", model: model(boards()), settings: .general, page: .init(openAtLogin: true)),
             Fixture(name: "21-settings-accounts", model: model(boards(claude: edgeRows)), settings: .accounts,

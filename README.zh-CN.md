@@ -73,9 +73,8 @@ scripts/bundle.sh && cp -R dist/Switcher.app /Applications/
 
 ```sh
 switcher cli install                 # shims and the PATH line; open a new terminal afterwards
-switcher cli add cc work             # 创建 ~/.claude-profiles/work，登录，并询问是否切换
-                                     # now run the sign-in command it printed
-switcher cli use cc work             # new `claude` processes now use "work"
+switcher cli add cc                  # 在浏览器里登录另一个账号，然后询问是否切换
+switcher cli use cc you@example.com  # 新的 `claude` 进程使用这个账号（也可用编号或名称）
 switcher cli exec co 2 -- codex      # run Codex as account 2, once, without changing the pointer
 switcher cli usage                   # quota of every profile
 switcher cli doctor                  # check shims, sign-ins, links and keychain items
@@ -87,8 +86,9 @@ switcher cli doctor                  # check shims, sign-ins, links and keychain
 |---|---|
 | `switcher cli [list] [--json]` | 每个配置文件夹、它登录的是谁，以及哪个是当前激活的 |
 | `switcher cli use <cli> [<who>]` | 新的 `claude` / `codex` 进程使用这个账号（不带 `<who>`：下一个账号） |
-| `switcher cli add <cli> [<name>]` | 添加账号：创建文件夹，在里面运行 CLI 自己的登录，再询问是否切换（不给名字会询问；`--no-login` 只建文件夹；`--use` 不询问直接切换） |
+| `switcher cli add [<cli>] [<name>]` | 添加账号：CLI 自己的登录会打开浏览器，完成后询问是否切换。不给名字时文件夹依次叫 `account2`、`account3`……；取消登录不会留下任何东西；如果是已有的账号会提示。`--no-login` 只建文件夹；`--use` 不询问直接切换 |
 | `switcher cli login <cli> [<who>]` | 重新登录某个账号（默认是当前账号） |
+| `switcher cli remove <cli> <who> [--yes]` | 退出某个账号的登录，并把它的文件夹移到废纸篓（默认账号不能删；共享的会话和设置保留） |
 | `switcher cli link [<cli>]` | 把共享设置链接到每个配置文件夹 |
 | `switcher cli exec <cli> <who> [-- <command> [args]]` | 以某个账号运行一条命令（默认：真正的 CLI） |
 | `switcher cli install [--no-rc]` | 安装垫片和 `~/.zshrc` 中的那一行（`--no-rc`：只装垫片，由你自己把文件夹加入 PATH） |
@@ -96,7 +96,9 @@ switcher cli doctor                  # check shims, sign-ins, links and keychain
 | `switcher cli doctor` | 检查垫片、登录状态、链接和钥匙串条目 |
 | `switcher cli usage [<cli>] [--renew]` | 立即读取每个配置文件夹的额度；`--renew` 允许 CLI 续期已过期的登录 |
 
-`<cli>` 为 `claude` 或 `codex`（即 `cc` / `co`）。`<who>` 可以是数字（1 = 默认账号）、名称或 `default`。
+`<cli>` 为 `claude` 或 `codex`（即 `cc` / `co`）。`<who>` 可以是数字（1 = 默认账号）、名称、登录的邮箱或 `default`。
+
+在菜单栏 app 里，Claude Code 或 Codex 下的 **添加账号…** 一键完成同样的事：浏览器打开，登录完成后账号就会出现（可以取消；没打开浏览器时点 **改用终端**）。账号按邮箱显示；登录后文件夹不会改名，因为 Claude Code 的钥匙串项是按文件夹路径命名的。
 
 ## 原理
 

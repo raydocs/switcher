@@ -39,6 +39,8 @@ final class AppModel {
     /// The CLIs whose usage is being read, and the accounts whose sign-in is being renewed.
     private(set) var cliReading: Set<CLIKind> = []
     private(set) var cliRenewing: Set<String> = []
+    /// A sign-in running in the background (the browser is open), per CLI: the account's name.
+    private(set) var cliSigningIn: [CLIKind: String] = [:]
     /// True once "Install" has run here: what is left is to open a new terminal.
     private(set) var cliJustInstalled = false
     var banner: Banner?
@@ -54,6 +56,8 @@ final class AppModel {
     @ObservationIgnored private let cliKeychain: CLIKeychain
     @ObservationIgnored private var cliQuotaErrors: [String: CLIQuotaError] = [:]
     @ObservationIgnored private var cliQuotaReadAt: [CLIKind: Date] = [:]
+    @ObservationIgnored private var cliLoginRuns: [CLIKind: CLILoginRun] = [:]
+    @ObservationIgnored private var cliCancelled: Set<CLIKind> = []
 
     /// Fixed data for previews and screenshots: touches nothing on disk.
     init(preview boards: [AppBoard], ccSame: CCSameImport.Found? = nil, job: SwitchJob? = nil, banner: Banner? = nil,
@@ -281,28 +285,89 @@ final class AppModel {
         }
     }
 
-    /// Why `name` cannot be an account's name, or nil.
-    func cliNameProblem(_ name: String) -> String? {
-        CLIPath.isValidName(name) ? nil : L.cliNameRule
+
+    /// Add an account with one click: Switcher names the folder (`account2`, …), and the CLI's own
+    /// sign-in runs in the background and opens the browser. If it ends without a sign-in, the
+    /// new folder is removed again, so a cancelled add leaves nothing behind.
+    func addCLIAccount(_ kind: CLIKind) {
+        if isPreview || cliSigningIn[kind] != nil { return }
+        let cli = self.cli
+        queue.async {
+            let result = Result { try cli.add(kind, name: cli.suggestedName(kind)) }
+            Task { @MainActor in
+                switch result {
+                case .success(let p): self.startCLISignIn(p, createdNow: true)
+                case .failure(let error): self.banner = Banner(kind: .error, text: error.localizedDescription)
+                }
+            }
+        }
     }
 
-    /// Make an account folder. `done` gets nil, or why it failed (to show next to the name).
-    func addCLIProfile(_ kind: CLIKind, name: String, done: @escaping @MainActor (String?) -> Void) {
-        if isPreview { return }
-        if let problem = cliNameProblem(name) { return done(problem) }
+    /// Sign an existing account in (again), in the background.
+    func signInCLI(_ row: CLIRow) {
+        if isPreview || cliSigningIn[row.kind] != nil { return }
+        guard let p = try? Self.profile(cli, row.kind, row.isDefault ? "default" : row.name) else { return }
+        startCLISignIn(p, createdNow: false)
+    }
+
+    func cancelCLISignIn(_ kind: CLIKind) {
+        guard let run = cliLoginRuns[kind] else { return }
+        cliCancelled.insert(kind)
+        queue.async { run.cancel() }
+    }
+
+    /// The sign-in that is running, in Terminal instead (when the browser flow does not work here).
+    func continueCLISignInInTerminal(_ kind: CLIKind) {
+        guard let name = cliSigningIn[kind], let run = cliLoginRuns[kind] else { return }
+        let command = kind.loginCommand(run.profile)
+        cliCancelled.insert(kind)
+        queue.async { run.cancel() }
+        openSignIn(kind, name: name, loginCommand: command)
+    }
+
+    private func startCLISignIn(_ p: CLIProfile, createdNow: Bool) {
         let cli = self.cli, keychain = self.cliKeychain
-        queue.async {
-            let result = Result { try cli.add(kind, name: name) }
+        guard let binary = Self.realBinary(cli, p.kind) else {
+            banner = Banner(kind: .error, text: L.cliNotFound(p.kind))
+            if createdNow { queue.async { try? cli.discardUnsignedIn(p, keychain: keychain) } }
+            return
+        }
+        // Launched from Finder the app has a bare PATH; the CLI may look for its helpers there.
+        var base = ProcessInfo.processInfo.environment
+        base["PATH"] = [cli.env.home + "/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", base["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"].joined(separator: ":")
+        let run = CLILoginRun(profile: p, binary: binary, baseEnvironment: base)
+        do { try run.start() } catch {
+            banner = Banner(kind: .error, text: error.localizedDescription)
+            if createdNow { queue.async { try? cli.discardUnsignedIn(p, keychain: keychain) } }
+            return
+        }
+        cliLoginRuns[p.kind] = run
+        cliCancelled.remove(p.kind)
+        cliSigningIn[p.kind] = p.name
+        if createdNow { refreshCLI() }
+        Task.detached {
+            let status = run.wait()
+            let signedIn = cli.signIn(p, keychain: keychain).state != .signedOut
+            if !signedIn, createdNow { try? cli.discardUnsignedIn(p, keychain: keychain) }
+            let email = cli.identity(p)?.email
+            let twin = signedIn ? cli.duplicates(of: p).first : nil
+            let output = signedIn ? "" : run.output()
             let boards = Self.readCLI(cli, keychain)
-            Task { @MainActor in
+            await MainActor.run {
+                let cancelled = self.cliCancelled.remove(p.kind) != nil
+                self.cliLoginRuns[p.kind] = nil
+                self.cliSigningIn[p.kind] = nil
                 self.setCLI(boards)
-                switch result {
-                case .success:
-                    self.banner = Banner(kind: .success, text: L.cliAdded(kind, name))
-                    self.openSignIn(kind, name: name, loginCommand: nil)
-                    done(nil)
-                case .failure(let error):
-                    done(error.localizedDescription)
+                if signedIn {
+                    if let twin {
+                        self.banner = Banner(kind: .info, text: L.cliDuplicate(email ?? p.name, twin.isDefault ? "1" : twin.name))
+                    } else {
+                        self.banner = Banner(kind: .success, text: L.cliSignedIn(p.kind, email ?? p.name))
+                    }
+                    self.loadCLIQuota(p.kind, force: true)
+                } else if !cancelled {
+                    let last = output.split(separator: "\n").last.map(String.init) ?? ""
+                    self.banner = Banner(kind: .error, text: L.cliSignInFailed(status: status, detail: last))
                 }
             }
         }

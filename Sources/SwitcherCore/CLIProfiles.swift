@@ -171,15 +171,19 @@ public final class CLIProfiles {
         let root = env.profilesRoot(kind)
         let names = ((try? fm.contentsOfDirectory(atPath: root)) ?? []).filter { name in
             CLIPath.isValidName(name) && Self.isRealDirectory(root + "/" + name)
-        }.sorted()
+        }.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
         return [defaultProfile(kind)] + names.map { CLIProfile(kind: kind, name: $0, path: root + "/" + $0, isDefault: false) }
     }
 
-    /// `1` is the default account, `2…` the profiles in name order; or a name, or `default`.
+    /// `1` is the default account, `2…` the profiles in name order (account2 before account10);
+    /// or a name, `default`, or the email an account is signed in as (when only one is).
     public func resolve(_ kind: CLIKind, _ query: String) -> CLIProfile? {
         let all = list(kind)
         if let n = Int(query), n >= 1, n <= all.count { return all[n - 1] }
-        return all.first { $0.name == query } ?? all.first { $0.name.lowercased() == query.lowercased() }
+        if let p = all.first(where: { $0.name == query }) ?? all.first(where: { $0.name.lowercased() == query.lowercased() }) { return p }
+        guard query.contains("@") else { return nil }
+        let byEmail = all.filter { identity($0)?.email?.lowercased() == query.lowercased() }
+        return byEmail.count == 1 ? byEmail[0] : nil
     }
 
     /// The profile new `claude` / `codex` processes get. A missing or invalid pointer is the
