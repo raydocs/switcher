@@ -278,7 +278,7 @@ public struct CLIDoctor {
 
         // Claude keychain items nobody uses, and the stale plaintext fallback.
         let expected = Set(profiles.list(.claude).map { claudeKeychainService(configDir: $0.envValue) })
-        let byHash = Dictionary(uniqueKeysWithValues: [env.defaultFolder(.claude), env.defaultFolder(.claude) + "/"].map { (dir: String) in (claudeKeychainService(configDir: dir), dir) })
+        let byHash: [String: String] = Dictionary(uniqueKeysWithValues: [env.defaultFolder(.claude), env.defaultFolder(.claude) + "/"].map { (claudeKeychainService(configDir: $0), $0) })
         for service in keychain.claudeServices() where !expected.contains(service) {
             let why = byHash[service].map { " (it is what CLAUDE_CONFIG_DIR=\($0) reads; leave that variable unset for the default account)" } ?? " (another tool's folder, e.g. Orca, or a deleted profile)"
             add(.note, "keychain item \"\(service)\" is not one of Switcher's profiles\(why). Switcher never deletes it.")
