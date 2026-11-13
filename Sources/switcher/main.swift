@@ -188,6 +188,7 @@ func runCLIUsage(_ args: [String]) async -> Never {
         print(kind.displayName)
         guard let real = CLIShim.findRealBinary(kind, env: env) else { print("  \(kind.command) not found"); continue }
         for p in profiles.list(kind) {
+            let accountKey = profiles.identity(p)?.accountKey
             let head = "  \(p.name)\(profiles.identity(p)?.email.map { " (\($0))" } ?? "")"
             func read() async throws -> CLIQuota {
                 switch kind {
@@ -201,14 +202,14 @@ func runCLIUsage(_ args: [String]) async -> Never {
                     guard ClaudeCodeQuota.renewLogin(profile: p, claudeBinary: real, stateDir: env.config + "/renew") else { throw CLIQuotaError.signInExpired }
                     q = try await read()
                 }
-                try? cache.store(q, for: p)
+                try? cache.store(q, for: p, accountKey: accountKey)
                 print(head + "  [\(q.source)]")
                 for w in q.windows {
                     print("    \(w.label): \(Int(w.usedPercent.rounded()))% used\(w.resetsAt.map { ", resets " + fmt.string(from: $0) } ?? "")")
                 }
             } catch {
                 print(head + "  ! \(error.localizedDescription)\(error as? CLIQuotaError == .signInExpired && kind == .claude ? " (try --renew)" : "")")
-                if let old = cache.quota(for: p) { print("    last read \(ago(old.observedAt)): " + old.windows.map { "\($0.label) \(Int($0.usedPercent.rounded()))%" }.joined(separator: ", ")) }
+                if let old = cache.quota(for: p, accountKey: profiles.identity(p)?.accountKey) { print("    last read \(ago(old.observedAt)): " + old.windows.map { "\($0.label) \(Int($0.usedPercent.rounded()))%" }.joined(separator: ", ")) }
             }
         }
     }

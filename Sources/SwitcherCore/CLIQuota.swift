@@ -134,10 +134,14 @@ public enum ClaudeCodeQuota {
             throw CLIQuotaError.signInExpired
         }
 
+        // Who this read is for: the account and a fingerprint of the token, compared again after
+        // the response. The fingerprint stays in memory; it is never stored.
+        let before = identityStamp(profile: profile, profiles: profiles, token: token)
+        let result: CLIQuota
         do {
             var quota = try await requestUsage(token: token, http: http, now: now)
             quota.plan = plan
-            return quota
+            result = quota
         } catch {
             let message = (error as? CLIQuotaError)?.errorDescription ?? "Claude usage request failed or timed out."
             guard var p = passive else {
@@ -147,8 +151,27 @@ public enum ClaudeCodeQuota {
                 throw CLIQuotaError.unavailable("\(message) The last statusline reading (\(ISO8601DateFormatter().string(from: p.observedAt))) is too old to stand in for current quota.")
             }
             p.plan = plan
-            return p
+            result = p
         }
+        guard identityStamp(profile: profile, profiles: profiles, keychain: keychain) == before else {
+            throw CLIQuotaError.unavailable("the account changed during the read; try again")
+        }
+        return result
+    }
+
+    struct IdentityStamp: Equatable {
+        var accountKey: String?
+        var tokenPrefix: String?
+    }
+
+    static func identityStamp(profile: CLIProfile, profiles: CLIProfiles, token: String?) -> IdentityStamp {
+        IdentityStamp(accountKey: profiles.identity(profile)?.accountKey,
+                      tokenPrefix: token.map { String(SHA256.hex(Data($0.utf8)).prefix(16)) })
+    }
+
+    static func identityStamp(profile: CLIProfile, profiles: CLIProfiles, keychain: CLIKeychain) -> IdentityStamp {
+        identityStamp(profile: profile, profiles: profiles,
+                      token: profiles.claudeOAuth(profile, keychain: keychain)?["accessToken"] as? String)
     }
 
     static func requestUsage(token: String, http: HTTPGetter, now: Date) async throws -> CLIQuota {
@@ -469,24 +492,35 @@ public enum CodexQuota {
 // MARK: - Cache
 
 /// The last good quota per profile id, in `<CLIEnv.config>/quota-cache.json` (0600). A quota holds
-/// percentages, reset times, a plan name and a source label: no tokens, no emails.
+/// percentages, reset times, a plan name and a source label: no tokens, no emails. Each entry is
+/// bound to the account it was read for (the opaque account id, never a token or a hash of one):
+/// when a profile is signed in as someone else, the old entry is not returned.
 public struct CLIQuotaCache {
+    struct Entry: Codable {
+        var quota: CLIQuota
+        var accountKey: String?
+    }
+
     struct File: Codable {
-        var version = 1
-        var profiles: [String: CLIQuota] = [:]
+        var version = 2
+        var profiles: [String: Entry] = [:]
     }
 
     public let url: URL
 
     public init(env: CLIEnv) { url = URL(fileURLWithPath: env.config + "/quota-cache.json") }
 
-    public func load() -> [String: CLIQuota] { readFile().profiles }
+    public func load() -> [String: CLIQuota] { readFile().profiles.mapValues(\.quota) }
 
-    public func quota(for profile: CLIProfile) -> CLIQuota? { readFile().profiles[profile.id] }
+    /// The cached quota, only when it was read for `accountKey` (the profile's current account).
+    public func quota(for profile: CLIProfile, accountKey: String?) -> CLIQuota? {
+        guard let e = readFile().profiles[profile.id], e.accountKey == accountKey else { return nil }
+        return e.quota
+    }
 
-    public func store(_ quota: CLIQuota, for profile: CLIProfile) throws {
+    public func store(_ quota: CLIQuota, for profile: CLIProfile, accountKey: String?) throws {
         var file = readFile()
-        file.profiles[profile.id] = quota
+        file.profiles[profile.id] = Entry(quota: quota, accountKey: accountKey)
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         enc.dateEncodingStrategy = .iso8601
