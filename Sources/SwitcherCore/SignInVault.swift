@@ -176,6 +176,19 @@ public final class SignInVault {
         try FS.move(url, to: FS.uniquePath(bin.appendingPathComponent("\(provider.rawValue)-\(url.lastPathComponent)")))
     }
 
+    /// How long a trashed sign-in is kept before it is deleted for good.
+    static let trashRetention: TimeInterval = 14 * 86_400
+
+    /// Delete trash entries older than the retention. Only direct children of the trash folder that
+    /// are real folders (what `trash()` makes) are considered; nothing outside it is touched.
+    func pruneTrash(now: TimeInterval = FS.now) {
+        guard FS.isDirectory(trashRoot) else { return }
+        for bin in FS.children(trashRoot) where FS.isDirectory(bin) {
+            guard let modified = FS.mtime(bin), now - modified.timeIntervalSince1970 > Self.trashRetention else { continue }
+            FS.removeIfExists(bin)
+        }
+    }
+
     // MARK: Swap
 
     struct Journal: Codable {

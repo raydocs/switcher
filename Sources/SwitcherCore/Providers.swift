@@ -80,6 +80,7 @@ public final class Provider {
         guard !app.isRunning, let lock = try? FileLock(lockURL, timeout: 0) else { return }
         withExtendedLifetime(lock) {
             do { try vault.recover() } catch { log("finishing an interrupted switch: \(error.localizedDescription)") }
+            vault.pruneTrash()
         }
     }
 }
