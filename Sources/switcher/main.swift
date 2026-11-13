@@ -53,6 +53,7 @@ switcher cli: Claude Code and Codex accounts, chosen per new terminal session.
   switcher cli install [--no-rc]       install the PATH shims (and the line in ~/.zshrc)
   switcher cli uninstall               remove the shims and the rc lines
   switcher cli doctor                  check shims, sign-ins, links and keychain items
+  switcher cli usage [<cli>] [--renew] read each profile's quota now (--renew: let the CLI renew an expired sign-in)
 
 <cli> is claude or codex (cc / co). <who> is a number (1 = the default account), a name or default.
 """
@@ -172,9 +173,52 @@ func runCLI(_ args: [String]) -> Never {
     exit(0)
 }
 
+/// `switcher cli usage`: every profile's quota, from the statusline file, Claude's usage endpoint
+/// or `codex app-server`. Never refreshes a token itself; `--renew` asks the CLI to.
+func runCLIUsage(_ args: [String]) async -> Never {
+    let env = CLIEnv(home: ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory())
+    let profiles = CLIProfiles(env: env)
+    let keychain = LiveCLIKeychain()
+    let cache = CLIQuotaCache(env: env)
+    let kinds = args.first.flatMap(CLICommands.kind).map { [$0] } ?? CLIKind.allCases
+    let renew = args.contains("--renew")
+    let fmt = DateFormatter()
+    fmt.dateFormat = "MMM d HH:mm"
+    for kind in kinds {
+        print(kind.displayName)
+        guard let real = CLIShim.findRealBinary(kind, env: env) else { print("  \(kind.command) not found"); continue }
+        for p in profiles.list(kind) {
+            let head = "  \(p.name)\(profiles.identity(p)?.email.map { " (\($0))" } ?? "")"
+            func read() async throws -> CLIQuota {
+                switch kind {
+                case .claude: try await ClaudeCodeQuota.read(profile: p, profiles: profiles, keychain: keychain, http: URLSessionHTTPGetter())
+                case .codex: try await CodexQuota.read(profile: p, codexBinary: real)
+                }
+            }
+            do {
+                var q: CLIQuota
+                do { q = try await read() } catch CLIQuotaError.signInExpired where renew && kind == .claude {
+                    guard ClaudeCodeQuota.renewLogin(profile: p, claudeBinary: real, stateDir: env.config + "/renew") else { throw CLIQuotaError.signInExpired }
+                    q = try await read()
+                }
+                try? cache.store(q, for: p)
+                print(head + "  [\(q.source)]")
+                for w in q.windows {
+                    print("    \(w.label): \(Int(w.usedPercent.rounded()))% used\(w.resetsAt.map { ", resets " + fmt.string(from: $0) } ?? "")")
+                }
+            } catch {
+                print(head + "  ! \(error.localizedDescription)\(error as? CLIQuotaError == .signInExpired && kind == .claude ? " (try --renew)" : "")")
+                if let old = cache.quota(for: p) { print("    last read \(ago(old.observedAt)): " + old.windows.map { "\($0.label) \(Int($0.usedPercent.rounded()))%" }.joined(separator: ", ")) }
+            }
+        }
+    }
+    exit(0)
+}
+
 let board = Switchboard()
 var args = Array(CommandLine.arguments.dropFirst())
 let command = args.isEmpty ? "list" : args.removeFirst()
+if command == "cli", args.first == "usage" { await runCLIUsage(Array(args.dropFirst())) }
 if command == "cli" { runCLI(args) }
 
 func who(_ p: ProviderID, _ q: String?) -> Slot {
