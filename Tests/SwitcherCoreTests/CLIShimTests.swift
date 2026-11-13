@@ -142,6 +142,19 @@ import Testing
         #expect(try w.run(extra: ["SWITCHER_BYPASS": "0"]).value("CLAUDE_CONFIG_DIR") == w.root + "/a")
     }
 
+    // Review finding 4: an explicit default stays the default even when the pointer says otherwise.
+    @Test func anExplicitDefaultSurvivesTheShim() throws {
+        let w = try world()
+        w.pointer(w.root + "/a\n")
+        let base = ["CLAUDE_CONFIG_DIR": w.root + "/a"]
+        let env = CLICommands.environment(base: base, profile: w.profiles.defaultProfile(.claude))
+        let r = try w.run(extra: env)
+        #expect(r.value("CLAUDE_CONFIG_DIR") == "<unset>")
+        // A profile run through exec is passed through by the shim as it is.
+        let p = CLICommands.environment(base: [:], profile: w.profiles.resolve(.claude, "a")!)
+        #expect(try w.run(extra: p).value("CLAUDE_CONFIG_DIR") == w.root + "/a")
+    }
+
     @Test func argumentsArriveIntact() throws {
         let w = try world()
         let args = ["plain", "two words", "it's", "say \"hi\"", "$HOME", "`x`", "a;b", "*", "-p", "", "  lead"]

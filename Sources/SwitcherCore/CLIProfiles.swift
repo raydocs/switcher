@@ -52,7 +52,9 @@ public enum CLIKind: String, CaseIterable, Codable, Sendable, Identifiable {
 
     /// The command to sign a profile in, as the user types it.
     public func loginCommand(_ profile: CLIProfile) -> String {
-        let prefix = profile.isDefault ? "" : "\(envVar)=\(shellQuote(profile.path)) "
+        // The default account clears the variable and bypasses the shim, which would otherwise
+        // follow the pointer to another account.
+        let prefix = profile.isDefault ? "env -u \(envVar) SWITCHER_BYPASS=1 " : "\(envVar)=\(shellQuote(profile.path)) "
         switch self {
         case .claude: return "\(prefix)claude   # then type /login"
         case .codex: return "\(prefix)codex login"

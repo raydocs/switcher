@@ -66,7 +66,9 @@ import Testing
         let p = CLIProfile(kind: .claude, name: "o'k", path: "/h/o'k", isDefault: false)
         #expect(CLIKind.claude.loginCommand(p).hasPrefix("CLAUDE_CONFIG_DIR='/h/o'\\''k' claude"))
         let d = CLIProfiles(env: CLIEnv(home: "/h")).defaultProfile(.codex)
-        #expect(CLIKind.codex.loginCommand(d) == "codex login")
+        #expect(CLIKind.codex.loginCommand(d) == "env -u CODEX_HOME SWITCHER_BYPASS=1 codex login")
+        let dc = CLIProfiles(env: CLIEnv(home: "/h")).defaultProfile(.claude)
+        #expect(CLIKind.claude.loginCommand(dc) == "env -u CLAUDE_CONFIG_DIR SWITCHER_BYPASS=1 claude   # then type /login")
     }
 }
 
