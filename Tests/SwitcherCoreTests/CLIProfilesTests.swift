@@ -255,6 +255,34 @@ import Testing
         #expect(Set(try FileManager.default.contentsOfDirectory(atPath: box.env.profilesRoot(.claude))) == ["work", "lnk"])
     }
 
+    // Found on the owner's Mac: a shared config.toml naming './instruction.sol.md' made Codex
+    // refuse to start in a new profile.
+    @Test func codexConfigRelativeFilesAreLinked() throws {
+        let box = CLIBox()
+        let profiles = CLIProfiles(env: box.env())
+        let home = box.home + "/.codex"
+        box.write(home + "/config.toml", """
+        model_instructions_file = './instruction.md'
+        experimental_instructions_file = "notes/extra.md"
+        auth_file = './auth.json'
+        other_file = '/abs/path.md'
+        up_file = '../outside.md'
+        gone_file = './missing.md'
+        name = './not-a-file-key-but-relative.md'
+        """)
+        box.write(home + "/instruction.md", "x")
+        box.write(home + "/notes/extra.md", "x")
+        box.write(home + "/auth.json", "{}")
+        box.write(home + "/not-a-file-key-but-relative.md", "x")
+        let p = try profiles.add(.codex, name: "work")
+        #expect(box.isLink(p.path + "/instruction.md"))
+        #expect(box.isLink(p.path + "/notes"))
+        #expect(box.isLink(p.path + "/not-a-file-key-but-relative.md"))
+        #expect(!FS.exists(URL(fileURLWithPath: p.path + "/auth.json")))
+        #expect(!FS.exists(URL(fileURLWithPath: p.path + "/missing.md")))
+        #expect(profiles.checkLinks(p).allSatisfy { $0.state == .ok || $0.state == .nothingToShare })
+    }
+
     @Test func checkLinksStates() throws {
         let box = CLIBox()
         let profiles = claudeWorld(box)

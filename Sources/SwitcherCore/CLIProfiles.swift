@@ -279,6 +279,38 @@ public final class CLIProfiles {
         }
     }
 
+    /// Never shared, even when a config file names them: they hold a sign-in.
+    static let neverShared: Set<String> = ["auth.json", "auth.json.lock", "auth.lock", ".credentials.json", ".claude.json"]
+
+    /// The shared items plus what the shared Codex `config.toml` names by a path relative to
+    /// `CODEX_HOME` (`model_instructions_file = './instruction.md'`): without it a profile's config
+    /// points at a file that is not there and Codex refuses to start. Only the top-level item is
+    /// linked, only when it exists in the default folder, never `..` or a sign-in file.
+    public func sharedItems(_ kind: CLIKind) -> [String] {
+        var items = Self.sharedItems(kind)
+        guard kind == .codex,
+              let text = try? String(contentsOfFile: env.defaultFolder(kind) + "/config.toml", encoding: .utf8) else { return items }
+        for line in text.split(separator: "\n") {
+            let parts = line.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let key = parts[0].trimmingCharacters(in: .whitespaces)
+            var value = parts[1].trimmingCharacters(in: .whitespaces)
+            guard let q = value.first, q == "'" || q == "\"", value.count >= 2 else { continue }
+            value.removeFirst()
+            guard let end = value.firstIndex(of: q) else { continue }
+            value = String(value[..<end])
+            let relative = value.hasPrefix("./")
+            guard relative || (key.hasSuffix("_file") && !value.hasPrefix("/") && !value.hasPrefix("~")) else { continue }
+            if relative { value.removeFirst(2) }
+            guard let first = value.split(separator: "/").first.map(String.init),
+                  first != ".", first != "..", !first.isEmpty, !Self.neverShared.contains(first),
+                  !items.contains(first),
+                  FS.exists(URL(fileURLWithPath: env.defaultFolder(kind) + "/" + first)) else { continue }
+            items.append(first)
+        }
+        return items
+    }
+
     public enum LinkState: Equatable, Sendable {
         case ok
         /// Nothing there yet (applyLinks makes it).
@@ -307,7 +339,7 @@ public final class CLIProfiles {
     /// Link states read relative to the open folder, so a path swapped meanwhile is not followed.
     private func linkChecks(_ profile: CLIProfile, dirFD fd: Int32) -> [LinkCheck] {
         let source = env.defaultFolder(profile.kind)
-        return Self.sharedItems(profile.kind).map { item in
+        return sharedItems(profile.kind).map { item in
             let target = source + "/" + item
             var st = stat()
             if fstatat(fd, item, &st, AT_SYMLINK_NOFOLLOW) != 0 {
