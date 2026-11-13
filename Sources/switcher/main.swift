@@ -13,6 +13,7 @@ switcher: switch Claude Desktop and Antigravity between your accounts.
   switcher move <app> <who> <number>   give an account another number
   switcher usage                       read every Antigravity account's quota from Google now
   switcher import-cc-same              take over CC Same's saved Claude sign-ins and list
+  switcher cli ...                     Claude Code and Codex accounts per terminal: run `switcher cli help`
 
 <app> is claude or antigravity (c / a). <who> is a number, alias, email or the start of an ID.
 """
@@ -38,9 +39,143 @@ func ago(_ d: Date) -> String {
     return "\(Int(s / 86_400)) d ago"
 }
 
+// MARK: - switcher cli
+
+let cliUsage = """
+switcher cli: Claude Code and Codex accounts, chosen per new terminal session.
+
+  switcher cli [list] [--json]         every profile, who it is signed in as, and which is active
+  switcher cli use <cli> [<who>]       new claude/codex processes use this account (or the next)
+  switcher cli add <cli> <name>        make a profile folder and show how to sign it in
+  switcher cli link [<cli>]            link shared settings into every profile
+  switcher cli exec <cli> <who> [-- <command> [args]]
+                                       run a command (default: the real CLI) as one account
+  switcher cli install [--no-rc]       install the PATH shims (and the line in ~/.zshrc)
+  switcher cli uninstall               remove the shims and the rc lines
+  switcher cli doctor                  check shims, sign-ins, links and keychain items
+
+<cli> is claude or codex (cc / co). <who> is a number (1 = the default account), a name or default.
+"""
+
+func runCLI(_ args: [String]) -> Never {
+    // HOME rather than NSHomeDirectory(), so a test run can point everything at a temporary folder.
+    let env = CLIEnv(home: ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory())
+    let profiles = CLIProfiles(env: env)
+    var args = args
+    let sub = args.isEmpty ? "list" : args.removeFirst()
+
+    func cli(_ s: String?) -> CLIKind {
+        guard let k = CLICommands.kind(s) else { fail("say which CLI: claude or codex (cc / co)") }
+        return k
+    }
+
+    do {
+        switch sub {
+        case "list", "ls":
+            let groups = CLICommands.list(profiles, keychain: LiveCLIKeychain())
+            if args.contains("--json") {
+                print(try CLICommands.listJSON(groups))
+            } else {
+                for g in groups {
+                    print("\(g.name)\(g.shimInstalled ? "" : " (no shim yet: `switcher cli install`)")")
+                    for e in g.profiles { print("  " + e.line()) }
+                }
+            }
+        case "use":
+            let kind = cli(args.first)
+            let target: CLIProfile
+            if args.count > 1 {
+                target = try CLICommands.profile(profiles, kind, args[1])
+            } else {
+                guard let next = profiles.next(kind) else { fail("no other \(kind.displayName) profile yet: `switcher cli add \(kind.command) <name>`") }
+                target = next
+            }
+            try profiles.setActive(target)
+            let email = profiles.identity(target)?.email
+            print("New \(kind.command) processes now use \(target.name) (\(email ?? "no sign-in yet")). Sessions already running keep their account.")
+            if !CLIShim.isShim(env.shim(kind)) {
+                print("The \(kind.command) shim is not installed, so this pointer has no effect until `switcher cli install`.")
+            }
+        case "add":
+            let kind = cli(args.first)
+            guard args.count > 1 else { fail("say a name for the new profile") }
+            let p = try profiles.add(kind, name: args[1])
+            print("Created \(p.path)")
+            print("Sign it in with:\n  \(kind.loginCommand(p))")
+        case "link":
+            let kinds = args.isEmpty ? CLIKind.allCases : [cli(args.first)]
+            var any = false
+            for kind in kinds {
+                for p in profiles.list(kind) where !p.isDefault {
+                    any = true
+                    let made = try profiles.applyLinks(p)
+                    print("\(kind.command) \(p.name): \(made.isEmpty ? "already linked" : "linked " + made.joined(separator: ", "))")
+                }
+            }
+            if !any { print("No profiles yet: `switcher cli add <cli> <name>`.") }
+        case "exec":
+            let req: CLICommands.ExecRequest
+            do { req = try CLICommands.parseExec(args) } catch { fail(error.localizedDescription) }
+            let profile = try CLICommands.profile(profiles, req.kind, req.who)
+            var argv = req.command
+            if argv.isEmpty {
+                // The real binary, so the shim is not involved.
+                guard let real = CLIShim.findRealBinary(req.kind, env: env) else { fail("no real \(req.kind.command) found on PATH") }
+                argv = [real]
+            }
+            for (v, value) in CLICommands.envEdits(profile) {
+                if let value { setenv(v, value, 1) } else { unsetenv(v) }
+            }
+            var cargs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) } + [nil]
+            execvp(argv[0], &cargs)
+            let why = String(cString: strerror(errno))
+            FileHandle.standardError.write(Data("switcher: cannot run \(argv[0]): \(why)\n".utf8))
+            exit(127)
+        case "install":
+            let installed = try CLIShim.installShims(env: env)
+            for kind in CLIKind.allCases {
+                if let real = installed[kind] { print("\(env.shim(kind)) runs \(real)") }
+                else { print("\(kind.command): no real binary found on PATH; no shim written") }
+            }
+            if args.contains("--no-rc") {
+                print("Skipped the rc files: put \(env.shimDir) first on PATH yourself.")
+            } else {
+                for rc in CLICommands.rcFiles(env) {
+                    try CLIShim.installRC(rc, env: env)
+                    print("Put the PATH line at the end of \(rc)")
+                }
+                print("Open a new terminal (or `exec zsh`) for it to take effect.")
+            }
+        case "uninstall":
+            CLIShim.uninstallShims(env: env)
+            print("Removed the shims from \(env.shimDir).")
+            for rc in CLICommands.rcFiles(env) {
+                let had = CLIShim.rcState((try? String(contentsOfFile: rc, encoding: .utf8)) ?? "") != .absent
+                try CLIShim.uninstallRC(rc)
+                if had { print("Removed the PATH line from \(rc).") }
+            }
+        case "doctor":
+            let findings = CLIDoctor(profiles: profiles, keychain: LiveCLIKeychain(), rcFiles: CLICommands.rcFiles(env), resolve: CLIDoctor.zshResolve).run()
+            for f in findings {
+                let marker = switch f.level { case .ok: "[ok]     "; case .note: "[note]   "; case .warn: "[warn]   "; case .problem: "[problem]" }
+                print("\(marker) \(f.message)")
+            }
+            exit(findings.contains { $0.level == .problem } ? 1 : 0)
+        case "help", "-h", "--help":
+            print(cliUsage)
+        default:
+            fail("unknown cli command \"\(sub)\"\n\n\(cliUsage)")
+        }
+    } catch {
+        fail(error.localizedDescription)
+    }
+    exit(0)
+}
+
 let board = Switchboard()
 var args = Array(CommandLine.arguments.dropFirst())
 let command = args.isEmpty ? "list" : args.removeFirst()
+if command == "cli" { runCLI(args) }
 
 func who(_ p: ProviderID, _ q: String?) -> Slot {
     guard let q else { fail("say which account") }
