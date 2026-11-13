@@ -117,8 +117,12 @@ public enum CLIPath {
 
     /// A profile name: a plain folder name, safe inside single quotes and a pointer file.
     public static func isValidName(_ name: String) -> Bool {
-        guard !name.isEmpty, name.count <= 64, name != "default", !name.hasPrefix("."), !name.hasPrefix("-") else { return false }
-        return name.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) && $0.isASCII || "-_.".unicodeScalars.contains($0) }
+        // The PATH shim enforces the same rule in sh: 1-64 of [A-Za-z0-9._-], not starting with . or -.
+        let bytes = Array(name.utf8)
+        guard !bytes.isEmpty, bytes.count <= 64, name != "default", bytes[0] != UInt8(ascii: "."), bytes[0] != UInt8(ascii: "-") else { return false }
+        return bytes.allSatisfy { b in
+            (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || b == 0x2D || b == 0x5F || b == 0x2E
+        }
     }
 
     /// Why `path` cannot be a profile path under `root`, or nil when it can: absolute, exactly

@@ -26,9 +26,12 @@ public enum CLIShim {
             ''|default) ;;
             \(shellQuote(root + "/"))*)
               name=${p#\(shellQuote(root + "/"))}
+              # Exactly CLIPath.isValidName: 1-64 of [A-Za-z0-9._-] (spelled out: ranges follow the
+              # locale in some shells), not starting with . or -, not "default".
               case "$name" in
-                ''|*/*|.*|-*) p= ;;
+                ''|default|.*|-*|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*) p= ;;
               esac
+              if [ "${#name}" -gt 64 ]; then p=; fi
               if [ -n "$p" ] && [ -d "$p" ] && [ ! -L "$p" ]; then
                 \(v)=$p
                 export \(v)

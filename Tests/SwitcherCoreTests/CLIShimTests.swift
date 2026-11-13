@@ -106,6 +106,24 @@ import Testing
         }
     }
 
+    // Review finding 9: the shim accepts exactly the names CLIPath.isValidName accepts.
+    @Test func shimAndAppAgreeOnProfileNames() throws {
+        let w = try world()
+        let long64 = String(repeating: "a", count: 64)
+        let names = ["has space", "über", "a:b", "a*b", "a?b", "a[b", "tab\there", String(repeating: "a", count: 65), "default", ".hid", "-dash",
+                     "ok.name_1-x", "A", long64]
+        for name in names {
+            w.box.mkdir(w.root + "/" + name)
+            w.pointer(w.root + "/" + name + "\n")
+            let r = try w.run()
+            let valid = CLIPath.isValidName(name)
+            #expect(r.value("CLAUDE_CONFIG_DIR") == (valid ? w.root + "/" + name : "<unset>"), "\(name.debugDescription)")
+            #expect(w.profiles.active(.claude).isDefault == !valid, "\(name.debugDescription)")
+        }
+        #expect(["ok.name_1-x", "A", long64].allSatisfy(CLIPath.isValidName))
+        #expect(!["has space", "über", "default", ".hid", "-dash", String(repeating: "a", count: 65), "", "ａb"].contains(where: CLIPath.isValidName))
+    }
+
     @Test func aVariableAlreadySetPassesThroughUnchanged() throws {
         let w = try world()
         w.pointer(w.root + "/a\n")
