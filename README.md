@@ -93,7 +93,7 @@ passes it through untouched. Set `SWITCHER_BYPASS=1` to skip the shim for one co
 
 ```sh
 switcher cli install                 # shims and the PATH line; open a new terminal afterwards
-switcher cli add cc work             # make ~/.claude-profiles/work and print how to sign it in
+switcher cli add cc work             # make ~/.claude-profiles/work, sign in, offer to switch
                                      # now run the sign-in command it printed
 switcher cli use cc work             # new `claude` processes now use "work"
 switcher cli exec co 2 -- codex      # run Codex as account 2, once, without changing the pointer
@@ -107,7 +107,8 @@ switcher cli doctor                  # check shims, sign-ins, links and keychain
 |---|---|
 | `switcher cli [list] [--json]` | Every profile, who it is signed in as, and which is active |
 | `switcher cli use <cli> [<who>]` | New `claude` / `codex` processes use this account (no `<who>`: the next one) |
-| `switcher cli add <cli> <name>` | Make a profile folder and show how to sign it in |
+| `switcher cli add <cli> [<name>]` | Add an account: make its folder, run the CLI's own sign-in there, offer to switch (asks for a name if none; `--no-login`: folder only; `--use`: switch without asking) |
+| `switcher cli login <cli> [<who>]` | Sign an account in again (default: the active one) |
 | `switcher cli link [<cli>]` | Link shared settings into every profile |
 | `switcher cli exec <cli> <who> [-- <command> [args]]` | Run a command (default: the real CLI) as one account |
 | `switcher cli install [--no-rc]` | Install the shims and the `~/.zshrc` line (`--no-rc`: shims only; you put the folder on PATH) |

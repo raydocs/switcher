@@ -55,9 +55,15 @@ public enum CLIKind: String, CaseIterable, Codable, Sendable, Identifiable {
         // The default account clears the variable and bypasses the shim, which would otherwise
         // follow the pointer to another account.
         let prefix = profile.isDefault ? "env -u \(envVar) SWITCHER_BYPASS=1 " : "\(envVar)=\(shellQuote(profile.path)) "
+        return prefix + ([command] + loginArguments).joined(separator: " ")
+    }
+
+    /// The CLI's own sign-in, run inside the profile's folder: it opens the browser and stores the
+    /// sign-in where that folder's sessions look for it.
+    public var loginArguments: [String] {
         switch self {
-        case .claude: return "\(prefix)claude   # then type /login"
-        case .codex: return "\(prefix)codex login"
+        case .claude: ["auth", "login"]
+        case .codex: ["login"]
         }
     }
 }
@@ -145,7 +151,7 @@ public func claudeKeychainService(configDir: String?) -> String {
     return "Claude Code-credentials-" + SHA256.hex(Data(configDir.utf8)).prefix(8)
 }
 
-func shellQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+public func shellQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
 // MARK: - Registry and pointer
 

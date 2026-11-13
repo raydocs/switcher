@@ -292,7 +292,7 @@ struct Make {
         return CLIRow(
             kind: kind, number: number, name: name, isDefault: name == "default", isActive: active, email: email, plan: plan,
             signIn: signedIn ? .good(until: goodDays.map { Date().addingTimeInterval($0 * 86400) }) : .out,
-            loginCommand: path + (kind == .claude ? "claude   # then type /login" : "codex login"),
+            loginCommand: path + (kind == .claude ? "claude auth login" : "codex login"),
             quota: usage.map { u in
                 CLIQuota(windows: [
                     CLIQuotaWindow(label: "5h", usedPercent: u.five, resetsAt: Date().addingTimeInterval(u.resetHours * 3600)),

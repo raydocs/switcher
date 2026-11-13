@@ -76,7 +76,7 @@ extension L {
     }
 
     static func cliAdded(_ kind: CLIKind, _ name: String) -> String {
-        t("Added \(name). Sign in to it with the command under its name.", "已添加 \(name)，用它名字下方的命令登录即可。")
+        t("Added \(name). Finish signing in in the Terminal window that opened.", "已添加 \(name)，在打开的终端窗口里完成登录即可。")
     }
 
     static func cliNotFound(_ kind: CLIKind) -> String {
@@ -527,15 +527,20 @@ struct CLIRowView: View {
 
     private var signInNote: some View {
         let lead = ranOut ? L.t("The sign-in has run out.", "登录已失效。") : L.t("Not signed in.", "未登录。")
-        let how = row.kind == .claude
-            ? L.t("Run this in a terminal, then type /login:", "在终端运行这条命令，然后输入 /login：")
-            : L.t("Run this in a terminal:", "在终端运行这条命令：")
+        let how = L.t("Sign in opens Terminal; or run this yourself:", "点“登录”会打开终端；也可以自己运行：")
         return Note(symbol: ranOut ? "exclamationmark.circle" : "info.circle", text: lead + (L.zh ? "" : " ") + how, tint: ranOut ? .orange : nil)
     }
 
     private var signInSteps: some View {
-        CommandBox(model: model, command: shellCommand)
-            .padding(.leading, Metrics.avatar + Metrics.avatarGap)
+        VStack(alignment: .leading, spacing: 6) {
+            Button(L.t("Sign in…", "登录…")) {
+                model.openSignIn(row.kind, name: row.isDefault ? "default" : row.name, loginCommand: shellCommand)
+            }
+            .buttonStyle(SoftButtonStyle(kind: .tinted, compact: true))
+            .fixedSize()
+            CommandBox(model: model, command: shellCommand)
+        }
+        .padding(.leading, Metrics.avatar + Metrics.avatarGap)
     }
 
     private var renewal: some View {
@@ -638,8 +643,8 @@ struct CLIAddCard: View {
         VStack(alignment: .leading, spacing: 8) {
             Text(L.t("Add a \(kind.displayName) account", "添加 \(kind.displayName) 账号"))
                 .font(.body.weight(.semibold))
-            Text(L.t("Give it a short name. It gets its own folder, and you sign in to it in a terminal next. Nothing running changes.",
-                     "起一个简短的名称。它会有自己的文件夹，接着在终端里登录即可。正在运行的会话不受影响。"))
+            Text(L.t("Give it a short name. It gets its own folder, and Terminal opens to sign it in. Nothing running changes.",
+                     "起一个简短的名称。它会有自己的文件夹，随后自动打开终端登录。正在运行的会话不受影响。"))
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

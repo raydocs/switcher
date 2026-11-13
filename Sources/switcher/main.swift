@@ -46,7 +46,9 @@ switcher cli: Claude Code and Codex accounts, chosen per new terminal session.
 
   switcher cli [list] [--json]         every profile, who it is signed in as, and which is active
   switcher cli use <cli> [<who>]       new claude/codex processes use this account (or the next)
-  switcher cli add <cli> <name>        make a profile folder and show how to sign it in
+  switcher cli add <cli> [<name>]      add an account: make its folder, sign in, offer to switch
+                                       (--no-login: only the folder; --use: switch without asking)
+  switcher cli login <cli> [<who>]     sign an account in again (default: the active one)
   switcher cli link [<cli>]            link shared settings into every profile
   switcher cli exec <cli> <who> [-- <command> [args]]
                                        run a command (default: the real CLI) as one account
@@ -57,6 +59,56 @@ switcher cli: Claude Code and Codex accounts, chosen per new terminal session.
 
 <cli> is claude or codex (cc / co). <who> is a number (1 = the default account), a name or default.
 """
+
+/// A line from the terminal, trimmed; nil at end of input.
+func ask(_ prompt: String) -> String? {
+    print(prompt, terminator: "")
+    fflush(stdout)
+    return readLine()?.trimmingCharacters(in: .whitespaces)
+}
+
+/// Run the CLI's own sign-in inside `profile`'s folder, in this terminal, then say who it is
+/// signed in as and (for a new account) offer to point new sessions at it.
+func signIn(_ profile: CLIProfile, env: CLIEnv, profiles: CLIProfiles, offerToUse: Bool, useWithoutAsking: Bool) {
+    let kind = profile.kind
+    guard let real = CLIShim.findRealBinary(kind, env: env) else {
+        fail("no real \(kind.command) found on PATH; sign in later with:\n  \(kind.loginCommand(profile))")
+    }
+    print("Signing in \(kind.displayName) · \(profile.name) (your browser opens; finish there)…\n")
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: real)
+    proc.arguments = kind.loginArguments
+    var environment = ProcessInfo.processInfo.environment
+    for (v, value) in CLICommands.envEdits(profile) { environment[v] = value }
+    proc.environment = environment
+    // Ctrl-C belongs to the sign-in while it runs.
+    signal(SIGINT, SIG_IGN)
+    defer { signal(SIGINT, SIG_DFL) }
+    do { try proc.run() } catch { fail("cannot run \(real): \(error.localizedDescription)") }
+    proc.waitUntilExit()
+    print("")
+    let state = profiles.signIn(profile, keychain: LiveCLIKeychain()).state
+    guard state != .signedOut else {
+        print("Not signed in yet. Try again any time with:\n  switcher cli login \(kind.command) \(profile.name)")
+        exit(1)
+    }
+    let who = profiles.identity(profile)
+    let label = [who?.email, who?.plan.map { "(\($0))" }].compactMap { $0 }.joined(separator: " ")
+    print("✓ \(profile.name) is signed in\(label.isEmpty ? "" : " as " + label).")
+    guard offerToUse, !profile.isDefault, profiles.active(kind) != profile else { exit(0) }
+    var use = useWithoutAsking
+    if !use {
+        let answer = ask("Use \(profile.name) for new \(kind.command) sessions now? [Y/n] ")?.lowercased() ?? "n"
+        use = answer.isEmpty || answer.hasPrefix("y")
+    }
+    if use {
+        do { try profiles.setActive(profile) } catch { fail(error.localizedDescription) }
+        print("New \(kind.command) sessions now use \(profile.name). Switch back with `switcher cli use \(kind.command) default`.")
+    } else {
+        print("Switch to it any time with `switcher cli use \(kind.command) \(profile.name)`.")
+    }
+    exit(0)
+}
 
 func runCLI(_ args: [String]) -> Never {
     // HOME rather than NSHomeDirectory(), so a test run can point everything at a temporary folder.
@@ -99,10 +151,28 @@ func runCLI(_ args: [String]) -> Never {
             }
         case "add":
             let kind = cli(args.first)
-            guard args.count > 1 else { fail("say a name for the new profile") }
-            let p = try profiles.add(kind, name: args[1])
+            let flags = Set(args.dropFirst().filter { $0.hasPrefix("--") })
+            let rest = args.dropFirst().filter { !$0.hasPrefix("--") }
+            let tty = isatty(0) == 1 && isatty(1) == 1
+            var name = rest.first ?? ""
+            if name.isEmpty {
+                guard tty else { fail("say a name for the new account: `switcher cli add \(kind.command) <name>`") }
+                let taken = Set(profiles.list(kind).map(\.name))
+                let suggestion = (2...99).map { "account\($0)" }.first { !taken.contains($0) } ?? "account"
+                name = ask("Name for the new \(kind.displayName) account (letters, digits, - _ .) [\(suggestion)]: ") ?? ""
+                if name.isEmpty { name = suggestion }
+            }
+            let p = try profiles.add(kind, name: name)
             print("Created \(p.path)")
-            print("Sign it in with:\n  \(kind.loginCommand(p))")
+            guard tty, !flags.contains("--no-login") else {
+                print("Sign it in with:\n  \(kind.loginCommand(p))")
+                exit(0)
+            }
+            signIn(p, env: env, profiles: profiles, offerToUse: true, useWithoutAsking: flags.contains("--use"))
+        case "login":
+            let kind = cli(args.first)
+            let p = args.count > 1 ? try CLICommands.profile(profiles, kind, args[1]) : profiles.active(kind)
+            signIn(p, env: env, profiles: profiles, offerToUse: false, useWithoutAsking: false)
         case "link":
             let kinds = args.isEmpty ? CLIKind.allCases : [cli(args.first)]
             var any = false
@@ -113,7 +183,7 @@ func runCLI(_ args: [String]) -> Never {
                     print("\(kind.command) \(p.name): \(made.isEmpty ? "already linked" : "linked " + made.joined(separator: ", "))")
                 }
             }
-            if !any { print("No profiles yet: `switcher cli add <cli> <name>`.") }
+            if !any { print("No profiles yet: `switcher cli add <cli>`.") }
         case "exec":
             let req: CLICommands.ExecRequest
             do { req = try CLICommands.parseExec(args) } catch { fail(error.localizedDescription) }

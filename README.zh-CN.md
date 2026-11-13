@@ -73,7 +73,7 @@ scripts/bundle.sh && cp -R dist/Switcher.app /Applications/
 
 ```sh
 switcher cli install                 # shims and the PATH line; open a new terminal afterwards
-switcher cli add cc work             # make ~/.claude-profiles/work and print how to sign it in
+switcher cli add cc work             # 创建 ~/.claude-profiles/work，登录，并询问是否切换
                                      # now run the sign-in command it printed
 switcher cli use cc work             # new `claude` processes now use "work"
 switcher cli exec co 2 -- codex      # run Codex as account 2, once, without changing the pointer
@@ -87,7 +87,8 @@ switcher cli doctor                  # check shims, sign-ins, links and keychain
 |---|---|
 | `switcher cli [list] [--json]` | 每个配置文件夹、它登录的是谁，以及哪个是当前激活的 |
 | `switcher cli use <cli> [<who>]` | 新的 `claude` / `codex` 进程使用这个账号（不带 `<who>`：下一个账号） |
-| `switcher cli add <cli> <name>` | 创建配置文件夹并显示如何登录 |
+| `switcher cli add <cli> [<name>]` | 添加账号：创建文件夹，在里面运行 CLI 自己的登录，再询问是否切换（不给名字会询问；`--no-login` 只建文件夹；`--use` 不询问直接切换） |
+| `switcher cli login <cli> [<who>]` | 重新登录某个账号（默认是当前账号） |
 | `switcher cli link [<cli>]` | 把共享设置链接到每个配置文件夹 |
 | `switcher cli exec <cli> <who> [-- <command> [args]]` | 以某个账号运行一条命令（默认：真正的 CLI） |
 | `switcher cli install [--no-rc]` | 安装垫片和 `~/.zshrc` 中的那一行（`--no-rc`：只装垫片，由你自己把文件夹加入 PATH） |

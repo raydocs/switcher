@@ -299,6 +299,7 @@ final class AppModel {
                 switch result {
                 case .success:
                     self.banner = Banner(kind: .success, text: L.cliAdded(kind, name))
+                    self.openSignIn(kind, name: name, loginCommand: nil)
                     done(nil)
                 case .failure(let error):
                     done(error.localizedDescription)
@@ -389,6 +390,32 @@ final class AppModel {
                     self.banner = Banner(kind: .info, text: L.cliRenewFailed(row.label))
                 }
             }
+        }
+    }
+
+    /// Sign an account in, in Terminal: a one-shot `.command` script (private temp folder, deleted as
+    /// it starts) runs `switcher cli login`, which runs the CLI's own sign-in in the account's folder.
+    /// The menu picks the sign-in up the next time it opens.
+    func openSignIn(_ kind: CLIKind, name: String, loginCommand: String?) {
+        if isPreview { return }
+        let bundled = Bundle.main.resourceURL?.appendingPathComponent("switcher").path
+        let command: String
+        if let bundled, FileManager.default.isExecutableFile(atPath: bundled) {
+            command = "exec \(shellQuote(bundled)) cli login \(kind.command) \(shellQuote(name))"
+        } else if let loginCommand {
+            command = loginCommand
+        } else {
+            return
+        }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("switcher-sign-in", isDirectory: true)
+        let url = dir.appendingPathComponent("sign-in-\(kind.command)-\(UUID().uuidString.prefix(8)).command")
+        do {
+            try FS.makePrivateDir(dir)
+            try FS.atomicWrite(Data("#!/bin/sh\nrm -f \"$0\"\nclear\n\(command)\n".utf8), to: url)
+            guard chmod(url.path, 0o700) == 0 else { throw SwitcherError.message("cannot make \(url.path) executable") }
+            NSWorkspace.shared.open(url)
+        } catch {
+            banner = Banner(kind: .error, text: error.localizedDescription)
         }
     }
 
