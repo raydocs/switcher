@@ -226,10 +226,13 @@ final class AppModel {
     }
 
     private nonisolated static func readCLI(_ cli: CLIProfiles, _ keychain: CLIKeychain) -> [CLIBoard] {
-        let cache = CLIQuotaCache(env: cli.env).load()
+        let cache = CLIQuotaCache(env: cli.env)
         return CLIKind.allCases.compactMap { kind -> CLIBoard? in
             guard let group = CLICommands.list(cli, keychain: keychain, kinds: [kind]).first else { return nil }
-            let commands = Dictionary(cli.list(kind).map { ($0.path, kind.loginCommand($0)) }) { a, _ in a }
+            let listed = cli.list(kind)
+            let commands = Dictionary(listed.map { ($0.path, kind.loginCommand($0)) }) { a, _ in a }
+            // A cached quota counts only for the account the profile is signed in to now.
+            let cached = Dictionary(listed.map { p in (p.id, cache.quota(for: p, accountKey: cli.identity(p)?.accountKey)) }) { a, _ in a }
             let rows = group.profiles.map { e -> CLIRow in
                 let signIn: CLIRow.SignIn
                 switch e.signIn {
@@ -239,8 +242,8 @@ final class AppModel {
                 }
                 let id = "\(kind.rawValue):\(e.name)"
                 return CLIRow(kind: kind, number: e.number, name: e.name, isDefault: e.isDefault, isActive: e.active,
-                              email: e.email, plan: e.plan ?? cache[id]?.plan, signIn: signIn,
-                              loginCommand: commands[e.path] ?? "", quota: signIn == .out ? nil : cache[id])
+                              email: e.email, plan: e.plan ?? cached[id]??.plan, signIn: signIn,
+                              loginCommand: commands[e.path] ?? "", quota: signIn == .out ? nil : cached[id] ?? nil)
             }
             let found = group.shimInstalled || CLIShim.findRealBinary(kind, env: cli.env) != nil
             return CLIBoard(kind: kind, shimInstalled: group.shimInstalled, commandFound: found, rows: rows)
@@ -346,7 +349,7 @@ final class AppModel {
                         guard let binary = Self.realBinary(cli, .codex) else { throw CLIQuotaError.unavailable(L.cliNotFound(.codex)) }
                         quota = try await CodexQuota.read(profile: p, codexBinary: binary)
                     }
-                    try? cache.store(quota, for: p)
+                    try? cache.store(quota, for: p, accountKey: cli.identity(p)?.accountKey)
                     errors[p.id] = .some(nil)
                 } catch let error as CLIQuotaError {
                     errors[p.id] = error
