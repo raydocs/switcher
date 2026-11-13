@@ -129,10 +129,36 @@ extension L {
     }
 
     /// A model's own weekly window, named beside the Week meter: "week (Opus)" is "Opus" there.
-    static func cliScope(_ label: String) -> String {
-        guard label.hasPrefix("week ("), label.hasSuffix(")") else { return cliWindow(label) }
-        let scope = String(label.dropFirst(6).dropLast())
-        return scope == "scoped" ? t("Model", "模型") : scope
+    static func cliScope(_ label: String) -> String { cliScopeParts(label).name }
+
+    /// A window outside the main ones, split into whose limit it is and how long it runs.
+    /// Claude's "week (Opus)" is ("Opus", nil): the window is the week, said by the meter beside it.
+    /// Codex's "<limit name> <window>" is (limit name, "5h" / "week" / "45m"); the name may hold spaces.
+    static func cliScopeParts(_ label: String) -> (name: String, window: String?) {
+        if label.hasPrefix("week ("), label.hasSuffix(")") {
+            let scope = String(label.dropFirst(6).dropLast())
+            return (scope == "scoped" ? t("Model", "模型") : scope, nil)
+        }
+        guard let space = label.lastIndex(of: " ") else { return (cliWindow(label), nil) }
+        let window = String(label[label.index(after: space)...])
+        guard CLIUsage.isMain(CLIQuotaWindow(label: window, usedPercent: 0, resetsAt: nil)) else { return (label, nil) }
+        return (String(label[..<space]), window)
+    }
+
+    /// The tooltip of a separate limit, with its whole name.
+    static func cliScopeHelp(_ parts: (name: String, window: String?), percent: Int) -> String {
+        guard let window = parts.window else {
+            return t("\(parts.name)'s own weekly limit is \(percent)% used.", "\(parts.name) 单独的每周额度已用 \(percent)%。")
+        }
+        return t("The separate limit “\(parts.name)” (\(cliWindow(window))) is \(percent)% used.",
+                 "单独的额度「\(parts.name)」（\(cliWindow(window))）已用 \(percent)%。")
+    }
+
+    /// Any window's full name, for tooltips and VoiceOver: "Spark (45m)", "Opus (Week)".
+    static func cliWindowFull(_ label: String) -> String {
+        if CLIUsage.isMain(CLIQuotaWindow(label: label, usedPercent: 0, resetsAt: nil)) { return cliWindow(label) }
+        let (name, window) = cliScopeParts(label)
+        return "\(name) (\(cliWindow(window ?? "week")))"
     }
 }
 
@@ -474,33 +500,31 @@ struct CLIRowView: View {
     // MARK: Usage
 
     private var meters: some View {
-        HStack(spacing: 0) {
+        // A separate limit's warning sits beside the meters when its whole name fits there, and on a
+        // line of its own below them when it does not: a long Codex limit name is never cut.
+        ViewThatFits(in: .horizontal) {
+            meterLine(scopedBeside: true)
+            VStack(alignment: .leading, spacing: 4) {
+                meterLine(scopedBeside: false)
+                if let scoped = row.headroom.scopedWarning { scopedLabel(scoped, wraps: true) }
+            }
+        }
+        .opacity(isStale ? 0.75 : 1)
+        .help(usageDetail)
+    }
+
+    private func meterLine(scopedBeside: Bool) -> some View {
+        let beside = scopedBeside ? row.headroom.scopedWarning : nil
+        return HStack(spacing: 0) {
             HStack(spacing: 8) {
                 ForEach(windows, id: \.label) { window in
                     UsageMeter(title: L.cliWindow(window.label), name: row.kind.displayName + " " + L.cliWindow(window.label),
                                percent: Int(window.usedPercent.rounded()), pace: pace(window),
-                               hugsPercent: row.headroom.scopedWarning != nil && window.label == windows.last?.label)
+                               hugsPercent: beside != nil && window.label == windows.last?.label)
                 }
             }
             Spacer(minLength: 8)
-            if let scoped = row.headroom.scopedWarning {
-                // A third window without a bar: its name, then the percent as the meters colour it.
-                let percent = Int(scoped.usedPercent.rounded())
-                HStack(spacing: 4) {
-                    Text(L.cliScope(scoped.label))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    Text(verbatim: "\(percent)%")
-                        .monospacedDigit()
-                        .foregroundStyle(Fill.usage(percent))
-                        .fixedSize()
-                }
-                .font(.subheadline)
-                .help(L.t("This model's own weekly limit is nearly used up.", "这个模型单独的每周额度快用完了。"))
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(row.kind.displayName + " " + L.cliWindow(scoped.label))
-                .accessibilityValue("\(percent)%")
-            }
+            if let beside { scopedLabel(beside, wraps: false) }
             if case .unavailable(let why) = row.quotaError {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.subheadline)
@@ -511,8 +535,33 @@ struct CLIRowView: View {
                     .accessibilityLabel(L.t("Usage read failed", "用量读取失败"))
             }
         }
-        .opacity(isStale ? 0.75 : 1)
-        .help(usageDetail)
+    }
+
+    /// A third window without a bar: its name (and window, for a Codex limit), then the percent as
+    /// the meters colour it.
+    private func scopedLabel(_ scoped: CLIQuotaWindow, wraps: Bool) -> some View {
+        let percent = Int(scoped.usedPercent.rounded())
+        let parts = L.cliScopeParts(scoped.label)
+        return HStack(alignment: .firstTextBaseline, spacing: 4) {
+            Text(verbatim: parts.name)
+                .foregroundStyle(.secondary)
+                .lineLimit(wraps ? nil : 1)
+                .fixedSize(horizontal: !wraps, vertical: wraps)
+            if let window = parts.window {
+                Text(L.cliWindow(window))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize()
+            }
+            Text(verbatim: "\(percent)%")
+                .monospacedDigit()
+                .foregroundStyle(Fill.usage(percent))
+                .fixedSize()
+        }
+        .font(.subheadline)
+        .help(L.cliScopeHelp(parts, percent: percent))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(row.kind.displayName + " " + L.cliWindowFull(scoped.label))
+        .accessibilityValue("\(percent)%")
     }
 
     /// The even-pace mark: on the weekly meter only (a 5-hour window is spent in bursts).
@@ -532,7 +581,7 @@ struct CLIRowView: View {
     private var usageDetail: String {
         guard let quota = row.quota else { return "" }
         var lines = quota.windows.map { w in
-            "\(L.cliWindow(w.label)): \(Int(w.usedPercent.rounded()))%" + (w.resetsAt.map { ", " + L.resets($0) } ?? "")
+            "\(L.cliWindowFull(w.label)): \(Int(w.usedPercent.rounded()))%" + (w.resetsAt.map { ", " + L.resets($0) } ?? "")
         }
         if windows.contains(where: { pace($0) != nil }) {
             lines.append(L.t("The mark on \(L.week) is an even pace: use past it runs out before the reset.",

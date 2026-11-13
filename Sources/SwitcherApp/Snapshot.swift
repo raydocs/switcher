@@ -224,7 +224,8 @@ enum Snapshot {
                 s.cli(.claude, 3, "account3", "ada@side.dev", plan: "pro", goodDays: 9, usage: (40, 70, 2, 35)),
             ])),
             CLIBoard(kind: .codex, shimInstalled: true, commandFound: true, rows: CLIBoard.markingBest([
-                s.cli(.codex, 1, "default", "ada@lovelace.dev", plan: "plus", active: true, usage: (100, 47, 0.8, 1), weekResetHours: 30),
+                s.cli(.codex, 1, "default", "ada@lovelace.dev", plan: "plus", active: true, usage: (100, 47, 0.8, 1),
+                      error: .unavailable("HTTP 503"), scoped: ("GPT-5.1-Codex-Max Research Preview week", 96), weekResetHours: 30),
                 s.cli(.codex, 2, "account2", "ada@orbital.dev", plan: "pro", usage: (5, 9, 4, 12)),
             ])),
         ]
@@ -258,6 +259,7 @@ enum Snapshot {
             Fixture(name: "18-cli-headroom", model: model(boards(claude: short), cli: tight), staged: both),
 
             Fixture(name: "20-settings-general", model: model(boards()), settings: .general, page: .init(openAtLogin: true)),
+            Fixture(name: "20-settings-general-meter", model: model(boards(), cli: tight), settings: .general, page: .init(openAtLogin: true)),
             Fixture(name: "21-settings-accounts", model: model(boards(claude: edgeRows)), settings: .accounts,
                     page: .init(hover: AccountsSettings.key(.claude, grace))),
             Fixture(name: "22-settings-accounts-ccsame", model: model(boards(), ccSame: found), settings: .accounts),

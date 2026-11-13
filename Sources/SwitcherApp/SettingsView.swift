@@ -266,12 +266,12 @@ struct GeneralSettings: View {
             }
             SettingsCard {
                 VStack(alignment: .leading, spacing: 10) {
-                    MenuBarSketch()
+                    MenuBarSketch(icon: MenuBarLabel.icon(model.cliBoards, meter: menuBarMeter))
                     VStack(alignment: .leading, spacing: 2) {
                         Text(L.t("Switcher lives in the menu bar", "Switcher 常驻菜单栏"))
                             .font(.body.weight(.medium))
                         (Text(L.t("Click ", "点击菜单栏里的 "))
-                            + Text(Image(systemName: "person.2.circle")).foregroundStyle(.primary)
+                            + Text(MenuBarLabel.icon(model.cliBoards, meter: menuBarMeter)).foregroundStyle(.primary)
                             + Text(L.t(" to switch accounts, check usage or add an account. There is no Dock icon and no main window: that menu is the app, and this window only holds its settings.",
                                        " 即可切换账号、查看用量或添加账号。Switcher 没有程序坞图标，也没有主窗口：那个菜单就是整个应用，这个窗口只放设置。")))
                             .font(.subheadline)
@@ -288,10 +288,12 @@ struct GeneralSettings: View {
 
 /// The right end of a menu bar, with Switcher's icon picked out.
 private struct MenuBarSketch: View {
+    let icon: Image
+
     var body: some View {
         HStack(spacing: 12) {
             Spacer(minLength: 0)
-            Image(systemName: "person.2.circle")
+            icon
                 .font(.body.weight(.medium))
                 .foregroundStyle(Color.accentColor)
                 .frame(width: 30, height: 20)

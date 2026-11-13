@@ -45,14 +45,21 @@ struct MenuBarLabel: View {
     @AppStorage(settingKey) private var showMeter = true
 
     var body: some View {
-        if showMeter, let (row, five, week) = Self.tightest(model.cliBoards) {
-            Image(nsImage: MeterIcon.image(five: five, week: week))
+        if showMeter, let (row, _, _) = Self.tightest(model.cliBoards) {
+            Self.icon(model.cliBoards, meter: true)
                 .accessibilityLabel("Switcher")
                 .accessibilityValue(L.t("\(row.label): \(Int(row.headroom.percentLeft ?? 0))% left",
                                         "\(row.label)：剩余 \(Int(row.headroom.percentLeft ?? 0))%"))
         } else {
             Image(systemName: "person.2.circle")
         }
+    }
+
+    /// The menu bar icon as it stands: the two bars when they are on and there is a reading, else the app's own.
+    /// The settings page draws it from here too, so its picture of the menu bar is the real one.
+    static func icon(_ boards: [CLIBoard], meter: Bool) -> Image {
+        guard meter, let (_, five, week) = tightest(boards) else { return Image(systemName: "person.2.circle") }
+        return Image(nsImage: MeterIcon.image(five: five, week: week))
     }
 
     /// The active account (Claude Code or Codex) with the least room, and its two main windows.
@@ -104,6 +111,8 @@ enum MeterIcon {
             return true
         }
         image.isTemplate = true
+        // Named, so VoiceOver has something to say wherever it is drawn (the settings page too).
+        image.accessibilityDescription = "Switcher"
         last = (key, image)
         return image
     }
