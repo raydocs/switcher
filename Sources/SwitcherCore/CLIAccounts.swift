@@ -139,8 +139,11 @@ extension CLIProfiles {
             guard let auth = codexAuth(profile) else { return CLISignIn(state: .signedOut) }
             let mode = auth["auth_mode"] as? String ?? (auth["tokens"] != nil ? "chatgpt" : "apikey")
             let last = (auth["last_refresh"] as? String).flatMap { ISO8601DateFormatter.lenient($0) }
-            guard (auth["tokens"] as? [String: Any])?["refresh_token"] is String else {
-                return CLISignIn(state: mode == "chatgpt" ? .signedOut : .other(mode), lastRefresh: last)
+            func present(_ v: Any?) -> Bool { (v as? String).map { !$0.isEmpty } ?? false }
+            guard present((auth["tokens"] as? [String: Any])?["refresh_token"]) else {
+                // An API-key sign-in with no key (`{}`, a null or empty key) is no sign-in at all.
+                let noKey = mode.lowercased() == "apikey" && !present(auth["OPENAI_API_KEY"])
+                return CLISignIn(state: mode.lowercased().contains("chatgpt") || noKey ? .signedOut : .other(mode), lastRefresh: last)
             }
             return CLISignIn(state: mode.lowercased().contains("chatgpt") ? .signedIn : .other(mode), lastRefresh: last)
         }

@@ -639,13 +639,6 @@ struct CLIRowView: View {
 
     // MARK: What needs a terminal
 
-    /// The command as typed: `loginCommand` without its trailing comment (an interactive zsh would
-    /// pass the comment on as arguments).
-    private var shellCommand: String {
-        guard let comment = row.loginCommand.range(of: "#", options: .backwards) else { return row.loginCommand }
-        return row.loginCommand[..<comment.lowerBound].trimmingCharacters(in: .whitespaces)
-    }
-
     private var signInNote: some View {
         let lead = ranOut ? L.t("The sign-in has run out.", "登录已失效。") : L.t("Not signed in.", "未登录。")
         let how = L.t("Sign in opens your browser; or run this in a terminal:", "点“登录”会打开浏览器；也可以在终端运行：")
@@ -657,7 +650,7 @@ struct CLIRowView: View {
             Button(L.t("Sign In…", "登录…")) { model.signInCLI(row) }
             .buttonStyle(SoftButtonStyle(kind: .tinted, compact: true))
             .fixedSize()
-            CommandBox(model: model, command: shellCommand)
+            CommandBox(model: model, command: row.loginCommand)
         }
         .padding(.leading, Metrics.avatar + Metrics.avatarGap)
     }

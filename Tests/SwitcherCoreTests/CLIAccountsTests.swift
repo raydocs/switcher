@@ -169,6 +169,21 @@ import Testing
         box.write(p.path + "/auth.json", box.json(["auth_mode": "chatgpt", "tokens": ["access_token": "a"]]))
         #expect(profiles.signIn(p, keychain: MemoryCLIKeychain()).state == .signedOut)
     }
+
+    @Test func codexWithoutAnyCredentialIsSignedOut() {
+        let box = CLIBox()
+        let profiles = CLIProfiles(env: box.env)
+        let p = CLIProfile(kind: .codex, name: "alt", path: box.env.profilesRoot(.codex) + "/alt", isDefault: false)
+        for auth: [String: Any] in [
+            [:],
+            ["OPENAI_API_KEY": NSNull()],
+            ["auth_mode": "apikey", "OPENAI_API_KEY": ""],
+            ["auth_mode": "chatgpt", "tokens": ["access_token": "a", "refresh_token": ""]],
+        ] {
+            box.write(p.path + "/auth.json", box.json(auth))
+            #expect(profiles.signIn(p, keychain: MemoryCLIKeychain()).state == .signedOut)
+        }
+    }
 }
 
 @Suite struct CLIDoctorTests {

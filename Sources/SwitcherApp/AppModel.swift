@@ -61,6 +61,8 @@ final class AppModel {
     /// Per account id: when its usage was last read (or tried) and how many reads in a row failed.
     @ObservationIgnored private var cliAttempt: [String: Date] = [:]
     @ObservationIgnored private var cliFailures: [String: Int] = [:]
+    /// A sign-in moved to Terminal: the account and its command, opened once the background run ends.
+    @ObservationIgnored private var cliHandoff: [CLIKind: (name: String, command: String)] = [:]
     @ObservationIgnored private var usageScheduler: NSBackgroundActivityScheduler?
     @ObservationIgnored private var screensAsleep = false
 
@@ -388,18 +390,22 @@ final class AppModel {
     }
 
     func cancelCLISignIn(_ kind: CLIKind) {
-        guard let run = cliLoginRuns[kind] else { return }
+        // Accepted until the sign-in's last step, even when its process already ended. A Cancel after
+        // "in Terminal" takes that back too: nothing opens and a just-added account goes.
+        guard cliSigningIn[kind] != nil else { return }
+        cliHandoff[kind] = nil
         cliCancelled.insert(kind)
-        queue.async { run.cancel() }
+        if let run = cliLoginRuns[kind] { queue.async { run.cancel() } }
     }
 
     /// The sign-in that is running, in Terminal instead (when the browser flow does not work here).
     func continueCLISignInInTerminal(_ kind: CLIKind) {
         guard let name = cliSigningIn[kind], let run = cliLoginRuns[kind] else { return }
-        let command = kind.loginCommand(run.profile)
+        // The account stays (a cancel would remove a just-added one), and Terminal opens once the
+        // background sign-in has ended, so the two never run in the same folder at once.
+        cliHandoff[kind] = (name, kind.loginCommand(run.profile))
         cliCancelled.insert(kind)
         queue.async { run.cancel() }
-        openSignIn(kind, name: name, loginCommand: command)
     }
 
     private func startCLISignIn(_ p: CLIProfile, createdNow: Bool) {
@@ -424,25 +430,50 @@ final class AppModel {
         if createdNow { refreshCLI() }
         Task.detached {
             let status = run.wait()
-            let signedIn = cli.signIn(p, keychain: keychain).state != .signedOut
-            if !signedIn, createdNow { try? cli.discardUnsignedIn(p, keychain: keychain) }
+            // One step on the main actor closes the run: after it no move to Terminal can arrive, so
+            // what it read decides the clean-up. A later Cancel is taken in the last step.
+            let (cancelled, handoff) = await MainActor.run {
+                self.cliLoginRuns[p.kind] = nil
+                return (self.cliCancelled.remove(p.kind) != nil, self.cliHandoff.removeValue(forKey: p.kind))
+            }
+            let present = cli.signIn(p, keychain: keychain).state != .signedOut
+            // A just-added account is kept when its sign-in moved to Terminal.
+            if !present, createdNow, handoff == nil { try? cli.discardUnsignedIn(p, keychain: keychain) }
+            // A cancelled run proves nothing: an account signed in before keeps its old sign-in.
+            let signedIn = present && !cancelled
             let email = cli.identity(p)?.email
             let twin = signedIn ? cli.duplicates(of: p).first : nil
             let output = signedIn ? "" : run.output()
             let boards = Self.readCLI(cli, keychain)
             await MainActor.run {
-                let cancelled = self.cliCancelled.remove(p.kind) != nil
-                self.cliLoginRuns[p.kind] = nil
+                // A Cancel that came after the run closed still counts.
+                let cancelledLate = self.cliCancelled.remove(p.kind) != nil
+                if handoff != nil, cancelledLate {
+                    // The move to Terminal is taken back: nothing opens, and a just-added account goes.
+                    // The sign-in stays marked as running until it is gone, so no retry starts in it.
+                    guard createdNow, !present else { self.cliSigningIn[p.kind] = nil; self.setCLI(boards); return }
+                    self.queue.async {
+                        try? cli.discardUnsignedIn(p, keychain: keychain)
+                        let after = Self.readCLI(cli, keychain)
+                        Task { @MainActor in
+                            self.cliSigningIn[p.kind] = nil
+                            self.setCLI(after)
+                        }
+                    }
+                    return
+                }
                 self.cliSigningIn[p.kind] = nil
                 self.setCLI(boards)
-                if signedIn {
+                if let handoff {
+                    self.openSignIn(p.kind, name: handoff.name, loginCommand: handoff.command)
+                } else if signedIn {
                     if let twin {
                         self.banner = Banner(kind: .info, text: L.cliDuplicate(email ?? p.name, twin.isDefault ? "1" : twin.name))
                     } else {
                         self.banner = Banner(kind: .success, text: L.cliSignedIn(p.kind, email ?? p.name))
                     }
                     self.loadCLIQuota(p.kind, force: true)
-                } else if !cancelled {
+                } else if !cancelled, !cancelledLate {
                     let last = output.split(separator: "\n").last.map(String.init) ?? ""
                     self.banner = Banner(kind: .error, text: L.cliSignInFailed(status: status, detail: last))
                 }
@@ -476,7 +507,13 @@ final class AppModel {
     func loadCLIQuota(_ kind: CLIKind, force: Bool = false, only: [String]? = nil) {
         if isPreview || cliReading.contains(kind) { return }
         if !force, only == nil, let at = cliQuotaReadAt[kind], Date().timeIntervalSince(at) < 300 { return }
-        guard let names = cliBoard(kind)?.rows.filter({ $0.signIn.isGood && (only?.contains($0.name) ?? true) }).map(\.name), !names.isEmpty else { return }
+        // Opening the menu does not cut short the backoff after failures (a rate limit waits an hour).
+        let now = Date()
+        func backingOff(_ row: CLIRow) -> Bool {
+            !force && CLIRefreshPlan.backingOff(lastAttempt: cliAttempt[row.id], failures: cliFailures[row.id] ?? 0, now: now)
+        }
+        guard let names = cliBoard(kind)?.rows.filter({ $0.signIn.isGood && (only?.contains($0.name) ?? true) && !backingOff($0) }).map(\.name),
+              !names.isEmpty else { return }
         cliReading.insert(kind)
         for name in names { cliAttempt["\(kind.rawValue):\(name)"] = Date() }
         let cli = self.cli, keychain = self.cliKeychain

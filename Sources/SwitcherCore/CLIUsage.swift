@@ -161,6 +161,12 @@ public enum CLIRefreshPlan {
         return min(backoffMax, backoffBase * pow(2, Double(min(failures, 10) - 1)))
     }
 
+    /// Still waiting out the backoff of earlier failures: no automatic read of any kind until then.
+    public static func backingOff(lastAttempt: Date?, failures: Int, now: Date) -> Bool {
+        guard let lastAttempt, failures > 0 else { return false }
+        return now.timeIntervalSince(lastAttempt) < backoff(failures: failures)
+    }
+
     public static func due(_ accounts: [CLIRefreshState], activeStatus: CLIHeadroom.Status, lastActivity: Date?,
                            lowPower: Bool, now: Date) -> [String] {
         let factor: Double = lowPower ? 2 : 1

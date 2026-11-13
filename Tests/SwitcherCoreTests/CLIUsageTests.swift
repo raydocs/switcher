@@ -99,6 +99,12 @@ import Testing
         #expect(CLIRefreshPlan.backoff(failures: 1) == 300)
         #expect(CLIRefreshPlan.backoff(failures: 3) == 1200)
         #expect(CLIRefreshPlan.backoff(failures: CLIRefreshPlan.rateLimitedFailures) == 3600)
+        // Every automatic read (opening the menu too) waits the backoff out.
+        let limitedAt = now.addingTimeInterval(-600)
+        #expect(CLIRefreshPlan.backingOff(lastAttempt: limitedAt, failures: CLIRefreshPlan.rateLimitedFailures, now: now))
+        #expect(!CLIRefreshPlan.backingOff(lastAttempt: limitedAt, failures: 1, now: now))
+        #expect(!CLIRefreshPlan.backingOff(lastAttempt: limitedAt, failures: 0, now: now))
+        #expect(!CLIRefreshPlan.backingOff(lastAttempt: nil, failures: 5, now: now))
         let failing = [s("a", active: true, seenAgo: 4000, triedAgo: 900, failures: 3)]
         #expect(CLIRefreshPlan.due(failing, activeStatus: .ok, lastActivity: now, lowPower: false, now: now).isEmpty)
         let limited = [s("a", active: true, seenAgo: 4000, triedAgo: 3000, failures: CLIRefreshPlan.rateLimitedFailures)]
