@@ -58,6 +58,8 @@ switcher cli: Claude Code and Codex accounts, chosen per new terminal session.
   switcher cli uninstall               remove the shims and the rc lines
   switcher cli doctor                  check shims, sign-ins, links and keychain items
   switcher cli usage [<cli>] [--renew] read each profile's quota now (--renew: let the CLI renew an expired sign-in)
+  switcher cli usage [<cli>] --json    the same, as JSON (schema switcher.usage.v1), with headroom and the best account
+  switcher cli usage [<cli>] --cached  the last readings as JSON: no request, no process, no keychain
 
 <cli> is claude or codex (cc / co). <who> is a number (1 = the default account), a name, an email or default.
 """
@@ -294,11 +296,19 @@ func runCLIUsage(_ args: [String]) async -> Never {
     let cache = CLIQuotaCache(env: env)
     let kinds = args.first.flatMap(CLICommands.kind).map { [$0] } ?? CLIKind.allCases
     let renew = args.contains("--renew")
+    let asJSON = args.contains("--json") || args.contains("--cached")
+    // `--cached`: the last readings only. No request, no process, no keychain.
+    if args.contains("--cached") {
+        print(CLIUsageReport.build(profiles: profiles, kinds: kinds).json())
+        exit(0)
+    }
+    func say(_ line: String) { if !asJSON { print(line) } }
+    var errors: [String: String] = [:]
     let fmt = DateFormatter()
     fmt.dateFormat = "MMM d HH:mm"
     for kind in kinds {
-        print(kind.displayName)
-        guard let real = CLIShim.findRealBinary(kind, env: env) else { print("  \(kind.command) not found"); continue }
+        say(kind.displayName)
+        guard let real = CLIShim.findRealBinary(kind, env: env) else { say("  \(kind.command) not found"); continue }
         for p in profiles.list(kind) {
             let accountKey = profiles.identity(p)?.accountKey
             let head = "  \(p.name)\(profiles.identity(p)?.email.map { " (\($0))" } ?? "")"
@@ -315,15 +325,19 @@ func runCLIUsage(_ args: [String]) async -> Never {
                     q = try await read()
                 }
                 try? cache.store(q, for: p, accountKey: accountKey)
-                print(head + "  [\(q.source)]")
+                say(head + "  [\(q.source)]")
                 for w in q.windows {
-                    print("    \(w.label): \(Int(w.usedPercent.rounded()))% used\(w.resetsAt.map { ", resets " + fmt.string(from: $0) } ?? "")")
+                    say("    \(w.label): \(Int(w.usedPercent.rounded()))% used\(w.resetsAt.map { ", resets " + fmt.string(from: $0) } ?? "")")
                 }
             } catch {
-                print(head + "  ! \(error.localizedDescription)\(error as? CLIQuotaError == .signInExpired && kind == .claude ? " (try --renew)" : "")")
-                if let old = cache.quota(for: p, accountKey: profiles.identity(p)?.accountKey) { print("    last read \(ago(old.observedAt)): " + old.windows.map { "\($0.label) \(Int($0.usedPercent.rounded()))%" }.joined(separator: ", ")) }
+                errors[p.id] = error.localizedDescription
+                say(head + "  ! \(error.localizedDescription)\(error as? CLIQuotaError == .signInExpired && kind == .claude ? " (try --renew)" : "")")
+                if let old = cache.quota(for: p, accountKey: profiles.identity(p)?.accountKey) { say("    last read \(ago(old.observedAt)): " + old.windows.map { "\($0.label) \(Int($0.usedPercent.rounded()))%" }.joined(separator: ", ")) }
             }
         }
+    }
+    if asJSON {
+        print(CLIUsageReport.build(profiles: profiles, kinds: kinds, signedIn: { profiles.signIn($0, keychain: keychain).state == .signedIn }, errors: errors).json())
     }
     exit(0)
 }

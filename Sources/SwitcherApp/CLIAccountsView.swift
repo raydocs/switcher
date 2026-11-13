@@ -35,6 +35,10 @@ struct CLIRow: Equatable, Identifiable {
     /// The last usage read (kept between runs), and why the newest read failed.
     var quota: CLIQuota?
     var quotaError: CLIQuotaError?
+    /// Room left in the tightest main window, after resets.
+    var headroom: CLIHeadroom = .unknown
+    /// The account to go to: the most room, shown while the active one is low or out.
+    var isBest = false
 
     var id: String { "\(kind.rawValue):\(name)" }
     /// The account in a sentence: its own name, or who the default account is.
@@ -59,6 +63,16 @@ struct CLIBoard: Equatable, Identifiable {
     var active: CLIRow? { rows.first { $0.isActive } }
     /// Nothing to show: the CLI is not here and nobody is signed in to it.
     var isAbsent: Bool { !commandFound && !rows.contains { $0.signIn != .out || !$0.isDefault } }
+
+    /// `rows` with `isBest` on the account with the most room, only while the active one is low or out.
+    static func markingBest(_ rows: [CLIRow]) -> [CLIRow] {
+        var rows = rows
+        guard let active = rows.first(where: \.isActive), active.headroom.status == .low || active.headroom.status == .out,
+              let best = CLIUsage.best(rows.filter { !$0.isActive }.map { ($0.id, $0.headroom) }),
+              let i = rows.firstIndex(where: { $0.id == best }) else { return rows }
+        rows[i].isBest = true
+        return rows
+    }
 }
 
 extension L {
@@ -112,6 +126,13 @@ extension L {
         case "week": week
         default: label
         }
+    }
+
+    /// A model's own weekly window, named beside the Week meter: "week (Opus)" is "Opus" there.
+    static func cliScope(_ label: String) -> String {
+        guard label.hasPrefix("week ("), label.hasSuffix(")") else { return cliWindow(label) }
+        let scope = String(label.dropFirst(6).dropLast())
+        return scope == "scoped" ? t("Model", "模型") : scope
     }
 }
 
@@ -416,6 +437,17 @@ struct CLIRowView: View {
                 Tag(text: plan.prefix(1).uppercased() + plan.dropFirst())
             }
             Spacer(minLength: 4)
+            if row.isBest, !highlighted {
+                // A status, so a coloured symbol and plain text, as "Claude is running" is.
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.right.circle.fill").foregroundStyle(.green)
+                    Text(L.t("Most room", "余量最多")).foregroundStyle(.secondary)
+                }
+                .font(.subheadline.weight(.medium))
+                .fixedSize()
+                .help(L.t("The active account is nearly out; this one has the most usage left. Click to use it for new \(command) sessions.",
+                          "当前账号的额度快用完了，这个账号剩得最多。点它即可让新的 \(command) 会话使用它。"))
+            }
             if row.isActive {
                 HStack(spacing: 3) {
                     Image(systemName: "checkmark").font(.caption2.weight(.bold))
@@ -442,16 +474,38 @@ struct CLIRowView: View {
     // MARK: Usage
 
     private var meters: some View {
-        HStack(spacing: 8) {
-            ForEach(windows, id: \.label) { window in
-                UsageMeter(title: L.cliWindow(window.label), name: row.kind.displayName + " " + L.cliWindow(window.label),
-                           percent: Int(window.usedPercent.rounded()))
+        HStack(spacing: 0) {
+            HStack(spacing: 8) {
+                ForEach(windows, id: \.label) { window in
+                    UsageMeter(title: L.cliWindow(window.label), name: row.kind.displayName + " " + L.cliWindow(window.label),
+                               percent: Int(window.usedPercent.rounded()), pace: pace(window),
+                               hugsPercent: row.headroom.scopedWarning != nil && window.label == windows.last?.label)
+                }
             }
-            Spacer(minLength: 0)
+            Spacer(minLength: 8)
+            if let scoped = row.headroom.scopedWarning {
+                // A third window without a bar: its name, then the percent as the meters colour it.
+                let percent = Int(scoped.usedPercent.rounded())
+                HStack(spacing: 4) {
+                    Text(L.cliScope(scoped.label))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Text(verbatim: "\(percent)%")
+                        .monospacedDigit()
+                        .foregroundStyle(Fill.usage(percent))
+                        .fixedSize()
+                }
+                .font(.subheadline)
+                .help(L.t("This model's own weekly limit is nearly used up.", "这个模型单独的每周额度快用完了。"))
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(row.kind.displayName + " " + L.cliWindow(scoped.label))
+                .accessibilityValue("\(percent)%")
+            }
             if case .unavailable(let why) = row.quotaError {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.subheadline)
                     .foregroundStyle(.orange)
+                    .padding(.leading, 8)
                     .help(L.t("The last usage read failed; these are the previous numbers.\n\(why)",
                               "上次读取用量失败，显示的是之前的数字。\n\(why)"))
                     .accessibilityLabel(L.t("Usage read failed", "用量读取失败"))
@@ -459,6 +513,12 @@ struct CLIRowView: View {
         }
         .opacity(isStale ? 0.75 : 1)
         .help(usageDetail)
+    }
+
+    /// The even-pace mark: on the weekly meter only (a 5-hour window is spent in bursts).
+    private func pace(_ w: CLIQuotaWindow) -> Int? {
+        guard w.label == "week" || CLIUsage.duration(w) == 7 * 86400 else { return nil }
+        return CLIUsage.pace(w, now: Date()).map { Int($0.rounded()) }
     }
 
     /// Older than this, the numbers say how old they are instead of when they reset.
@@ -473,6 +533,10 @@ struct CLIRowView: View {
         guard let quota = row.quota else { return "" }
         var lines = quota.windows.map { w in
             "\(L.cliWindow(w.label)): \(Int(w.usedPercent.rounded()))%" + (w.resetsAt.map { ", " + L.resets($0) } ?? "")
+        }
+        if windows.contains(where: { pace($0) != nil }) {
+            lines.append(L.t("The mark on \(L.week) is an even pace: use past it runs out before the reset.",
+                             "“\(L.week)”上的刻度是匀速使用的位置：超过它，会在重置前用完。"))
         }
         lines.append(L.t("Read \(L.ago(quota.observedAt))", "读取于\(L.ago(quota.observedAt))"))
         return lines.joined(separator: "\n")

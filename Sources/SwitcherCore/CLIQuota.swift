@@ -41,6 +41,12 @@ public enum CLIQuotaError: Error, LocalizedError, Equatable {
     case signInExpired
     case unavailable(String)
 
+    /// The service said too many requests (HTTP 429): wait the longest before asking again.
+    public var isRateLimited: Bool {
+        if case .unavailable(let m) = self { return m.contains("HTTP 429") }
+        return false
+    }
+
     public var errorDescription: String? {
         switch self {
         case .signedOut: "not signed in"

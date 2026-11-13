@@ -115,6 +115,8 @@ switcher cli doctor                  # check shims, sign-ins, links and keychain
 | `switcher cli uninstall` | Remove the shims and the rc lines |
 | `switcher cli doctor` | Check shims, sign-ins, links and keychain items |
 | `switcher cli usage [<cli>] [--renew]` | Read each profile's quota now; `--renew` lets the CLI renew an expired sign-in |
+| `switcher cli usage [<cli>] --json` | The same as JSON (`switcher.usage.v1`): each account's windows, room left, an even-pace mark, and the account with the most room |
+| `switcher cli usage [<cli>] --cached` | The last readings as JSON, without any request, process or keychain access (for scripts and status bars) |
 
 `<cli>` is `claude` or `codex` (`cc` / `co`). `<who>` is a number (1 = the default account), a name,
 the email it is signed in as, or `default`.
@@ -123,6 +125,20 @@ In the menu bar app, **Add Account…** under Claude Code or Codex does the same
 browser opens, and the account appears once you have signed in (Cancel, or **Use Terminal Instead**
 if no browser opened). Accounts are listed by email; a folder is never renamed after sign-in,
 because Claude Code names its keychain item after the folder's path.
+
+**Usage at a glance.** Each account shows its 5-hour and weekly use, with a mark on the weekly bar
+where an even pace would be. When the active account passes 80 %, the account with the most room
+left is tagged **Most room**. The menu bar icon can show two bars (5-hour over weekly) for the
+active account closest to its limit (Settings → General).
+
+The menu keeps the active accounts' numbers current while it is closed, and does it cheaply. The
+system schedules the check about every 5 minutes and folds it into other wake-ups. The check itself
+looks at a few file dates. A read (a request, or a `codex app-server` process) happens only when the
+CLI ran since the last reading, or when the reading is over 30 minutes old. The other accounts are
+read when the menu opens, and in the background only while the active account is low. Failures
+back off from 5 minutes to an hour, and a rate limit waits the full hour. In Low Power Mode every
+interval doubles, and nothing runs while the screens sleep. A window whose reset time has passed is
+shown as 0 % when the CLI has not run since; otherwise it is left out until the next reading.
 
 ## How it works
 

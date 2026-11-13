@@ -42,6 +42,11 @@ enum Snapshot {
                     print(url.path)
                 }
             }
+            for scheme in [ColorScheme.light, .dark] {
+                let url = out.appendingPathComponent("19-menubar-meter-\(scheme == .dark ? "dark" : "light")-\(lang).png")
+                try renderMenuBar(scheme: scheme, to: url)
+                print(url.path)
+            }
             if ProcessInfo.processInfo.environment["SWITCHER_SNAPSHOT_NATIVE"] != nil, let last = fixtures().last {
                 // The whole window's content, tabs included (as a plain tab view: there is no Settings scene here).
                 let url = out.appendingPathComponent("28-settings-tabview-native-\(lang).png")
@@ -89,6 +94,33 @@ enum Snapshot {
             .environment(\.colorScheme, scheme)
         let renderer = ImageRenderer(content: view)
         renderer.scale = 2
+        guard let image = renderer.cgImage,
+              let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        try png.write(to: url)
+    }
+
+    /// The menu bar icon at a few levels, on a stand-in menu bar, at 4x.
+    static func renderMenuBar(scheme: ColorScheme, to url: URL) throws {
+        let dark = scheme == .dark
+        NSApplication.shared.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+        let levels: [(Int?, Int?)] = [(12, 30), (55, 61), (88, 70), (100, 47), (0, 4), (nil, 20)]
+        let view = HStack(spacing: 14) {
+            Image(systemName: "person.2.circle").font(.system(size: 14))
+            ForEach(levels.indices, id: \.self) { i in
+                Image(nsImage: MeterIcon.image(five: levels[i].0, week: levels[i].1)).renderingMode(.template)
+            }
+            Image(systemName: "wifi").font(.system(size: 13))
+            Text("Fri 9:41").font(.system(size: 13, weight: .medium))
+        }
+        .foregroundStyle(dark ? Color.white : Color.black)
+        .padding(.horizontal, 12)
+        .frame(height: 24)
+        .background(dark ? Color(white: 0.16) : Color(white: 0.93))
+        .environment(\.colorScheme, scheme)
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 4
         guard let image = renderer.cgImage,
               let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
             throw CocoaError(.fileWriteUnknown)
@@ -183,6 +215,19 @@ enum Snapshot {
             ]
         }
         let both = MenuView.Staged(cli: .init(expanded: [.claude, .codex]))
+        // The active accounts nearly out: the one with the most room is marked; a model's own limit warns.
+        let tight = [
+            CLIBoard(kind: .claude, shimInstalled: true, commandFound: true, rows: CLIBoard.markingBest([
+                s.cli(.claude, 1, "default", "ada@lovelace.dev", plan: "max", active: true, goodDays: 24, usage: (88, 61, 1.2, 2),
+                      scoped: ("week (Opus)", 93), weekResetHours: 60),
+                s.cli(.claude, 2, "account2", "ada@orbital.dev", plan: "pro", goodDays: 12, usage: (12, 25, 3.5, 20), weekResetHours: 130),
+                s.cli(.claude, 3, "account3", "ada@side.dev", plan: "pro", goodDays: 9, usage: (40, 70, 2, 35)),
+            ])),
+            CLIBoard(kind: .codex, shimInstalled: true, commandFound: true, rows: CLIBoard.markingBest([
+                s.cli(.codex, 1, "default", "ada@lovelace.dev", plan: "plus", active: true, usage: (100, 47, 0.8, 1), weekResetHours: 30),
+                s.cli(.codex, 2, "account2", "ada@orbital.dev", plan: "pro", usage: (5, 9, 4, 12)),
+            ])),
+        ]
 
         return [
             Fixture(name: "01-claude", model: model(boards())),
@@ -210,6 +255,7 @@ enum Snapshot {
             Fixture(name: "16-cli-collapsed", model: model(boards(), cli: cli()), staged: MenuView.Staged(cli: .init(expanded: []))),
             Fixture(name: "17-cli-add", model: model(boards(claude: short), cli: cli(renew: true), cliJustInstalled: true),
                     staged: MenuView.Staged(cli: .init(expanded: [.claude], adding: .claude, hover: "claude:work"))),
+            Fixture(name: "18-cli-headroom", model: model(boards(claude: short), cli: tight), staged: both),
 
             Fixture(name: "20-settings-general", model: model(boards()), settings: .general, page: .init(openAtLogin: true)),
             Fixture(name: "21-settings-accounts", model: model(boards(claude: edgeRows)), settings: .accounts,
@@ -286,20 +332,24 @@ struct Make {
 
     func cli(_ kind: CLIKind, _ number: Int, _ name: String, _ email: String?, plan: String? = nil, active: Bool = false,
              signedIn: Bool = true, goodDays: Double? = nil,
-             usage: (five: Double, week: Double, resetHours: Double, minutesAgo: Double)?, error: CLIQuotaError? = nil) -> CLIRow {
+             usage: (five: Double, week: Double, resetHours: Double, minutesAgo: Double)?, error: CLIQuotaError? = nil,
+             scoped: (String, Double)? = nil, weekResetHours: Double = 90) -> CLIRow {
         let folder = "/Users/ada/" + (kind == .claude ? ".claude" : ".codex")
         let path = name == "default" ? "" : "\(kind.envVar)='\(folder)-profiles/\(name)' "
+        let quota = usage.map { u in
+            CLIQuota(windows: [
+                CLIQuotaWindow(label: "5h", usedPercent: u.five, resetsAt: Date().addingTimeInterval(u.resetHours * 3600)),
+                CLIQuotaWindow(label: "week", usedPercent: u.week, resetsAt: Date().addingTimeInterval(weekResetHours * 3600)),
+            ] + (scoped.map { [CLIQuotaWindow(label: $0.0, usedPercent: $0.1, resetsAt: Date().addingTimeInterval(weekResetHours * 3600))] } ?? []),
+            source: "fixture", observedAt: Date().addingTimeInterval(-u.minutesAgo * 60), plan: plan)
+        }
         return CLIRow(
             kind: kind, number: number, name: name, isDefault: name == "default", isActive: active, email: email, plan: plan,
             signIn: signedIn ? .good(until: goodDays.map { Date().addingTimeInterval($0 * 86400) }) : .out,
             loginCommand: path + (kind == .claude ? "claude auth login" : "codex login"),
-            quota: usage.map { u in
-                CLIQuota(windows: [
-                    CLIQuotaWindow(label: "5h", usedPercent: u.five, resetsAt: Date().addingTimeInterval(u.resetHours * 3600)),
-                    CLIQuotaWindow(label: "week", usedPercent: u.week, resetsAt: Date().addingTimeInterval(90 * 3600)),
-                ], source: "fixture", observedAt: Date().addingTimeInterval(-u.minutesAgo * 60), plan: plan)
-            },
-            quotaError: error)
+            quota: quota,
+            quotaError: error,
+            headroom: CLIUsage.headroom(quota, signedIn: signedIn, now: Date(), lastActivity: nil))
     }
 
     func quota(plan: String, gemini: (Int, Int), claude: (Int, Int), argon: Int, resetHours: Double, minutesAgo: Double, problem: String? = nil) -> AntigravityQuota {

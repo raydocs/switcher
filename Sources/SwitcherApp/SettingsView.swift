@@ -232,6 +232,7 @@ struct GeneralSettings: View {
     let model: AppModel
     private let staged: SettingsPage.Staged
     @State private var openAtLogin: Bool
+    @AppStorage(MenuBarLabel.settingKey) private var menuBarMeter = true
     @Environment(\.staticRender) private var staticRender
 
     init(model: AppModel, staged: SettingsPage.Staged = .init()) {
@@ -254,6 +255,13 @@ struct GeneralSettings: View {
                             model.openAtLogin = $0
                             openAtLogin = model.openAtLogin
                         }), label: L.t("Open at login", "登录时打开"))
+                }
+                SettingRow(
+                    title: L.t("Usage in the menu bar", "在菜单栏显示用量"),
+                    detail: L.t("Shows the terminal account nearest its limit as two bars: 5-hour over weekly.",
+                                "图标换成上下两根小条：最接近上限的终端账号的 5 小时和每周用量。")
+                ) {
+                    SwitchControl(isOn: $menuBarMeter, label: L.t("Usage in the menu bar", "在菜单栏显示用量"))
                 }
             }
             SettingsCard {

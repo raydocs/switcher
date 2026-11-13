@@ -68,8 +68,9 @@ struct MenuView: View {
         }
         .frame(width: Metrics.width)
         .background { if !staticRender { shortcuts } }
+        .onDisappear { if !staticRender { model.surfaceDisappeared() } }
         .onAppear {
-            model.refresh()
+            if !staticRender { model.surfaceAppeared() }
             // The CLI section refreshes itself once shown; while hidden (no CLI found yet), look
             // again here so a CLI installed later appears without restarting Switcher.
             if !model.cliBoards.contains(where: { !$0.isAbsent }) { model.refreshCLI() }

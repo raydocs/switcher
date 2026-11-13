@@ -58,6 +58,11 @@ final class AppModel {
     @ObservationIgnored private var cliQuotaReadAt: [CLIKind: Date] = [:]
     @ObservationIgnored private var cliLoginRuns: [CLIKind: CLILoginRun] = [:]
     @ObservationIgnored private var cliCancelled: Set<CLIKind> = []
+    /// Per account id: when its usage was last read (or tried) and how many reads in a row failed.
+    @ObservationIgnored private var cliAttempt: [String: Date] = [:]
+    @ObservationIgnored private var cliFailures: [String: Int] = [:]
+    @ObservationIgnored private var usageScheduler: NSBackgroundActivityScheduler?
+    @ObservationIgnored private var screensAsleep = false
 
     /// Fixed data for previews and screenshots: touches nothing on disk.
     init(preview boards: [AppBoard], ccSame: CCSameImport.Found? = nil, job: SwitchJob? = nil, banner: Banner? = nil,
@@ -83,10 +88,75 @@ final class AppModel {
         queue.async { board.recoverIfIdle() }
         refresh()
         refreshCLI()
+        startUsageRefresh()
+    }
+
+    @ObservationIgnored private var surfacesShown = 0
+
+    /// The menu or the Settings window opened: re-read now, and every 15 seconds while one is open.
+    /// While both are closed nothing shows the apps' state, so nothing re-reads it (the timer scans
+    /// every process, so it is not left running for nobody).
+    func surfaceAppeared() {
+        surfacesShown += 1
+        refresh()
+        guard timer == nil, !isPreview else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.refresh()
+            Task { @MainActor in self?.refresh() }
+        }
+        // Let the system fold this wake-up into others.
+        timer?.tolerance = 5
+    }
+
+    func surfaceDisappeared() {
+        surfacesShown = max(0, surfacesShown - 1)
+        guard surfacesShown == 0 else { return }
+        timer?.invalidate()
+        timer = nil
+    }
+
+    /// Keep the active CLI accounts' usage current while the menu is closed, at the least cost:
+    /// the system schedules the check (it defers it on battery, when hot or busy), the check itself
+    /// is a few `stat`s, and a read (a request, or a `codex app-server` process) happens only when
+    /// `CLIRefreshPlan` says the numbers can have changed. Nothing runs while the screens sleep.
+    private func startUsageRefresh() {
+        let scheduler = NSBackgroundActivityScheduler(identifier: "dev.switcher.app.cli-usage")
+        scheduler.repeats = true
+        scheduler.interval = CLIRefreshPlan.minSpacing
+        scheduler.tolerance = CLIRefreshPlan.minSpacing / 2
+        scheduler.qualityOfService = .utility
+        scheduler.schedule { [weak self] done in
+            Task { @MainActor in self?.backgroundUsageCheck() }
+            done(.finished)
+        }
+        usageScheduler = scheduler
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.screensAsleep = true }
+        }
+        center.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.screensAsleep = false }
+        }
+    }
+
+    private func backgroundUsageCheck() {
+        if isPreview || screensAsleep || cliBoards.isEmpty { return }
+        let env = cli.env, boards = cliBoards, attempts = cliAttempt, failures = cliFailures
+        let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        Task.detached(priority: .utility) {
+            let now = Date()
+            var due: [(CLIKind, [String])] = []
+            for b in boards where b.commandFound {
+                let states = b.rows.map {
+                    CLIRefreshState(id: $0.id, isActive: $0.isActive, signedIn: $0.signIn.isGood, observedAt: $0.quota?.observedAt,
+                                    lastAttempt: attempts[$0.id], failures: failures[$0.id] ?? 0)
+                }
+                let ids = Set(CLIRefreshPlan.due(states, activeStatus: b.active?.headroom.status ?? .unknown,
+                                                 lastActivity: CLIUsage.lastActivity(b.kind, env: env, now: now), lowPower: lowPower, now: now))
+                let names = b.rows.filter { ids.contains($0.id) }.map(\.name)
+                if !names.isEmpty { due.append((b.kind, names)) }
             }
+            let plan = due
+            await MainActor.run { for (kind, names) in plan { self.loadCLIQuota(kind, only: names) } }
         }
     }
 
@@ -94,7 +164,7 @@ final class AppModel {
 
     var isBusy: Bool { job != nil }
 
-    /// Re-read every app. Cheap: run when the menu opens and every 15 seconds.
+    /// Re-read every app. Cheap: run when the menu opens and every 15 seconds while it is open.
     func refresh() {
         if isPreview { return }
         let board = self.board
@@ -231,13 +301,15 @@ final class AppModel {
 
     private nonisolated static func readCLI(_ cli: CLIProfiles, _ keychain: CLIKeychain) -> [CLIBoard] {
         let cache = CLIQuotaCache(env: cli.env)
+        let now = Date()
         return CLIKind.allCases.compactMap { kind -> CLIBoard? in
+            let activity = CLIUsage.lastActivity(kind, env: cli.env, now: now)
             guard let group = CLICommands.list(cli, keychain: keychain, kinds: [kind]).first else { return nil }
             let listed = cli.list(kind)
             let commands = Dictionary(listed.map { ($0.path, kind.loginCommand($0)) }) { a, _ in a }
             // A cached quota counts only for the account the profile is signed in to now.
             let cached = Dictionary(listed.map { p in (p.id, cache.quota(for: p, accountKey: cli.identity(p)?.accountKey)) }) { a, _ in a }
-            let rows = group.profiles.map { e -> CLIRow in
+            var rows = group.profiles.map { e -> CLIRow in
                 let signIn: CLIRow.SignIn
                 switch e.signIn {
                 case "signedIn": signIn = .good(until: e.signInGoodUntil)
@@ -245,10 +317,15 @@ final class AppModel {
                 default: signIn = .out
                 }
                 let id = "\(kind.rawValue):\(e.name)"
+                // A window that reset since the reading shows 0 % (or goes) instead of the old number.
+                var quota = signIn == .out ? nil : cached[id] ?? nil
+                if let read = quota { quota?.windows = CLIUsage.current(read, now: now, lastActivity: activity) }
                 return CLIRow(kind: kind, number: e.number, name: e.name, isDefault: e.isDefault, isActive: e.active,
                               email: e.email, plan: e.plan ?? cached[id]??.plan, signIn: signIn,
-                              loginCommand: commands[e.path] ?? "", quota: signIn == .out ? nil : cached[id] ?? nil)
+                              loginCommand: commands[e.path] ?? "", quota: quota,
+                              headroom: CLIUsage.headroom(quota, signedIn: signIn.isGood, now: now, lastActivity: activity))
             }
+            rows = CLIBoard.markingBest(rows)
             let found = group.shimInstalled || CLIShim.findRealBinary(kind, env: cli.env) != nil
             return CLIBoard(kind: kind, shimInstalled: group.shimInstalled, commandFound: found, rows: rows)
         }
@@ -395,11 +472,13 @@ final class AppModel {
 
     /// Read the usage of every signed-in account of `kind`, at most every 5 minutes (sooner with
     /// `force`). Never renews a sign-in: an expired one is reported on its row.
-    func loadCLIQuota(_ kind: CLIKind, force: Bool = false) {
+    /// `only`: these accounts, from the background check (it has its own rule, so no throttle here).
+    func loadCLIQuota(_ kind: CLIKind, force: Bool = false, only: [String]? = nil) {
         if isPreview || cliReading.contains(kind) { return }
-        if !force, let at = cliQuotaReadAt[kind], Date().timeIntervalSince(at) < 300 { return }
-        guard let names = cliBoard(kind)?.rows.filter({ $0.signIn.isGood }).map(\.name), !names.isEmpty else { return }
+        if !force, only == nil, let at = cliQuotaReadAt[kind], Date().timeIntervalSince(at) < 300 { return }
+        guard let names = cliBoard(kind)?.rows.filter({ $0.signIn.isGood && (only?.contains($0.name) ?? true) }).map(\.name), !names.isEmpty else { return }
         cliReading.insert(kind)
+        for name in names { cliAttempt["\(kind.rawValue):\(name)"] = Date() }
         let cli = self.cli, keychain = self.cliKeychain
         Task.detached {
             let cache = CLIQuotaCache(env: cli.env)
@@ -426,9 +505,15 @@ final class AppModel {
             let boards = Self.readCLI(cli, keychain)
             let read = errors
             await MainActor.run {
-                for (id, error) in read { self.cliQuotaErrors[id] = error }
+                for (id, error) in read {
+                    self.cliQuotaErrors[id] = error
+                    switch error {
+                    case nil: self.cliFailures[id] = nil
+                    case let e?: self.cliFailures[id] = e.isRateLimited ? CLIRefreshPlan.rateLimitedFailures : (self.cliFailures[id] ?? 0) + 1
+                    }
+                }
                 self.cliReading.remove(kind)
-                self.cliQuotaReadAt[kind] = Date()
+                if only == nil { self.cliQuotaReadAt[kind] = Date() }
                 self.setCLI(boards)
             }
         }

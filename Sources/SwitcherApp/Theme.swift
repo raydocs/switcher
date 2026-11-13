@@ -148,6 +148,17 @@ struct UsageMeter: View {
     let title: String
     let name: String
     let percent: Int?
+    /// Where an even pace would be now (0…100): a thin mark across the track. Use past it runs out early.
+    var pace: Int? = nil
+    /// The last meter on a line gives up the percent's fixed column when something follows it.
+    var hugsPercent = false
+
+    /// The mark's centre, kept clear of the rounded ends and on the half-point grid (whole pixels at 2x).
+    private var paceX: CGFloat? {
+        guard let pace, pace > 2, pace < 98 else { return nil }
+        let x = min(max(Metrics.meterWidth * CGFloat(pace) / 100, 3), Metrics.meterWidth - 3)
+        return ((x - 0.25) * 2).rounded() / 2 + 0.25
+    }
 
     var body: some View {
         HStack(spacing: 5) {
@@ -163,12 +174,31 @@ struct UsageMeter: View {
                             .frame(width: max(Metrics.meterHeight, Metrics.meterWidth * CGFloat(min(percent, 100)) / 100))
                     }
                 }
+                .overlay(alignment: .leading) {
+                    // A gap either side, so the mark stays apart from the fill it crosses.
+                    if let paceX {
+                        Rectangle()
+                            .frame(width: 3.5)
+                            .offset(x: paceX - 1.75)
+                            .blendMode(.destinationOut)
+                    }
+                }
+                .compositingGroup()
+                .overlay(alignment: .leading) {
+                    if let paceX {
+                        Capsule()
+                            .fill(Color.primary.opacity(0.6))
+                            .frame(width: 1.5, height: Metrics.meterHeight + 4)
+                            .offset(x: paceX - 0.75)
+                    }
+                }
                 .frame(width: Metrics.meterWidth, height: Metrics.meterHeight)
             Text(percent.map { "\($0)%" } ?? "–")
                 .monospacedDigit()
                 .lineLimit(1)
                 .foregroundStyle(percent.map { $0 >= 90 ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary) } ?? AnyShapeStyle(.tertiary))
-                .frame(width: Metrics.percentWidth, alignment: .leading)
+                .frame(width: hugsPercent ? nil : Metrics.percentWidth, alignment: .leading)
+                .fixedSize(horizontal: hugsPercent, vertical: false)
         }
         .font(.subheadline)
         .accessibilityElement(children: .ignore)
