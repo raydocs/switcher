@@ -11,12 +11,14 @@ struct MenuView: View {
         var hover: String?
         var confirmRemove: String?
         var confirmAdd = false
+        var cli = CLISection.Staged()
     }
 
     private let staged: Staged
     @State private var removing: String?
     @State private var confirmingAdd: Bool
     @State private var listHeight: CGFloat = 0
+    @State private var cliHeight: CGFloat = 0
     @AppStorage("ccSameOfferDismissed") private var ccSameDismissed = false
     @Environment(\.staticRender) private var staticRender
 
@@ -52,6 +54,12 @@ struct MenuView: View {
                     Note(symbol: "ellipsis", text: L.t("Reading your accounts…", "正在读取账号…"))
                         .padding(.vertical, Metrics.rowV)
                 }
+                if model.cliBoards.contains(where: { !$0.isAbsent }) {
+                    Divider()
+                        .padding(.horizontal, Metrics.rowH)
+                    CLISection(model: model, height: $cliHeight, staged: staged.cli)
+                        .inert(busy)
+                }
             }
             .padding(Metrics.pad)
             Divider()
@@ -60,7 +68,13 @@ struct MenuView: View {
         }
         .frame(width: Metrics.width)
         .background { if !staticRender { shortcuts } }
-        .onAppear { model.refresh() }
+        .onDisappear { if !staticRender { model.surfaceDisappeared() } }
+        .onAppear {
+            if !staticRender { model.surfaceAppeared() }
+            // The CLI section refreshes itself once shown; while hidden (no CLI found yet), look
+            // again here so a CLI installed later appears without restarting Switcher.
+            if !model.cliBoards.contains(where: { !$0.isAbsent }) { model.refreshCLI() }
+        }
         .onChange(of: model.selected) {
             removing = nil
             confirmingAdd = false
@@ -117,7 +131,8 @@ struct MenuView: View {
                         rows(board)
                             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { listHeight = $0 }
                     }
-                    .frame(height: listHeight > 0 ? min(listHeight, Metrics.listMaxHeight) : nil)
+                    // The terminal accounts below take their share of the screen first.
+                    .frame(height: listHeight > 0 ? min(listHeight, max(Metrics.listMinHeight, Metrics.listMaxHeight - cliHeight)) : nil)
                     .scrollBounceBehavior(.basedOnSize)
                 }
             }

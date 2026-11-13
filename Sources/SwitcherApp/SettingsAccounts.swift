@@ -36,7 +36,8 @@ struct AccountsSettings: View {
             }
         }
         .inert(model.isBusy)
-        .onAppear { model.refresh() }
+        .onAppear { model.surfaceAppeared() }
+        .onDisappear { model.surfaceDisappeared() }
     }
 
     @ViewBuilder private func section(_ board: AppBoard) -> some View {

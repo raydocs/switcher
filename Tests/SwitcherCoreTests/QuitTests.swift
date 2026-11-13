@@ -3,8 +3,13 @@ import Testing
 @testable import SwitcherCore
 
 @Suite(.serialized) struct QuitTests {
+    /// Quitting waits while any process can't be looked into at all (it might be the app's). Some
+    /// CI runners have such a process permanently, so these tests need every process visible.
+    static let everyProcessVisible = Proc.list().map { $0.unknown.isEmpty } ?? false
+
     /// A fake app whose main program is not running but whose helper is (Antigravity's sidecars).
-    @Test func helpersLeftAfterTheAppAreStopped() throws {
+    @Test(.enabled(if: QuitTests.everyProcessVisible, "a process here can't be looked into, so quitting always waits"))
+    func helpersLeftAfterTheAppAreStopped() throws {
         // Under /var/folders on purpose: its /private must still match what the process list reports.
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("quit-test-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -36,7 +41,10 @@ import Testing
         #expect(fake.isRunning)
 
         let start = Date()
-        try fake.quit(timeout: 20, cancel: nil, waiting: nil)
+        do { try fake.quit(timeout: 20, cancel: nil, waiting: nil) } catch {
+            Issue.record("quit failed: \(error); still listed: \(fake.processes().map { "\($0)" } ?? "listing failed"); helper running: \(p.isRunning)")
+            throw error
+        }
         #expect(!fake.isRunning)
         #expect(Date().timeIntervalSince(start) < 15)
         p.waitUntilExit()
@@ -44,7 +52,8 @@ import Testing
     }
 
     /// After an update the old helpers run on from a bundle that was deleted: only their name is left.
-    @Test func helpersWhoseProgramWasDeletedAreStoppedToo() throws {
+    @Test(.enabled(if: QuitTests.everyProcessVisible, "a process here can't be looked into, so quitting always waits"))
+    func helpersWhoseProgramWasDeletedAreStoppedToo() throws {
         let build = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent(".build", isDirectory: true)
         let root = build.appendingPathComponent("quit-test-\(UUID().uuidString)", isDirectory: true)
@@ -75,7 +84,10 @@ import Testing
         let listed = fake.processes() ?? []
         #expect(listed.contains { $0.pid == p.processIdentifier && $0.path.hasPrefix("?") })
 
-        try fake.quit(timeout: 20, cancel: nil, waiting: nil)
+        do { try fake.quit(timeout: 20, cancel: nil, waiting: nil) } catch {
+            Issue.record("quit failed: \(error); still listed: \(fake.processes().map { "\($0)" } ?? "listing failed"); helper running: \(p.isRunning)")
+            throw error
+        }
         #expect(!fake.isRunning)
         p.waitUntilExit()
         #expect(p.terminationReason == .uncaughtSignal)

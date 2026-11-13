@@ -80,6 +80,7 @@ public final class Provider {
         guard !app.isRunning, let lock = try? FileLock(lockURL, timeout: 0) else { return }
         withExtendedLifetime(lock) {
             do { try vault.recover() } catch { log("finishing an interrupted switch: \(error.localizedDescription)") }
+            vault.pruneTrash()
         }
     }
 }
@@ -187,7 +188,7 @@ public func isUUID(_ s: String) -> Bool { UUID(uuidString: s) != nil }
 // MARK: - Antigravity
 
 extension Provider {
-    static let antigravityKeychain = SignInLayout.SecretRef(service: "gemini", account: "antigravity")
+    static let antigravityKeychain = SignInLayout.SecretRef(service: "gemini", account: "antigravity", shape: .goKeyring)
 
     /// Antigravity 2.x's sign-in: the Google OAuth token its language server keeps in the login
     /// keychain (`gemini` / `antigravity`), the copy it falls back to in

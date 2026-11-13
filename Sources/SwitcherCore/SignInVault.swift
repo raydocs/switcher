@@ -21,7 +21,46 @@ public struct SignInLayout {
     public struct SecretRef: Codable, Equatable {
         public var service: String
         public var account: String
+        /// What a healthy value looks like. A value of another shape is refused, never moved.
+        public var shape: Shape = .any
         var tag: String { "\(service)/\(account)" }
+
+        public enum Shape: String, Codable, Equatable {
+            case any
+            /// A JSON object or array.
+            case json
+            /// What zalando/go-keyring writes: `go-keyring-base64:<base64>`, `go-keyring-encoded:<hex>`,
+            /// or the JSON itself. Bare hex (what `security -w` prints for a value with non-printable
+            /// bytes) is none of these.
+            case goKeyring
+        }
+
+        /// Whether `value` is of the expected shape.
+        func accepts(_ value: String) -> Bool {
+            switch shape {
+            case .any:
+                return true
+            case .json:
+                return Self.isJSONContainer(value)
+            case .goKeyring:
+                let b64 = "go-keyring-base64:", enc = "go-keyring-encoded:"
+                if value.hasPrefix(b64) {
+                    let body = String(value.dropFirst(b64.count))
+                    guard !body.isEmpty, let data = Data(base64Encoded: body) else { return false }
+                    return !data.isEmpty
+                }
+                if value.hasPrefix(enc) {
+                    let body = value.dropFirst(enc.count)
+                    return !body.isEmpty && body.count % 2 == 0 && body.allSatisfy { $0.isHexDigit }
+                }
+                return Self.isJSONContainer(value)
+            }
+        }
+
+        private static func isJSONContainer(_ value: String) -> Bool {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(value.utf8)) else { return false }
+            return obj is [String: Any] || obj is [Any]
+        }
     }
 }
 
@@ -137,6 +176,19 @@ public final class SignInVault {
         try FS.move(url, to: FS.uniquePath(bin.appendingPathComponent("\(provider.rawValue)-\(url.lastPathComponent)")))
     }
 
+    /// How long a trashed sign-in is kept before it is deleted for good.
+    static let trashRetention: TimeInterval = 14 * 86_400
+
+    /// Delete trash entries older than the retention. Only direct children of the trash folder that
+    /// are real folders (what `trash()` makes) are considered; nothing outside it is touched.
+    func pruneTrash(now: TimeInterval = FS.now) {
+        guard FS.isDirectory(trashRoot) else { return }
+        for bin in FS.children(trashRoot) where FS.isDirectory(bin) {
+            guard let modified = FS.mtime(bin), now - modified.timeIntervalSince1970 > Self.trashRetention else { continue }
+            FS.removeIfExists(bin)
+        }
+    }
+
     // MARK: Swap
 
     struct Journal: Codable {
@@ -155,12 +207,15 @@ public final class SignInVault {
     final class Run {
         var j: Journal
         let url: URL
+        /// Tests: called after each journaled step (see `SignInVault.faultAfterStep`).
+        var step: () throws -> Void = {}
         init(_ j: Journal, url: URL) { self.j = j; self.url = url }
         func save() throws { try FS.writeCodable(j, to: url) }
         func move(_ a: URL, _ b: URL) throws {
             j.moves.append([a.path, b.path])
             try save()
             try FS.move(a, to: b)
+            try step()
         }
     }
 
@@ -179,16 +234,32 @@ public final class SignInVault {
                     "无法判断该应用当前登录的是哪个账号，无法安全地保存它的登录。先打开一次该应用让它完成登录，再试。"))
             }
         }
+        // A live value that isn't the shape the app writes (the keychain tool prints hex for bytes it
+        // can't show) would be saved wrong and put back corrupted: refuse before anything moves.
+        for s in layout.secrets {
+            if let value = try keychain.get(service: s.service, account: s.account), !s.accepts(value) {
+                throw SwitcherError.message(L10n.t(
+                    "The keychain item \(s.service)/\(s.account) isn't in the form the app writes, so its sign-in can't be set aside safely. Nothing was changed.",
+                    "钥匙串项目 \(s.service)/\(s.account) 的格式不是应用写入的格式，无法安全地保存其登录。未做任何改动。"))
+            }
+        }
         try FS.makePrivateDir(stage)
+        steps = 0
+        faultFired = false
         let run = Run(Journal(from: from?.id, fromEmail: from?.email, to: to), url: journalURL)
+        run.step = { [self] in try step() }
         try run.save()
         do {
+            try step()
             try perform(run)
             // Committed only once this is on disk; until then a failure is undone.
             try faultBeforeCommit?()
             run.j.committed = true
             try run.save()
+            try step()
         } catch {
+            // A simulated crash stops dead: nothing runs after it but `recover()` on the next start.
+            if faultSimulatesCrash, error is InjectedFault { throw error }
             run.j.committed = false
             do { try undo(run.j) } catch let undoError {
                 throw SwitcherError.message("\(error.localizedDescription); undoing it also failed: \(undoError.localizedDescription)")
@@ -208,6 +279,22 @@ public final class SignInVault {
     /// Tests: fail right before the commit is written.
     var faultBeforeCommit: (() throws -> Void)?
 
+    /// Tests: fail after the Nth journaled step of a swap (counting from 0), whichever step that is.
+    var faultAfterStep: Int?
+    /// Tests: with `faultAfterStep`, stop dead as a crash would (no undo) instead of failing like an error.
+    var faultSimulatesCrash = true
+    /// Tests: whether `faultAfterStep` was reached during the last swap.
+    private(set) var faultFired = false
+    private var steps = 0
+
+    struct InjectedFault: Error {}
+
+    func step() throws {
+        guard let n = faultAfterStep else { return }
+        defer { steps += 1 }
+        if steps == n { faultFired = true; throw InjectedFault() }
+    }
+
     /// Why tidying up after the last committed switch failed, if it did (it is retried by `recover()`).
     public private(set) var cleanupPending: String?
 
@@ -222,6 +309,7 @@ public final class SignInVault {
                 run.j.backups.append([j.file.path, nil])
             }
             try run.save()
+            try run.step()
         }
         // The live keychain items, stashed under the stage.
         for s in layout.secrets {
@@ -229,6 +317,7 @@ public final class SignInVault {
             if let value { try keychain.set(service: Self.vaultService, account: vaultKey(Self.stageID, s), value: value) }
             run.j.stashed[s.tag] = value != nil
             try run.save()
+            try run.step()
         }
         // Set the sign-in in use aside.
         for item in layout.items where FS.exists(item) {
@@ -242,6 +331,7 @@ public final class SignInVault {
             var mine = OrderedJSON()
             for k in j.keys { if let v = doc[k] { mine[k] = v } }
             try FS.atomicWrite(Data(mine.text(indent: "  ").utf8), to: stage.appendingPathComponent(j.vaultName))
+            try run.step()
         }
         // Put the target's in its place.
         let target = run.j.to.map(dir)
@@ -261,6 +351,7 @@ public final class SignInVault {
             let original = FS.isFile(j.file) ? String(decoding: try Data(contentsOf: j.file), as: UTF8.self) : "{}"
             let text = try OrderedJSON.edit(original, removing: j.keys, adding: adding)
             try FS.atomicWrite(Data(text.utf8), to: j.file)
+            try run.step()
         }
         for s in layout.secrets {
             if let to = run.j.to, let value = try keychain.get(service: Self.vaultService, account: vaultKey(to, s)) {
@@ -268,6 +359,7 @@ public final class SignInVault {
             } else {
                 try keychain.delete(service: s.service, account: s.account)
             }
+            try run.step()
         }
     }
 
@@ -306,28 +398,39 @@ public final class SignInVault {
         if FS.exists(stage) {
             for name in [".dropped"] + layout.jsonKeys.indices.map({ ".before-\($0)" }) {
                 FS.removeIfExists(stage.appendingPathComponent(name))
+                try step()
             }
             if let from = j.from {
                 let about = SavedLogin(account: from, email: j.fromEmail, setAsideAt: FS.now)
                 try FS.writeCodable(about, to: stage.appendingPathComponent(Self.aboutName))
+                try step()
                 for s in layout.secrets {
                     let key = vaultKey(Self.stageID, s)
                     if let value = try keychain.get(service: Self.vaultService, account: key) {
                         try keychain.set(service: Self.vaultService, account: vaultKey(from, s), value: value)
                         try keychain.delete(service: Self.vaultService, account: key)
+                        try step()
                     }
                 }
                 if FS.exists(dir(from)) { try trash(dir(from)) }
+                try step()
                 try FS.move(stage, to: dir(from))
+                try step()
             } else {
                 for s in layout.secrets { try keychain.delete(service: Self.vaultService, account: vaultKey(Self.stageID, s)) }
+                try step()
                 try trash(stage)
+                try step()
             }
         }
         if let to = j.to, to != j.from {
             // What is left is a duplicate of what is now live: never keep it to be put back twice.
             if FS.exists(dir(to)) { try FileManager.default.removeItem(at: dir(to)) }
-            for s in layout.secrets { try keychain.delete(service: Self.vaultService, account: vaultKey(to, s)) }
+            try step()
+            for s in layout.secrets {
+                try keychain.delete(service: Self.vaultService, account: vaultKey(to, s))
+                try step()
+            }
         }
         FS.removeIfExists(journalURL)
     }

@@ -8,6 +8,11 @@ Antigravity, and shows each Antigravity account's quota. SwiftPM, Swift 6 toolch
   - `SignInVault.swift`: journaled, all-or-nothing swap of one app's sign-in; `recover()` after a crash.
   - `Providers.swift`: what each app's sign-in is (`claudeLayout`, `antigravityLayout`) and the switch flow.
   - `Switchboard.swift`: the facade the app and CLI use.
+  - `CLIProfiles.swift`: Claude Code / Codex profile folders, the pointer, shared-item symlinks, `CLIEnv`, the keychain service name.
+  - `CLIShim.swift`: the PATH shim scripts and the `~/.zshrc` block (`switcher cli install` / `uninstall`).
+  - `CLIAccounts.swift`: who each profile is signed in as, the read-only keychain reader and `doctor`.
+  - `CLIQuota.swift`: Claude Code quota (statusline file, usage endpoint, `renewLogin`) and Codex quota (`codex app-server`).
+  - `CLICommands.swift`: `switcher cli` argument parsing, `exec` environment edits and the profile list.
 - `Sources/SwitcherApp`: SwiftUI app. `AppModel` is the only thing that calls the core; views never do.
 - `Sources/switcher`: CLI.
 - `scripts/bundle.sh`: builds `dist/Switcher.app`.
@@ -21,4 +26,11 @@ Antigravity, and shows each Antigravity account's quota. SwiftPM, Swift 6 toolch
 - Antigravity sign-in = keychain `gemini`/`antigravity` (go-keyring) + `app_storage.json` onboarding keys
   (`agy.onboarding.*` since 2.3x, `jetski.onboarding.*` before) + the 2.30 token file
   `~/.gemini/jetski-standalone-oauth-token`. Verified by live switches on 2.31; re-check after updates.
+- CLI accounts never move credentials: switching only rewrites the pointer file.
+- CLI paths are Strings end to end, never URL round trips. Claude Code's keychain name is sha256 of the
+  raw `CLAUDE_CONFIG_DIR` string, so a symlink or trailing slash changes it; the default account leaves
+  the variable unset. Verified on claude 2.1.323 with a fake `security`.
+- Never touch shims, rc files or the pointer on the real HOME from a test, or without the owner's go.
+- `renewLogin` (a real `claude -p` run) only on an explicit request (`--renew`), never on its own.
+- CLI tests use `CLIEnv(home: tmp)` and `MemoryCLIKeychain`.
 - Check: `swift test`. App: `scripts/bundle.sh && open dist/Switcher.app`.
