@@ -518,6 +518,20 @@ final class QuotaBox {
         #expect(stat(path, &st) == 0 && (st.st_mode & 0o777) == 0o600)
     }
 
+    // Review 2 finding 3: the app reads Claude and Codex at once; no writer drops another's entry.
+    @Test func concurrentStoresKeepEveryEntry() throws {
+        let b = QuotaBox()
+        let ps = (0..<24).map { b.claude("p\($0)") }
+        let q = CLIQuota(windows: [], source: "statusline", observedAt: b.now)
+        let env = b.env
+        DispatchQueue.concurrentPerform(iterations: ps.count) { i in
+            try? CLIQuotaCache(env: env).store(q, for: ps[i], accountKey: "k\(i)")
+        }
+        let cache = CLIQuotaCache(env: b.env)
+        #expect(cache.load().count == ps.count)
+        for (i, p) in ps.enumerated() { #expect(cache.quota(for: p, accountKey: "k\(i)") == q) }
+    }
+
     @Test func aCorruptFileReadsAsEmptyAndIsReplaced() throws {
         let b = QuotaBox(), p = b.claude()
         b.write(b.env.config + "/quota-cache.json", "{nope")

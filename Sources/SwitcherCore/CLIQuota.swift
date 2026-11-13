@@ -520,13 +520,17 @@ public struct CLIQuotaCache {
         return e.quota
     }
 
+    /// Read, merge and write under one lock (the app reads Claude and Codex at the same time, and
+    /// the CLI may run too), so one writer never drops another's entry.
     public func store(_ quota: CLIQuota, for profile: CLIProfile, accountKey: String?) throws {
+        try FS.makePrivateDir(url.deletingLastPathComponent())
+        let lock = try FileLock(url.appendingPathExtension("lock"), timeout: 10)
+        defer { withExtendedLifetime(lock) {} }
         var file = readFile()
         file.profiles[profile.id] = Entry(quota: quota, accountKey: accountKey)
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         enc.dateEncodingStrategy = .iso8601
-        try FS.makePrivateDir(url.deletingLastPathComponent())
         try FS.atomicWrite(try enc.encode(file), to: url)
     }
 
