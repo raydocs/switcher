@@ -218,4 +218,30 @@ import Testing
         #expect(box.read(box.home + "/.zshrc") == zshBefore)
         #expect(FS.exists(URL(fileURLWithPath: box.env.shim(.claude))))
     }
+
+    @Test(.enabled(if: CLIBinaryIntegrationTests.switcherBinary != nil))
+    func agyIsolationAndReloginPromotionFailuresFailClosedInCLI() throws {
+        let box = CLIBox()
+        let add = try run(box, ["cli", "add", "agy", "work"])
+        #expect(add.status == 0)
+        let workDir = box.home + "/.agy-profiles/work"
+
+        // Re-login where child exits 0 without writing staged token fails despite old token on disk.
+        box.write(workDir + "/antigravity-cli/antigravity-oauth-token",
+                  box.json(["token": ["refresh_token": "r-old"], "id_token_email": "old@example.com"]), mode: 0o600)
+        box.write(box.top + "/bin/agy", "#!/bin/sh\nexit 0\n", mode: 0o755)
+        let relogin = try run(box, ["cli", "login", "agy", "work"], extraPath: box.top + "/bin")
+        #expect(relogin.status != 0)
+        #expect(relogin.stdout.contains("Sign-in was not updated"))
+
+        // Broken isolation (cache replaced with a symlink) blocks both `use` and `exec` without moving pointer.
+        try FileManager.default.removeItem(atPath: workDir + "/antigravity-cli/cache")
+        box.mkdir(box.top + "/outside")
+        box.symlink(workDir + "/antigravity-cli/cache", to: box.top + "/outside")
+        let useRes = try run(box, ["cli", "use", "agy", "work"])
+        #expect(useRes.status != 0)
+        #expect(CLIProfiles(env: box.env).active(.agy).isDefault)
+        let execRes = try run(box, ["cli", "exec", "agy", "work", "--", "/usr/bin/true"])
+        #expect(execRes.status != 0)
+    }
 }

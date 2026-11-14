@@ -196,4 +196,39 @@ import Testing
         #expect(!children2.contains { $0.hasPrefix(".login-home-") })
         #expect(!FS.exists(URL(fileURLWithPath: p2.path + "/antigravity-cli/antigravity-oauth-token")))
     }
+
+    @Test func agyReloginPromotionFailureSurfacesNonZeroInsteadOfMaskingOldToken() throws {
+        let box = CLIBox()
+        let profiles = CLIProfiles(env: box.env)
+        let p = try profiles.add(.agy, name: "work")
+        let tokenFile = p.path + "/antigravity-cli/antigravity-oauth-token"
+        box.write(tokenFile, box.json(["token": ["access_token": "old", "refresh_token": "r-old"], "id_token_email": "old@example.com"]), mode: 0o600)
+
+        // Child exits 0 without writing staged jetski-standalone-oauth-token.
+        let noWrite = box.top + "/agy-nowrite"
+        box.write(noWrite, "#!/bin/sh\nexit 0\n", mode: 0o755)
+        let run1 = CLILoginRun(profile: p, binary: noWrite, workingDirectory: box.home, baseEnvironment: ["HOME": box.home, "PATH": "/usr/bin:/bin"])
+        try run1.start()
+        #expect(run1.wait() == 1)
+        #expect(run1.promotionError != nil)
+        #expect(run1.output().contains("without writing a sign-in token"))
+        #expect(profiles.identity(p, keychain: MemoryCLIKeychain())?.email == "old@example.com")
+        let left1 = try FileManager.default.contentsOfDirectory(atPath: p.path + "/antigravity-cli")
+        #expect(!left1.contains { $0.hasPrefix(".login-home-") })
+
+        // Destination replaced by a directory: promotion fails, surfaces non-zero, cleans up staging.
+        let pDir = try profiles.add(.agy, name: "bad-dest")
+        box.mkdir(pDir.path + "/antigravity-cli/antigravity-oauth-token")
+        let goodChild = box.top + "/agy-good"
+        box.write(goodChild, """
+        #!/bin/sh
+        printf '{"token":{"refresh_token":"r-new"}}' > "$HOME/.gemini/jetski-standalone-oauth-token"
+        """, mode: 0o755)
+        let run2 = CLILoginRun(profile: pDir, binary: goodChild, workingDirectory: box.home, baseEnvironment: ["HOME": box.home, "PATH": "/usr/bin:/bin"])
+        try run2.start()
+        #expect(run2.wait() == 1)
+        #expect(run2.promotionError != nil)
+        let left2 = try FileManager.default.contentsOfDirectory(atPath: pDir.path + "/antigravity-cli")
+        #expect(!left2.contains { $0.hasPrefix(".login-home-") })
+    }
 }

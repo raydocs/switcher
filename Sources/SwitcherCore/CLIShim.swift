@@ -29,15 +29,27 @@ public enum CLIShim {
         let agyPost = kind == .agy ? """
         if [ "${SWITCHER_BYPASS:-}" != 1 ] && [ -z "$agy_explicit" ] && [ -n "${ANTIGRAVITY_GEMINI_DIR:-}" ]; then
           agy_dir=$ANTIGRAVITY_GEMINI_DIR
-          if [ -d "$agy_dir" ] && [ ! -L "$agy_dir" ]; then
-            if [ ! -e "$agy_dir/antigravity-cli/cache" ]; then
-              if [ ! -L "$agy_dir/antigravity-cli" ]; then
-                (umask 077 && mkdir -p "$agy_dir/antigravity-cli/cache") 2>/dev/null || true
+          if [ "$agy_dir" != \(shellQuote(env.defaultFolder(.agy))) ]; then
+            agy_marker="$agy_dir/antigravity-cli/cache/antigravity-keyring-unavailable"
+            agy_marker_ok=
+            if [ -d "$agy_dir" ] && [ ! -L "$agy_dir" ]; then
+              if [ ! -e "$agy_dir/antigravity-cli" ]; then
+                (umask 077 && mkdir "$agy_dir/antigravity-cli") 2>/dev/null || true
+              fi
+              if [ -d "$agy_dir/antigravity-cli" ] && [ ! -L "$agy_dir/antigravity-cli" ]; then
+                if [ ! -e "$agy_dir/antigravity-cli/cache" ]; then
+                  (umask 077 && mkdir "$agy_dir/antigravity-cli/cache") 2>/dev/null || true
+                fi
+                if [ -d "$agy_dir/antigravity-cli/cache" ] && [ ! -L "$agy_dir/antigravity-cli/cache" ] && [ ! -L "$agy_marker" ]; then
+                  if (umask 077 && : > "$agy_marker") 2>/dev/null && chmod 600 "$agy_marker" 2>/dev/null && [ -f "$agy_marker" ] && [ ! -L "$agy_marker" ]; then
+                    agy_marker_ok=1
+                  fi
+                fi
               fi
             fi
-            agy_marker="$agy_dir/antigravity-cli/cache/antigravity-keyring-unavailable"
-            if [ -d "$agy_dir/antigravity-cli" ] && [ ! -L "$agy_dir/antigravity-cli" ] && [ -d "$agy_dir/antigravity-cli/cache" ] && [ ! -L "$agy_dir/antigravity-cli/cache" ] && [ ! -L "$agy_marker" ]; then
-              (umask 077 && : > "$agy_marker") 2>/dev/null || true
+            if [ -z "$agy_marker_ok" ]; then
+              printf 'switcher: cannot isolate Antigravity CLI profile "%s" (keyring marker failed); refusing to start\\n' "$agy_dir" >&2
+              exit 1
             fi
           fi
           case "${1:-}" in

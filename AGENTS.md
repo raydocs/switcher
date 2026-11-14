@@ -16,7 +16,7 @@ Antigravity, and shows each Antigravity account's quota. SwiftPM, Swift 6 toolch
   - `CLICommands.swift`: `switcher cli` argument parsing, `exec` environment edits and the profile list.
 - `Sources/SwitcherApp`: SwiftUI app. `AppModel` is the only thing that calls the core; views never do.
 - `Sources/switcher`: CLI.
-- `scripts/bundle.sh`: builds `dist/Switcher.app` (with `switcher` signed under `Contents/MacOS/switcher`).
+- `scripts/bundle.sh`: builds `dist/Switcher.app` (with `switcher` signed under `Contents/MacOS/switcher-cli`).
 
 ## Rules
 - Tests run only on temp dirs (`Sandbox` in `Tests/SwitcherCoreTests/SwitchTests.swift`) with `FakeApp`

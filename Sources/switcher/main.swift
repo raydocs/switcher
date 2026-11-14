@@ -108,6 +108,7 @@ func signIn(_ profile: CLIProfile, env: CLIEnv, profiles: CLIProfiles, keychain:
     for (v, value) in CLICommands.envEdits(profile) { environment[v] = value }
     var agyStage: String?
     if kind == .agy {
+        environment.removeValue(forKey: CLIKind.agy.envVar)
         environment["AGY_CLI_CDE_AUTH_ACTION"] = "login"
         environment["SWITCHER_BYPASS"] = "1"
         if !profile.isDefault {
@@ -127,20 +128,30 @@ func signIn(_ profile: CLIProfile, env: CLIEnv, profiles: CLIProfiles, keychain:
     do {
         try proc.run()
     } catch {
-        if let stage = agyStage { CLILoginRun.finalizeAgyLoginStaging(loginHome: stage, for: profile, succeeded: false) }
+        if let stage = agyStage { try? CLILoginRun.finalizeAgyLoginStaging(loginHome: stage, for: profile, succeeded: false) }
         fail("cannot run \(real): \(error.localizedDescription)")
     }
     proc.waitUntilExit()
+    var promotionError: String?
     if let stage = agyStage {
-        CLILoginRun.finalizeAgyLoginStaging(loginHome: stage, for: profile, succeeded: proc.terminationStatus == 0)
+        do {
+            try CLILoginRun.finalizeAgyLoginStaging(loginHome: stage, for: profile, succeeded: proc.terminationStatus == 0)
+        } catch {
+            promotionError = error.localizedDescription
+        }
     }
     print("")
+    if let promotionError {
+        FileHandle.standardError.write(Data("switcher: \(promotionError)\n".utf8))
+    }
     let after = profiles.signIn(profile, keychain: keychain)
     let expired = after.refreshExpiresAt.map { $0 <= Date() } ?? false
-    guard proc.terminationStatus == 0, after.state != .signedOut, !expired else {
+    guard proc.terminationStatus == 0, promotionError == nil, after.state != .signedOut, !expired else {
         if createdNow, after.state == .signedOut {
             try? profiles.discardUnsignedIn(profile, keychain: keychain)
             print("Not signed in, so nothing was added. Run `switcher cli add \(kind.command)` to try again.")
+        } else if after.state != .signedOut {
+            print("Sign-in was not updated. Try again any time with:\n  switcher cli login \(kind.command) \(profile.name)")
         } else {
             print("Not signed in yet. Try again any time with:\n  switcher cli login \(kind.command) \(profile.name)")
         }
@@ -159,7 +170,10 @@ func signIn(_ profile: CLIProfile, env: CLIEnv, profiles: CLIProfiles, keychain:
         use = answer.isEmpty || answer.hasPrefix("y")
     }
     if use {
-        do { try profiles.setActive(profile) } catch { fail(error.localizedDescription) }
+        do {
+            if kind == .agy, !profile.isDefault { try profiles.prepareAgyProfile(profile) }
+            try profiles.setActive(profile)
+        } catch { fail(error.localizedDescription) }
         print("New \(kind.command) sessions now use \(label.isEmpty ? profile.name : who?.email ?? profile.name). Back: `switcher cli use \(kind.command) default`.")
     } else {
         print("Switch any time: `switcher cli use \(kind.command) \(who?.email ?? profile.name)`.")
@@ -201,8 +215,8 @@ func runCLI(_ args: [String]) -> Never {
                 guard let next = profiles.next(kind) else { fail("no other \(kind.displayName) profile yet: `switcher cli add \(kind.command) <name>`") }
                 target = next
             }
+            if kind == .agy, !target.isDefault { try profiles.prepareAgyProfile(target) }
             try profiles.setActive(target)
-            if kind == .agy, !target.isDefault { try? profiles.prepareAgyProfile(target) }
             let email = profiles.identity(target, keychain: keychain)?.email
             print("New \(kind.command) processes now use \(target.name) (\(email ?? "no sign-in yet")). Sessions already running keep their account.")
             if !CLIShim.isShim(env.shim(kind)) {
@@ -298,7 +312,7 @@ func runCLI(_ args: [String]) -> Never {
             let req: CLICommands.ExecRequest
             do { req = try CLICommands.parseExec(args) } catch { fail(error.localizedDescription) }
             let profile = try CLICommands.profile(profiles, req.kind, req.who, keychain: keychain)
-            if profile.kind == .agy, !profile.isDefault { try? profiles.prepareAgyProfile(profile) }
+            if profile.kind == .agy, !profile.isDefault { try profiles.prepareAgyProfile(profile) }
             var argv = req.command
             if argv.isEmpty {
                 // The real binary, so the shim is not involved.

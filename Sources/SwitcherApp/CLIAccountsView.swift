@@ -445,11 +445,12 @@ struct CLIRowView: View {
 
     private var ranOut: Bool { timeLeft.map { $0 <= 0 } ?? false }
     private var needsSignIn: Bool { row.signIn == .out || ranOut }
-    private var usable: Bool { !row.isActive && !needsSignIn && !isRemoving }
+    private var isRemoving: Bool { model.cliRemoving.contains(row.id) }
+    private var isProfileBusy: Bool { model.isCLIProfileBusy(row.kind, name: row.name) }
+    private var usable: Bool { !row.isActive && !needsSignIn && !isRemoving && model.cliSigningIn[row.kind] != row.name }
     private var highlighted: Bool { (hovering || forcedHover || focused) && usable }
     private var needsRenewal: Bool { row.quotaError == .signInExpired && !needsSignIn && row.kind == .claude }
-    private var isRemoving: Bool { model.cliRemoving.contains(row.id) }
-    private var canRemove: Bool { !row.isDefault && !isRemoving }
+    private var canRemove: Bool { !row.isDefault && !isProfileBusy }
     private var signInBusy: Bool { model.cliStarting.contains(row.kind) || model.cliSigningIn[row.kind] != nil }
 
     /// The main windows (short before weekly), else up to two non-warned windows if none are main.
@@ -521,7 +522,7 @@ struct CLIRowView: View {
             }
         }
         .overlay(alignment: .topTrailing) {
-            if (hovering || forcedHover) && !row.isDefault && !isRemoving {
+            if (hovering || forcedHover) && canRemove {
                 moreMenu
                     .padding(.trailing, Metrics.rowH)
                     .padding(.top, Metrics.rowV)
@@ -585,7 +586,7 @@ struct CLIRowView: View {
                     .foregroundStyle(Color.accentColor)
                     .fixedSize()
                 }
-                if (hovering || forcedHover) && !row.isDefault {
+                if (hovering || forcedHover) && canRemove {
                     Color.clear.frame(width: 16, height: 1)
                 }
             }
@@ -632,6 +633,7 @@ struct CLIRowView: View {
                     removing = nil
                 }
                 .buttonStyle(SoftButtonStyle(kind: .destructive, compact: true))
+                .disabled(!canRemove)
             }
         }
         .padding(.horizontal, Metrics.rowH)
@@ -792,7 +794,7 @@ struct CLIRowView: View {
             HStack(spacing: 6) {
                 Button(L.t("Sign In…", "登录…")) { model.signInCLI(row) }
                     .buttonStyle(SoftButtonStyle(kind: .tinted, compact: true))
-                    .disabled(signInBusy || isRemoving)
+                    .disabled(signInBusy || isProfileBusy)
                     .fixedSize()
                 if !row.isDefault {
                     Button(L.t("Remove…", "移除…")) { removing = row.id }
@@ -817,6 +819,7 @@ struct CLIRowView: View {
             } else {
                 Button(L.t("Renew sign-in", "续期登录")) { model.renewCLISignIn(row) }
                     .buttonStyle(SoftButtonStyle(compact: true))
+                    .disabled(isProfileBusy)
                     .fixedSize()
                     .help(L.t("Runs claude once as this account, so it renews its own sign-in. Uses a few tokens of its plan.",
                               "用这个账号运行一次 claude，让它自己续期登录。会用掉套餐里的少量额度。"))

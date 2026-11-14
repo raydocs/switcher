@@ -238,6 +238,44 @@ import Testing
         // Explicit --gemini_dir is not duplicated.
         let explicit = try w.run(.agy, args: ["--gemini_dir=/custom", "chat"])
         #expect(explicit.args == ["--gemini_dir=/custom", "chat"])
+        #expect(w.box.mode(profPath + "/antigravity-cli/cache/antigravity-keyring-unavailable") == 0o600)
+    }
+
+    @Test func agyShimFailsClosedWhenKeyringMarkerCannotBeIsolated() throws {
+        let w = try world()
+        let agyRoot = w.env.profilesRoot(.agy)
+
+        // 1. Symlinked cache directory is refused before real agy runs.
+        let symProf = agyRoot + "/symcache"
+        w.box.mkdir(symProf + "/antigravity-cli")
+        w.box.mkdir(w.box.top + "/elsewhere")
+        w.box.symlink(symProf + "/antigravity-cli/cache", to: w.box.top + "/elsewhere")
+        w.pointer(symProf + "\n", .agy)
+        let r1 = try w.run(.agy, args: ["chat"])
+        #expect(r1.status == 1)
+        #expect(r1.stderr.contains("cannot isolate Antigravity CLI profile"))
+        #expect(r1.value("ANTIGRAVITY_GEMINI_DIR") == nil)
+
+        // 2. Symlinked marker file is refused.
+        let symMarkerProf = agyRoot + "/symmarker"
+        w.box.mkdir(symMarkerProf + "/antigravity-cli/cache")
+        w.box.symlink(symMarkerProf + "/antigravity-cli/cache/antigravity-keyring-unavailable", to: w.box.top + "/elsewhere/m")
+        w.pointer(symMarkerProf + "\n", .agy)
+        let r2 = try w.run(.agy, args: ["chat"])
+        #expect(r2.status == 1)
+        #expect(r2.value("ANTIGRAVITY_GEMINI_DIR") == nil)
+
+        // 3. Read-only cache directory (mkdir/truncate fails) is refused.
+        let roProf = agyRoot + "/rocache"
+        let roCache = roProf + "/antigravity-cli/cache"
+        w.box.mkdir(roCache)
+        chmod(roCache, 0o500)
+        defer { chmod(roCache, 0o700) }
+        w.pointer(roProf + "\n", .agy)
+        let r3 = try w.run(.agy, args: ["chat"])
+        #expect(r3.status == 1)
+        #expect(r3.stderr.contains("cannot isolate Antigravity CLI profile"))
+        #expect(r3.value("ANTIGRAVITY_GEMINI_DIR") == nil)
     }
 
     @Test func invalidPointerAndMissingFolderProduceDistinctWarnings() throws {

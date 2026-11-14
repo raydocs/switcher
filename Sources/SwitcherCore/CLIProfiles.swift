@@ -485,7 +485,7 @@ public final class CLIProfiles {
         let cliFD = openat(fd, "antigravity-cli", O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
         guard cliFD >= 0 else { throw SwitcherError.message("\(profilePath)/antigravity-cli is not a real folder") }
         defer { close(cliFD) }
-        _ = fchmod(cliFD, 0o700)
+        guard fchmod(cliFD, 0o700) == 0 else { throw POSIXError.current("securing \(profilePath)/antigravity-cli") }
 
         if mkdirat(cliFD, "cache", 0o700) != 0, errno != EEXIST {
             throw POSIXError.current("creating \(profilePath)/antigravity-cli/cache")
@@ -493,15 +493,22 @@ public final class CLIProfiles {
         let cacheFD = openat(cliFD, "cache", O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
         guard cacheFD >= 0 else { throw SwitcherError.message("\(profilePath)/antigravity-cli/cache is not a real folder") }
         defer { close(cacheFD) }
-        _ = fchmod(cacheFD, 0o700)
+        guard fchmod(cacheFD, 0o700) == 0 else { throw POSIXError.current("securing \(profilePath)/antigravity-cli/cache") }
 
-        let markerFD = openat(cacheFD, "antigravity-keyring-unavailable", O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0o600)
+        let markerPath = "\(profilePath)/antigravity-cli/cache/antigravity-keyring-unavailable"
+        let markerFD = openat(cacheFD, "antigravity-keyring-unavailable", O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0o600)
         guard markerFD >= 0 else {
-            throw SwitcherError.message("\(profilePath)/antigravity-cli/cache/antigravity-keyring-unavailable is not a regular file")
+            throw SwitcherError.message("\(markerPath) is not a regular writable file")
         }
-        _ = fchmod(markerFD, 0o600)
+        defer { close(markerFD) }
+        var mst = stat()
+        guard fstat(markerFD, &mst) == 0, (mst.st_mode & S_IFMT) == S_IFREG else {
+            throw SwitcherError.message("\(markerPath) is not a regular file")
+        }
+        guard ftruncate(markerFD, 0) == 0, fchmod(markerFD, 0o600) == 0 else {
+            throw POSIXError.current("updating \(markerPath)")
+        }
         _ = futimens(markerFD, nil)
-        close(markerFD)
     }
 
     /// Keys of the default `~/.claude.json` a new profile starts with. Everything else (the

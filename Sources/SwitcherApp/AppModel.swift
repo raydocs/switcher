@@ -450,15 +450,20 @@ final class AppModel {
         return CLIShim.findRealBinary(kind, env: cli.env)
     }
 
+    func isCLIProfileBusy(_ kind: CLIKind, name: String) -> Bool {
+        let id = "\(kind.rawValue):\(name)"
+        return cliRemoving.contains(id) || cliRenewing.contains(id) || cliSigningIn[kind] == name
+    }
+
     /// New `claude` / `codex` / `agy` processes use this account from now on. Nothing quits.
     func useCLI(_ row: CLIRow) {
-        guard !isPreview, !row.isActive else { return }
+        guard !isPreview, !row.isActive, !cliRemoving.contains(row.id), cliSigningIn[row.kind] != row.name else { return }
         let cli = self.cli, keychain = self.cliKeychain, seqBox = self.cliSeqBox
         queue.async {
             let result = Result {
                 let p = try Self.profile(cli, row.kind, row.name)
+                if p.kind == .agy, !p.isDefault { try cli.prepareAgyProfile(p) }
                 try cli.setActive(p)
-                if p.kind == .agy, !p.isDefault { try? cli.prepareAgyProfile(p) }
             }
             let boards = Self.readCLI(cli, keychain)
             let seq = seqBox.next()
@@ -488,9 +493,13 @@ final class AppModel {
     func addCLIAccount(_ kind: CLIKind) {
         if isPreview || cliStarting.contains(kind) || cliSigningIn[kind] != nil { return }
         cliStarting.insert(kind)
+        let prefix = kind.rawValue + ":"
+        let reserved = Set(cliRemoving.union(cliRenewing).compactMap { id in
+            id.hasPrefix(prefix) ? String(id.dropFirst(prefix.count)) : nil
+        })
         let cli = self.cli, keychain = self.cliKeychain
         queue.async {
-            let result = Result { try cli.add(kind, name: cli.suggestedName(kind, keychain: keychain)) }
+            let result = Result { try cli.add(kind, name: cli.suggestedName(kind, keychain: keychain, reserved: reserved)) }
             Task { @MainActor in
                 self.cliStarting.remove(kind)
                 switch result {
@@ -503,7 +512,7 @@ final class AppModel {
 
     /// Sign an existing account in (again), in the background.
     func signInCLI(_ row: CLIRow) {
-        if isPreview || cliStarting.contains(row.kind) || cliSigningIn[row.kind] != nil { return }
+        if isPreview || cliStarting.contains(row.kind) || cliSigningIn[row.kind] != nil || isCLIProfileBusy(row.kind, name: row.name) { return }
         guard let p = try? Self.profile(cli, row.kind, row.isDefault ? "default" : row.name) else { return }
         startCLISignIn(p, createdNow: false)
     }
@@ -539,7 +548,7 @@ final class AppModel {
 
     private func startCLISignIn(_ p: CLIProfile, createdNow: Bool) {
         let cli = self.cli, keychain = self.cliKeychain, coreQueue = self.queue, seqBox = self.cliSeqBox
-        guard !cliStarting.contains(p.kind), cliSigningIn[p.kind] == nil else {
+        guard !cliStarting.contains(p.kind), cliSigningIn[p.kind] == nil, !isCLIProfileBusy(p.kind, name: p.name) else {
             if createdNow { coreQueue.async { try? cli.discardUnsignedIn(p, keychain: keychain) } }
             return
         }
@@ -661,8 +670,9 @@ final class AppModel {
 
     /// Sign a CLI account out (bounded wait) and move its profile folder to the Trash.
     func removeCLIAccount(_ row: CLIRow) {
-        guard !isPreview, !row.isDefault, !cliRemoving.contains(row.id) else { return }
+        guard !isPreview, !row.isDefault, !isCLIProfileBusy(row.kind, name: row.name) else { return }
         cliRemoving.insert(row.id)
+        clearCLIQuotaState(row.id, clearAttempt: true)
         let cli = self.cli, keychain = self.cliKeychain, coreQueue = self.queue, seqBox = self.cliSeqBox
         let kind = row.kind, name = row.name, rowID = row.id, label = row.label
         DispatchQueue.global(qos: .userInitiated).async {
@@ -758,7 +768,8 @@ final class AppModel {
             var gen: UInt64
         }
         let targets: [Target] = (cliBoard(kind)?.rows ?? []).compactMap { row in
-            guard row.signIn.isGood(at: now), only?.contains(row.name) ?? true else { return nil }
+            guard !isCLIProfileBusy(kind, name: row.name),
+                  row.signIn.isGood(at: now), only?.contains(row.name) ?? true else { return nil }
             let isBackingOff = CLIRefreshPlan.backingOff(lastAttempt: cliAttempt[row.id], failures: cliFailures[row.id] ?? 0,
                                                          lowPower: lowPower, now: now)
             if !force, isBackingOff { return nil }
@@ -773,11 +784,23 @@ final class AppModel {
         let cli = self.cli, keychain = self.cliKeychain, coreQueue = self.queue, seqBox = self.cliSeqBox
         let augmentedEnv = cli.env.augmentedEnvironment()
 
+        struct ReadRecord: Sendable {
+            var profile: CLIProfile
+            var beforeKey: String?
+            var beforeFP: String?
+            var afterKey: String?
+            var afterFP: String?
+            var afterSignedOut: Bool
+            var outcome: Result<CLIQuota, CLIQuotaError>
+        }
+
         Task.detached {
-            var succeeded: [(CLIProfile, CLIQuota)] = []
-            var outcomes: [String: CLIQuotaError?] = [:]
+            var records: [ReadRecord] = []
             for t in targets {
                 guard let p = try? Self.profile(cli, kind, t.name) else { continue }
+                let beforeKey = cli.identity(p, keychain: keychain)?.accountKey
+                let beforeFP = cli.credentialFingerprint(p, keychain: keychain)
+                let outcome: Result<CLIQuota, CLIQuotaError>
                 do {
                     let quota: CLIQuota
                     switch kind {
@@ -789,41 +812,64 @@ final class AppModel {
                     case .agy:
                         quota = try await AgyCLIQuota.read(profile: p, profiles: cli, keychain: keychain)
                     }
-                    succeeded.append((p, quota))
-                    outcomes[p.id] = .some(nil)
+                    outcome = .success(quota)
                 } catch let error as CLIQuotaError {
-                    outcomes[p.id] = error
+                    outcome = .failure(error)
                 } catch {
-                    outcomes[p.id] = .unavailable(error.localizedDescription)
+                    outcome = .failure(.unavailable(error.localizedDescription))
                 }
+                let afterKey = cli.identity(p, keychain: keychain)?.accountKey
+                let afterFP = cli.credentialFingerprint(p, keychain: keychain)
+                let afterSignedOut = cli.signIn(p, keychain: keychain).state == .signedOut
+                records.append(ReadRecord(profile: p, beforeKey: beforeKey, beforeFP: beforeFP,
+                                          afterKey: afterKey, afterFP: afterFP, afterSignedOut: afterSignedOut,
+                                          outcome: outcome))
             }
 
-            let toStore = succeeded
-            let readOutcomes = outcomes
-            let targetIDs = targets.map(\.id)
-            let finished = await withCheckedContinuation { (cont: CheckedContinuation<(boards: [CLIBoard], seq: UInt64, contexts: [String: (accountKey: String?, fingerprint: String?)]), Never>) in
+            let collected = records
+            let finished = await withCheckedContinuation { (cont: CheckedContinuation<(boards: [CLIBoard], seq: UInt64, validOutcomes: [String: CLIQuotaError?], staleIDs: Set<String>, contexts: [String: (accountKey: String?, fingerprint: String?)]), Never>) in
                 coreQueue.async {
                     let cache = CLIQuotaCache(env: cli.env)
-                    for (p, q) in toStore {
-                        try? cache.store(q, for: p, accountKey: cli.identity(p, keychain: keychain)?.accountKey)
-                    }
+                    var validOutcomes: [String: CLIQuotaError?] = [:]
+                    var staleIDs: Set<String> = []
                     var contexts: [String: (accountKey: String?, fingerprint: String?)] = [:]
-                    for id in targetIDs {
-                        let name = String(id.dropFirst(kind.rawValue.count + 1))
-                        if let p = try? Self.profile(cli, kind, name) {
-                            contexts[id] = (cli.identity(p, keychain: keychain)?.accountKey,
-                                            cli.credentialFingerprint(p, keychain: keychain))
+                    for r in collected {
+                        let p = r.profile
+                        let nowKey = cli.identity(p, keychain: keychain)?.accountKey
+                        let nowFP = cli.credentialFingerprint(p, keychain: keychain)
+                        let sameDuringRead = (r.beforeKey == r.afterKey) && (r.beforeKey != nil || r.beforeFP == r.afterFP)
+                        let sameUntilCommit = (nowKey == r.afterKey) && (nowFP == r.afterFP)
+                        guard sameDuringRead, sameUntilCommit else {
+                            staleIDs.insert(p.id)
+                            continue
+                        }
+                        switch r.outcome {
+                        case .success(let q):
+                            guard !r.afterSignedOut else {
+                                staleIDs.insert(p.id)
+                                continue
+                            }
+                            try? cache.store(q, for: p, accountKey: r.afterKey)
+                            validOutcomes[p.id] = .some(nil)
+                        case .failure(let err):
+                            validOutcomes[p.id] = err
+                            contexts[p.id] = (r.afterKey, r.afterFP)
                         }
                     }
                     let boards = Self.readCLI(cli, keychain)
                     let seq = seqBox.next()
-                    cont.resume(returning: (boards, seq, contexts))
+                    cont.resume(returning: (boards, seq, validOutcomes, staleIDs, contexts))
                 }
             }
 
             await MainActor.run {
                 for t in targets {
-                    guard (self.cliQuotaGen[t.id] ?? 0) == t.gen, let outcome = readOutcomes[t.id] else { continue }
+                    guard (self.cliQuotaGen[t.id] ?? 0) == t.gen else { continue }
+                    if finished.staleIDs.contains(t.id) {
+                        self.cliAttempt[t.id] = nil
+                        continue
+                    }
+                    guard let outcome = finished.validOutcomes[t.id] else { continue }
                     self.cliQuotaErrors[t.id] = outcome
                     switch outcome {
                     case nil:
@@ -854,7 +900,7 @@ final class AppModel {
     /// Have Claude Code renew this account's sign-in (one minimal run of the real CLI), then read
     /// its usage again. Only from the row's button.
     func renewCLISignIn(_ row: CLIRow) {
-        guard !isPreview, row.kind == .claude, !cliRenewing.contains(row.id) else { return }
+        guard !isPreview, row.kind == .claude, !isCLIProfileBusy(row.kind, name: row.name) else { return }
         cliRenewing.insert(row.id)
         let cli = self.cli, keychain = self.cliKeychain, coreQueue = self.queue, seqBox = self.cliSeqBox
         let rowID = row.id, rowName = row.name, rowLabel = row.label
@@ -884,15 +930,27 @@ final class AppModel {
         }
     }
 
+    private nonisolated static func sameFile(_ a: String, _ b: String) -> Bool {
+        var sa = stat(), sb = stat()
+        guard stat(a, &sa) == 0, stat(b, &sb) == 0 else { return false }
+        return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino
+    }
+
     /// Sign an account in, in Terminal: a one-shot `.command` script (private temp folder, deleted as
     /// it starts) runs `switcher cli login`, which runs the CLI's own sign-in in the account's folder.
     /// The menu picks the sign-in up the next time it opens.
     @discardableResult
     func openSignIn(_ kind: CLIKind, name: String, loginCommand: String?, createdNow: Bool = false) -> Bool {
         if isPreview { return false }
-        let sibling = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("switcher").path
-        let resource = Bundle.main.resourceURL?.appendingPathComponent("switcher").path
-        let bundled = [sibling, resource].compactMap { $0 }.first { CLIShim.isRegularExecutable($0) }
+        let mainExec = Bundle.main.executableURL?.path
+        let macosDir = Bundle.main.executableURL?.deletingLastPathComponent()
+        let helper = macosDir?.appendingPathComponent("switcher-cli").path
+        let devSibling = macosDir?.appendingPathComponent("switcher").path
+        let bundled = [helper, devSibling].compactMap { $0 }.first { candidate in
+            guard CLIShim.isRegularExecutable(candidate) else { return false }
+            if let mainExec, Self.sameFile(candidate, mainExec) { return false }
+            return true
+        }
         let command: String
         if let bundled {
             let flag = createdNow ? " --rollback-if-unsigned" : ""

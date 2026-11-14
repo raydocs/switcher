@@ -114,7 +114,7 @@ switcher cli doctor                  # check shims, sign-ins, links and keychain
 | Command | What it does |
 |---|---|
 | `switcher cli [list] [--json]` | Every profile, who it is signed in as, and which is active |
-| `switcher cli use <cli> [<who>]` | New `claude` / `codex` processes use this account (no `<who>`: the next one) |
+| `switcher cli use <cli> [<who>]` | New `claude` / `codex` / `agy` processes use this account (no `<who>`: the next one) |
 | `switcher cli add [<cli>] [<name>]` | Add an account: the CLI's own sign-in opens the browser, then it offers to switch. The folder is named `account2`, `account3`, … unless you give a name; a cancelled sign-in leaves nothing. Says so when it is an account you already have. `--no-login`: folder only; `--use`: switch without asking |
 | `switcher cli login <cli> [<who>]` | Sign an account in again (default: the active one) |
 | `switcher cli remove <cli> <who> [--yes]` | Sign an account out and move its folder to the Trash (never the default account; shared sessions and settings stay) |

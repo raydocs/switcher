@@ -85,7 +85,7 @@ switcher cli doctor                  # check shims, sign-ins, links and keychain
 | 命令 | 作用 |
 |---|---|
 | `switcher cli [list] [--json]` | 每个配置文件夹、它登录的是谁，以及哪个是当前激活的 |
-| `switcher cli use <cli> [<who>]` | 新的 `claude` / `codex` 进程使用这个账号（不带 `<who>`：下一个账号） |
+| `switcher cli use <cli> [<who>]` | 新的 `claude` / `codex` / `agy` 进程使用这个账号（不带 `<who>`：下一个账号） |
 | `switcher cli add [<cli>] [<name>]` | 添加账号：CLI 自己的登录会打开浏览器，完成后询问是否切换。不给名字时文件夹依次叫 `account2`、`account3`……；取消登录不会留下任何东西；如果是已有的账号会提示。`--no-login` 只建文件夹；`--use` 不询问直接切换 |
 | `switcher cli login <cli> [<who>]` | 重新登录某个账号（默认是当前账号） |
 | `switcher cli remove <cli> <who> [--yes]` | 退出某个账号的登录，并把它的文件夹移到废纸篓（默认账号不能删；共享的会话和设置保留） |

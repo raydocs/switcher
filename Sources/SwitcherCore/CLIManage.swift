@@ -19,8 +19,8 @@ extension CLIProfiles {
     /// The folder name for a new account when none is given: `account2`, `account3`, … (the
     /// default account is number 1). The folder never changes after sign-in (Claude's keychain
     /// item is named after its path), so rows show the email and this name only as a tag.
-    public func suggestedName(_ kind: CLIKind, keychain: CLIKeychain? = nil) -> String {
-        let taken = Set(list(kind).map { $0.name.lowercased() })
+    public func suggestedName(_ kind: CLIKind, keychain: CLIKeychain? = nil, reserved: Set<String> = []) -> String {
+        let taken = Set(list(kind).map { $0.name.lowercased() }).union(reserved.map { $0.lowercased() })
         let root = env.profilesRoot(kind)
         var n = 2
         while true {
@@ -94,6 +94,11 @@ public final class CLILoginRun: @unchecked Sendable {
     private var pipe: Pipe?
     private var agyLoginStage: String?
     private var finalized = false
+    private var finalizeError: String?
+
+    public var promotionError: String? {
+        lock.withLock { finalizeError }
+    }
 
     public init(profile: CLIProfile, binary: String, arguments: [String]? = nil,
                 workingDirectory: String? = nil,
@@ -169,35 +174,83 @@ public final class CLILoginRun: @unchecked Sendable {
         }
         defer { close(cacheFD) }
 
-        let markerFD = openat(cacheFD, "antigravity-keyring-unavailable", O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0o600)
+        let markerFD = openat(cacheFD, "antigravity-keyring-unavailable", O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0o600)
         guard markerFD >= 0 else {
             try? FileManager.default.removeItem(atPath: stagePath)
             throw SwitcherError.message("\(stagePath)/.gemini/cache/antigravity-keyring-unavailable could not be created")
         }
-        _ = fchmod(markerFD, 0o600)
+        var mst = stat()
+        let okMarker = fstat(markerFD, &mst) == 0
+            && (mst.st_mode & S_IFMT) == S_IFREG
+            && ftruncate(markerFD, 0) == 0
+            && fchmod(markerFD, 0o600) == 0
         _ = futimens(markerFD, nil)
         close(markerFD)
+        guard okMarker else {
+            try? FileManager.default.removeItem(atPath: stagePath)
+            throw SwitcherError.message("\(stagePath)/.gemini/cache/antigravity-keyring-unavailable could not be secured")
+        }
         return stagePath
     }
 
     /// Move `<loginHome>/.gemini/jetski-standalone-oauth-token` into `<profile>/antigravity-cli/antigravity-oauth-token`
-    /// via `rename` (never copying) and remove `loginHome`.
-    public static func finalizeAgyLoginStaging(loginHome: String, for profile: CLIProfile, succeeded: Bool) {
+    /// via `renameat` (never copying) and remove `loginHome`. Throws when `succeeded` is true and the
+    /// staged token cannot be verified and moved into place.
+    public static func finalizeAgyLoginStaging(loginHome: String, for profile: CLIProfile, succeeded: Bool) throws {
         defer { try? FileManager.default.removeItem(atPath: loginHome) }
         guard succeeded, profile.kind == .agy, !profile.isDefault else { return }
         let root = (profile.path as NSString).deletingLastPathComponent
-        guard CLIPath.problem(profile.path, root: root) == nil,
-              CLIProfiles.isRealDirectory(root),
-              CLIProfiles.isRealDirectory(profile.path),
-              CLIProfiles.isRealDirectory(profile.path + "/antigravity-cli") else { return }
-        let staged = loginHome + "/.gemini/jetski-standalone-oauth-token"
-        var sst = stat()
-        guard lstat(staged, &sst) == 0, (sst.st_mode & S_IFMT) == S_IFREG else { return }
+        if let problem = CLIPath.problem(profile.path, root: root) {
+            throw SwitcherError.message("\(profile.path): \(problem)")
+        }
+        guard CLIProfiles.isRealDirectory(root), CLIProfiles.isRealDirectory(profile.path) else {
+            throw SwitcherError.message("\(profile.path) is not a real folder")
+        }
+        let profileFD = open(profile.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard profileFD >= 0 else { throw POSIXError.current("opening \(profile.path)") }
+        defer { close(profileFD) }
+
+        let cliFD = openat(profileFD, "antigravity-cli", O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard cliFD >= 0 else { throw SwitcherError.message("\(profile.path)/antigravity-cli is not a real folder") }
+        defer { close(cliFD) }
+
         let dest = profile.path + "/antigravity-cli/antigravity-oauth-token"
         var dst = stat()
-        if lstat(dest, &dst) == 0, (dst.st_mode & S_IFMT) != S_IFREG { return }
-        _ = chmod(staged, 0o600)
-        _ = rename(staged, dest)
+        if fstatat(cliFD, "antigravity-oauth-token", &dst, AT_SYMLINK_NOFOLLOW) == 0 {
+            guard (dst.st_mode & S_IFMT) == S_IFREG else {
+                throw SwitcherError.message("\(dest) exists and is not a regular file")
+            }
+        } else if errno != ENOENT {
+            throw POSIXError.current("checking \(dest)")
+        }
+
+        let stageFD = open(loginHome, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard stageFD >= 0 else { throw SwitcherError.message("Antigravity CLI staging folder is missing") }
+        defer { close(stageFD) }
+
+        let geminiFD = openat(stageFD, ".gemini", O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard geminiFD >= 0 else { throw SwitcherError.message("Antigravity CLI finished without writing a sign-in token") }
+        defer { close(geminiFD) }
+
+        let tokenFD = openat(geminiFD, "jetski-standalone-oauth-token", O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard tokenFD >= 0 else {
+            throw SwitcherError.message("Antigravity CLI finished without writing a sign-in token")
+        }
+        var sst = stat()
+        guard fstat(tokenFD, &sst) == 0, (sst.st_mode & S_IFMT) == S_IFREG else {
+            close(tokenFD)
+            throw SwitcherError.message("staged Antigravity CLI token is not a regular file")
+        }
+        guard fchmod(tokenFD, 0o600) == 0 else {
+            let err = POSIXError.current("setting permissions on staged Antigravity CLI token")
+            close(tokenFD)
+            throw err
+        }
+        close(tokenFD)
+
+        guard renameat(geminiFD, "jetski-standalone-oauth-token", cliFD, "antigravity-oauth-token") == 0 else {
+            throw POSIXError.current("moving Antigravity CLI token into \(dest)")
+        }
     }
 
     public func start() throws {
@@ -235,7 +288,7 @@ public final class CLILoginRun: @unchecked Sendable {
             pipe = nil
             if let staged {
                 agyLoginStage = nil
-                Self.finalizeAgyLoginStaging(loginHome: staged, for: profile, succeeded: false)
+                try? Self.finalizeAgyLoginStaging(loginHome: staged, for: profile, succeeded: false)
             }
             throw error
         }
@@ -275,19 +328,32 @@ public final class CLILoginRun: @unchecked Sendable {
             return s
         }
         if let stage {
-            Self.finalizeAgyLoginStaging(loginHome: stage, for: profile, succeeded: succeeded)
+            do {
+                try Self.finalizeAgyLoginStaging(loginHome: stage, for: profile, succeeded: succeeded)
+            } catch {
+                let msg = error.localizedDescription
+                lock.withLock {
+                    finalizeError = msg
+                    if !buffer.isEmpty, buffer.last != UInt8(ascii: "\n") {
+                        buffer.append(UInt8(ascii: "\n"))
+                    }
+                    buffer.append(contentsOf: msg.utf8)
+                    buffer.append(UInt8(ascii: "\n"))
+                    if buffer.count > 16384 { buffer = buffer.suffix(8192) }
+                }
+            }
         }
     }
 
     public var isRunning: Bool { process.isRunning }
 
-    /// Blocks until the sign-in ends. Returns its exit status.
+    /// Blocks until the sign-in ends. Returns its exit status (or `1` if staging promotion failed).
     @discardableResult
     public func wait() -> Int32 {
         process.waitUntilExit()
-        let status = process.terminationStatus
-        finishAfterExit(succeeded: status == 0)
-        return status
+        let rawStatus = process.terminationStatus
+        finishAfterExit(succeeded: rawStatus == 0)
+        return (rawStatus == 0 && promotionError != nil) ? 1 : rawStatus
     }
 
     /// Waits up to `timeout` seconds for the process to exit without killing it.
@@ -295,8 +361,9 @@ public final class CLILoginRun: @unchecked Sendable {
         let deadline = Date().addingTimeInterval(timeout)
         while process.isRunning, Date() < deadline { usleep(20_000) }
         guard !process.isRunning else { return (false, -1) }
-        let status = process.terminationStatus
-        finishAfterExit(succeeded: status == 0)
+        let rawStatus = process.terminationStatus
+        finishAfterExit(succeeded: rawStatus == 0)
+        let status: Int32 = (rawStatus == 0 && promotionError != nil) ? 1 : rawStatus
         return (true, status)
     }
 
