@@ -85,6 +85,7 @@ final class AppModel {
     @ObservationIgnored private var cliErrorContext: [String: (accountKey: String?, fingerprint: String?)] = [:]
     @ObservationIgnored private var cliQuotaGen: [String: UInt64] = [:]
     @ObservationIgnored private var cliPendingQuota: [CLIKind: PendingQuotaRequest] = [:]
+    @ObservationIgnored private var cliSignInTokens: [CLIKind: UUID] = [:]
     @ObservationIgnored private var cliLoginRuns: [CLIKind: CLILoginRun] = [:]
     @ObservationIgnored private var cliCancelled: Set<CLIKind> = []
     /// Per account id: when its usage was last read (or tried) and how many reads in a row failed.
@@ -409,7 +410,7 @@ final class AppModel {
             let meta = Dictionary(listed.map { p -> (String, (accountKey: String?, fingerprint: String?, quota: CLIQuota?)) in
                 let key = cli.identity(p, keychain: keychain)?.accountKey
                 let fp = cli.credentialFingerprint(p, keychain: keychain)
-                return (p.id, (key, fp, cache.quota(for: p, accountKey: key)))
+                return (p.id, (key, fp, cache.quota(for: p, accountKey: key, credentialFingerprint: fp)))
             }) { a, _ in a }
             var rows = group.profiles.map { e -> CLIRow in
                 let signIn: CLIRow.SignIn
@@ -552,117 +553,171 @@ final class AppModel {
             if createdNow { coreQueue.async { try? cli.discardUnsignedIn(p, keychain: keychain) } }
             return
         }
-        guard let binary = Self.realBinary(cli, p.kind) else {
-            banner = Banner(kind: .error, text: L.cliNotFound(p.kind))
-            if createdNow { coreQueue.async { try? cli.discardUnsignedIn(p, keychain: keychain) } }
-            return
-        }
-        let startedAt = Date()
-        let beforeSignIn = cli.signIn(p, keychain: keychain)
-        let beforeFingerprint = cli.credentialFingerprint(p, keychain: keychain)
-        let wasSignedOut = createdNow || beforeSignIn.state == .signedOut
-        let beforeExpired = beforeSignIn.refreshExpiresAt.map { $0 <= startedAt } ?? false
-
-        let run = CLILoginRun(profile: p, binary: binary, workingDirectory: cli.env.home,
-                              baseEnvironment: cli.env.augmentedEnvironment())
-        do { try run.start() } catch {
-            banner = Banner(kind: .error, text: error.localizedDescription)
-            if createdNow { coreQueue.async { try? cli.discardUnsignedIn(p, keychain: keychain) } }
-            return
-        }
-        cliLoginRuns[p.kind] = run
-        cliCanHandoff.insert(p.kind)
+        let token = UUID()
+        cliSignInTokens[p.kind] = token
+        cliLoginRuns[p.kind] = nil
+        cliCanHandoff.remove(p.kind)
         cliCancelled.remove(p.kind)
         cliHandoff[p.kind] = nil
         cliSigningIn[p.kind] = p.name
         if createdNow {
             cliSignInCreatedNow.insert(p.kind)
-            refreshCLI()
         } else {
             cliSignInCreatedNow.remove(p.kind)
         }
 
-        Task.detached {
-            let status = await Self.waitOffPool(run)
-            // One step on the main actor closes the run: after it no move to Terminal can arrive.
-            let closed: (cancelled: Bool, handoff: (name: String, command: String)?)? = await MainActor.run {
-                guard self.cliLoginRuns[p.kind] === run else { return nil }
-                self.cliLoginRuns[p.kind] = nil
-                self.cliCanHandoff.remove(p.kind)
-                return (self.cliCancelled.remove(p.kind) != nil, self.cliHandoff.removeValue(forKey: p.kind))
-            }
-            guard let (cancelled, handoff) = closed else { return }
+        struct StartedRun: Sendable {
+            var run: CLILoginRun
+            var wasSignedOut: Bool
+            var beforeExpired: Bool
+            var beforeFingerprint: String?
+            var initialBoards: ([CLIBoard], UInt64)?
+        }
 
-            let inspected = await withCheckedContinuation { (cont: CheckedContinuation<(afterPresent: Bool, completedNew: Bool, completedRelogin: Bool, email: String?, twin: CLIProfile?, output: String, boards: [CLIBoard], seq: UInt64), Never>) in
-                coreQueue.async {
-                    let now = Date()
-                    let afterSignIn = cli.signIn(p, keychain: keychain)
-                    let afterFingerprint = cli.credentialFingerprint(p, keychain: keychain)
-                    let afterPresent = afterSignIn.state != .signedOut
-                    let afterUsable = afterPresent && (afterSignIn.refreshExpiresAt.map { $0 > now } ?? true)
-                    let changed = afterFingerprint != nil && afterFingerprint != beforeFingerprint
-                    let completedNew = wasSignedOut && afterUsable && changed
-                    let completedRelogin = !wasSignedOut && status == 0 && !cancelled && afterUsable && (changed || !beforeExpired)
-                    if !afterPresent, createdNow, handoff == nil {
-                        try? cli.discardUnsignedIn(p, keychain: keychain)
-                    }
-                    let email = cli.identity(p, keychain: keychain)?.email
-                    let twin = (completedNew || completedRelogin) ? cli.duplicates(of: p, keychain: keychain).first : nil
-                    let output = (completedNew || completedRelogin) ? "" : run.output()
-                    let boards = Self.readCLI(cli, keychain)
-                    let seq = seqBox.next()
-                    cont.resume(returning: (afterPresent, completedNew, completedRelogin, email, twin, output, boards, seq))
+        coreQueue.async {
+            let launch: Result<StartedRun, Error> = Result {
+                guard let binary = Self.realBinary(cli, p.kind) else {
+                    throw SwitcherError.message(L.cliNotFound(p.kind))
                 }
+                let startedAt = Date()
+                let beforeSignIn = cli.signIn(p, keychain: keychain)
+                let beforeFingerprint = cli.credentialFingerprint(p, keychain: keychain)
+                let wasSignedOut = createdNow || beforeSignIn.state == .signedOut
+                let beforeExpired = beforeSignIn.refreshExpiresAt.map { $0 <= startedAt } ?? false
+                let run = CLILoginRun(profile: p, binary: binary, workingDirectory: cli.env.home,
+                                      baseEnvironment: cli.env.augmentedEnvironment())
+                try run.start()
+                let initialBoards: ([CLIBoard], UInt64)? = createdNow ? (Self.readCLI(cli, keychain), seqBox.next()) : nil
+                return StartedRun(run: run, wasSignedOut: wasSignedOut, beforeExpired: beforeExpired,
+                                  beforeFingerprint: beforeFingerprint, initialBoards: initialBoards)
+            }
+            let failureBoards: ([CLIBoard], UInt64)?
+            if case .failure = launch {
+                if createdNow { try? cli.discardUnsignedIn(p, keychain: keychain) }
+                failureBoards = (Self.readCLI(cli, keychain), seqBox.next())
+            } else {
+                failureBoards = nil
             }
 
-            await MainActor.run {
-                let cancelledLate = self.cliCancelled.remove(p.kind) != nil
-                let signedIn = inspected.completedNew || (inspected.completedRelogin && !cancelledLate)
-
-                func discardNewAndClear() {
-                    coreQueue.async {
-                        try? cli.discardUnsignedIn(p, keychain: keychain)
-                        let after = Self.readCLI(cli, keychain)
-                        let seq2 = seqBox.next()
-                        Task { @MainActor in
-                            self.cliSigningIn[p.kind] = nil
-                            self.cliSignInCreatedNow.remove(p.kind)
-                            self.setCLI(after, seq: seq2)
-                        }
+            Task { @MainActor in
+                guard self.cliSignInTokens[p.kind] == token else {
+                    if case .success(let s) = launch {
+                        let orphan = s.run
+                        DispatchQueue.global(qos: .userInitiated).async { orphan.cancel() }
                     }
-                }
-
-                if !signedIn, handoff != nil, cancelledLate {
-                    guard createdNow, !inspected.afterPresent else {
-                        self.cliSigningIn[p.kind] = nil
-                        self.cliSignInCreatedNow.remove(p.kind)
-                        self.setCLI(inspected.boards, seq: inspected.seq)
-                        return
-                    }
-                    discardNewAndClear()
                     return
                 }
-
-                self.clearCLIQuotaState(p.id, clearAttempt: true)
-                self.cliSigningIn[p.kind] = nil
-                self.cliSignInCreatedNow.remove(p.kind)
-                self.setCLI(inspected.boards, seq: inspected.seq)
-
-                if signedIn {
-                    if let twin = inspected.twin {
-                        self.banner = Banner(kind: .info, text: L.cliDuplicate(inspected.email ?? p.name, twin.isDefault ? "1" : twin.name))
-                    } else {
-                        self.banner = Banner(kind: .success, text: L.cliSignedIn(p.kind, inspected.email ?? p.name))
+                switch launch {
+                case .failure(let error):
+                    let cancelled = self.cliCancelled.remove(p.kind) != nil
+                    self.cliHandoff[p.kind] = nil
+                    self.cliSignInTokens[p.kind] = nil
+                    self.cliSigningIn[p.kind] = nil
+                    self.cliSignInCreatedNow.remove(p.kind)
+                    if let (boards, seq) = failureBoards { self.setCLI(boards, seq: seq) }
+                    if !cancelled {
+                        self.banner = Banner(kind: .error, text: error.localizedDescription)
                     }
-                    self.loadCLIQuota(p.kind, force: true, only: [p.name])
-                } else if let handoff {
-                    let opened = self.openSignIn(p.kind, name: handoff.name, loginCommand: handoff.command, createdNow: createdNow)
-                    if !opened, createdNow, !inspected.afterPresent {
-                        discardNewAndClear()
+                case .success(let started):
+                    let run = started.run
+                    let wasSignedOut = started.wasSignedOut
+                    let beforeExpired = started.beforeExpired
+                    let beforeFingerprint = started.beforeFingerprint
+                    if let (boards, seq) = started.initialBoards { self.setCLI(boards, seq: seq) }
+                    self.cliLoginRuns[p.kind] = run
+                    self.cliCanHandoff.insert(p.kind)
+                    if self.cliCancelled.contains(p.kind) {
+                        DispatchQueue.global(qos: .userInitiated).async { run.cancel() }
                     }
-                } else if !cancelled, !cancelledLate {
-                    let last = inspected.output.split(separator: "\n").last.map(String.init) ?? ""
-                    self.banner = Banner(kind: .error, text: L.cliSignInFailed(status: status, detail: last))
+
+                    Task.detached {
+                        let status = await Self.waitOffPool(run)
+                        // One step on the main actor closes the run: after it no move to Terminal can arrive.
+                        let closed: (cancelled: Bool, handoff: (name: String, command: String)?)? = await MainActor.run {
+                            guard self.cliLoginRuns[p.kind] === run else { return nil }
+                            self.cliLoginRuns[p.kind] = nil
+                            self.cliCanHandoff.remove(p.kind)
+                            return (self.cliCancelled.remove(p.kind) != nil, self.cliHandoff.removeValue(forKey: p.kind))
+                        }
+                        guard let (cancelled, handoff) = closed else { return }
+
+                        let inspected = await withCheckedContinuation { (cont: CheckedContinuation<(afterPresent: Bool, completedNew: Bool, completedRelogin: Bool, email: String?, twin: CLIProfile?, output: String, boards: [CLIBoard], seq: UInt64), Never>) in
+                            coreQueue.async {
+                                let now = Date()
+                                let afterSignIn = cli.signIn(p, keychain: keychain)
+                                let afterFingerprint = cli.credentialFingerprint(p, keychain: keychain)
+                                let afterPresent = afterSignIn.state != .signedOut
+                                let afterUsable = afterPresent && (afterSignIn.refreshExpiresAt.map { $0 > now } ?? true)
+                                let changed = afterFingerprint != nil && afterFingerprint != beforeFingerprint
+                                if changed { CLIQuotaCache(env: cli.env).remove(for: p) }
+                                let completedNew = wasSignedOut && afterUsable && changed
+                                let completedRelogin = !wasSignedOut && status == 0 && !cancelled && afterUsable && (changed || !beforeExpired)
+                                if !afterPresent, createdNow, handoff == nil {
+                                    try? cli.discardUnsignedIn(p, keychain: keychain)
+                                }
+                                let email = cli.identity(p, keychain: keychain)?.email
+                                let twin = (completedNew || completedRelogin) ? cli.duplicates(of: p, keychain: keychain).first : nil
+                                let output = (completedNew || completedRelogin) ? "" : run.output()
+                                let boards = Self.readCLI(cli, keychain)
+                                let seq = seqBox.next()
+                                cont.resume(returning: (afterPresent, completedNew, completedRelogin, email, twin, output, boards, seq))
+                            }
+                        }
+
+                        await MainActor.run {
+                            let cancelledLate = self.cliCancelled.remove(p.kind) != nil
+                            let signedIn = inspected.completedNew || (inspected.completedRelogin && !cancelledLate)
+
+                            func discardNewAndClear() {
+                                coreQueue.async {
+                                    try? cli.discardUnsignedIn(p, keychain: keychain)
+                                    let after = Self.readCLI(cli, keychain)
+                                    let seq2 = seqBox.next()
+                                    Task { @MainActor in
+                                        self.cliSignInTokens[p.kind] = nil
+                                        self.cliSigningIn[p.kind] = nil
+                                        self.cliSignInCreatedNow.remove(p.kind)
+                                        self.setCLI(after, seq: seq2)
+                                    }
+                                }
+                            }
+
+                            if !signedIn, handoff != nil, cancelledLate {
+                                guard createdNow, !inspected.afterPresent else {
+                                    self.cliSignInTokens[p.kind] = nil
+                                    self.cliSigningIn[p.kind] = nil
+                                    self.cliSignInCreatedNow.remove(p.kind)
+                                    self.setCLI(inspected.boards, seq: inspected.seq)
+                                    return
+                                }
+                                discardNewAndClear()
+                                return
+                            }
+
+                            self.clearCLIQuotaState(p.id, clearAttempt: true)
+                            self.cliSignInTokens[p.kind] = nil
+                            self.cliSigningIn[p.kind] = nil
+                            self.cliSignInCreatedNow.remove(p.kind)
+                            self.setCLI(inspected.boards, seq: inspected.seq)
+
+                            if signedIn {
+                                if let twin = inspected.twin {
+                                    self.banner = Banner(kind: .info, text: L.cliDuplicate(inspected.email ?? p.name, twin.isDefault ? "1" : twin.name))
+                                } else {
+                                    self.banner = Banner(kind: .success, text: L.cliSignedIn(p.kind, inspected.email ?? p.name))
+                                }
+                                self.loadCLIQuota(p.kind, force: true, only: [p.name])
+                            } else if let handoff {
+                                let opened = self.openSignIn(p.kind, name: handoff.name, loginCommand: handoff.command, createdNow: createdNow)
+                                if !opened, createdNow, !inspected.afterPresent {
+                                    discardNewAndClear()
+                                }
+                            } else if !cancelled, !cancelledLate {
+                                let last = inspected.output.split(separator: "\n").last.map(String.init) ?? ""
+                                self.banner = Banner(kind: .error, text: L.cliSignInFailed(status: status, detail: last))
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -696,6 +751,7 @@ final class AppModel {
                 let result = Result {
                     let p = try Self.profile(cli, kind, name)
                     try cli.remove(p)
+                    CLIQuotaCache(env: cli.env).remove(for: p)
                 }
                 let boards = Self.readCLI(cli, keychain)
                 let seq = seqBox.next()
@@ -849,7 +905,7 @@ final class AppModel {
                                 staleIDs.insert(p.id)
                                 continue
                             }
-                            try? cache.store(q, for: p, accountKey: r.afterKey)
+                            try? cache.store(q, for: p, accountKey: r.afterKey, credentialFingerprint: r.afterFP)
                             validOutcomes[p.id] = .some(nil)
                         case .failure(let err):
                             validOutcomes[p.id] = err

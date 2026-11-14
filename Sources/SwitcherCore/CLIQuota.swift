@@ -692,9 +692,10 @@ public enum AgyCLIQuota {
 // MARK: - Cache
 
 /// The last good quota per profile id, in `<CLIEnv.config>/quota-cache.json` (0600). A quota holds
-/// percentages, reset times, a plan name and a source label: no tokens, no emails. Each entry is
-/// bound to the account it was read for (the opaque account id, never a token or a hash of one):
-/// when a profile is signed in as someone else, the old entry is not returned.
+/// percentages, reset times, a plan name and a source label: no tokens, no emails. Each disk entry
+/// requires a non-empty `accountKey` (the opaque account id, never a token or a hash of one): when
+/// a profile is signed in as someone else, or has no stable `accountKey`, disk entries are never
+/// reused across logins (unattributed readings live only in memory, bound to `credentialFingerprint`).
 public struct CLIQuotaCache {
     struct Entry: Codable {
         var quota: CLIQuota
@@ -706,26 +707,82 @@ public struct CLIQuotaCache {
         var profiles: [String: Entry] = [:]
     }
 
+    private static let memoryLock = NSLock()
+    private static nonisolated(unsafe) var ephemeral: [String: (fingerprint: String, quota: CLIQuota)] = [:]
+
     public let url: URL
 
     public init(env: CLIEnv) { url = URL(fileURLWithPath: env.config + "/quota-cache.json") }
 
-    public func load() -> [String: CLIQuota] { readFile().profiles.mapValues(\.quota) }
+    private func memoryKey(for profile: CLIProfile) -> String { "\(url.path)\n\(profile.id)" }
 
-    /// The cached quota, only when it was read for `accountKey` (the profile's current account).
-    public func quota(for profile: CLIProfile, accountKey: String?) -> CLIQuota? {
-        guard let e = readFile().profiles[profile.id], e.accountKey == accountKey else { return nil }
-        return e.quota
+    public func load() -> [String: CLIQuota] {
+        readFile().profiles.compactMapValues { entry in
+            guard let k = entry.accountKey, !k.isEmpty else { return nil }
+            return entry.quota
+        }
     }
 
-    /// Read, merge and write under one lock (the app reads Claude and Codex at the same time, and
-    /// the CLI may run too), so one writer never drops another's entry.
-    public func store(_ quota: CLIQuota, for profile: CLIProfile, accountKey: String?) throws {
+    /// The cached quota, only when it was read for `accountKey` (or, when `accountKey` is nil,
+    /// in-memory for the exact `credentialFingerprint` of this session).
+    public func quota(for profile: CLIProfile, accountKey: String?, credentialFingerprint: String? = nil) -> CLIQuota? {
+        if let accountKey, !accountKey.isEmpty {
+            guard let e = readFile().profiles[profile.id], e.accountKey == accountKey else { return nil }
+            return e.quota
+        }
+        guard let fp = credentialFingerprint, !fp.isEmpty else { return nil }
+        let key = memoryKey(for: profile)
+        return Self.memoryLock.withLock {
+            guard let hit = Self.ephemeral[key], hit.fingerprint == fp else { return nil }
+            return hit.quota
+        }
+    }
+
+    /// Read, merge and write under one lock (the app reads Claude, Codex and Agy at the same time,
+    /// and the CLI may run too), so one writer never drops another's entry. Readings without a
+    /// stable `accountKey` stay in memory only (bound to `credentialFingerprint`) and clear any
+    /// older disk entry for `profile`.
+    public func store(_ quota: CLIQuota, for profile: CLIProfile, accountKey: String?, credentialFingerprint: String? = nil) throws {
+        let memKey = memoryKey(for: profile)
+        guard let accountKey, !accountKey.isEmpty else {
+            Self.memoryLock.withLock {
+                if let fp = credentialFingerprint, !fp.isEmpty {
+                    Self.ephemeral[memKey] = (fp, quota)
+                } else {
+                    Self.ephemeral.removeValue(forKey: memKey)
+                }
+            }
+            if FileManager.default.fileExists(atPath: url.path) {
+                try removeDiskEntry(for: profile)
+            }
+            return
+        }
+        Self.memoryLock.withLock { _ = Self.ephemeral.removeValue(forKey: memKey) }
         try FS.makePrivateDir(url.deletingLastPathComponent())
         let lock = try FileLock(url.appendingPathExtension("lock"), timeout: 10)
         defer { withExtendedLifetime(lock) {} }
         var file = readFile()
         file.profiles[profile.id] = Entry(quota: quota, accountKey: accountKey)
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        enc.dateEncodingStrategy = .iso8601
+        try FS.atomicWrite(try enc.encode(file), to: url)
+    }
+
+    public func remove(for profile: CLIProfile) {
+        let memKey = memoryKey(for: profile)
+        Self.memoryLock.withLock { _ = Self.ephemeral.removeValue(forKey: memKey) }
+        if FileManager.default.fileExists(atPath: url.path) {
+            try? removeDiskEntry(for: profile)
+        }
+    }
+
+    private func removeDiskEntry(for profile: CLIProfile) throws {
+        try FS.makePrivateDir(url.deletingLastPathComponent())
+        let lock = try FileLock(url.appendingPathExtension("lock"), timeout: 10)
+        defer { withExtendedLifetime(lock) {} }
+        var file = readFile()
+        guard file.profiles.removeValue(forKey: profile.id) != nil else { return }
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         enc.dateEncodingStrategy = .iso8601

@@ -227,13 +227,20 @@ extension CLIProfiles {
         case .agy:
             guard let record = agyTokenRecord(profile, keychain: keychain),
                   Self.isUsableAgyCredential(record.credential) else { return nil }
+            let tokenObj = record.json["token"] as? [String: Any]
+            let rawIDToken = Self.nonEmpty(record.json["id_token"]) ?? Self.nonEmpty(tokenObj?["id_token"])
+            let claims = rawIDToken.flatMap(Self.jwtClaims) ?? [:]
             var email = Self.nonEmpty(record.json["id_token_email"]).flatMap { $0.contains("@") ? $0 : nil }
+                ?? Self.nonEmpty(claims["email"]).flatMap { $0.contains("@") ? $0 : nil }
             if email == nil, profile.isDefault, record.fromKeychain {
                 email = agyDefaultFallbackEmail()
             }
+            let sub = Self.nonEmpty(claims["sub"])
             let tier = Self.nonEmpty(record.json["user_tier"])
             let plan = tier.map { AntigravityUsage.paidTiers[$0] ?? $0 }
-            return CLIIdentity(email: email, organization: nil, plan: plan, accountKey: email?.lowercased())
+            let key = email?.lowercased() ?? sub.map { "sub:\($0)" }
+            guard email != nil || plan != nil || key != nil else { return nil }
+            return CLIIdentity(email: email, organization: nil, plan: plan, accountKey: key)
         }
     }
 

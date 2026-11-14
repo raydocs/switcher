@@ -579,9 +579,36 @@ final class QuotaBox {
         let cache = CLIQuotaCache(env: b.env)
         #expect(cache.load().isEmpty)
         let q = CLIQuota(windows: [], source: "statusline", observedAt: b.now)
-        try cache.store(q, for: p, accountKey: nil)
-        #expect(cache.quota(for: p, accountKey: nil) == q)
+        try cache.store(q, for: p, accountKey: "acct-ok")
+        #expect(cache.quota(for: p, accountKey: "acct-ok") == q)
         #expect(cache.quota(for: p, accountKey: "A") == nil)
+    }
+
+    @Test func unattributedAccountsDoNotShareDiskCacheAcrossRelogins() throws {
+        let b = QuotaBox()
+        let p = try b.profiles.add(.agy, name: "work")
+        let tokenPath = p.path + "/antigravity-cli/antigravity-oauth-token"
+        let cache = CLIQuotaCache(env: b.env)
+        let q = CLIQuota(windows: [CLIQuotaWindow(label: "5h", usedPercent: 12, resetsAt: nil)],
+                         source: "google cloud code", observedAt: b.now)
+
+        // Account A without email/sub (accountKey == nil): cached in memory for A's fingerprint only, never on disk.
+        b.write(tokenPath, #"{"token":{"refresh_token":"r-account-A"}}"#)
+        let fpA = try #require(b.profiles.credentialFingerprint(p, keychain: b.keychain))
+        #expect(b.profiles.identity(p, keychain: b.keychain) == nil)
+        try cache.store(q, for: p, accountKey: nil, credentialFingerprint: fpA)
+        #expect(cache.quota(for: p, accountKey: nil, credentialFingerprint: fpA) == q)
+        #expect(cache.quota(for: p, accountKey: nil) == nil)
+        #expect(cache.load()[p.id] == nil)
+
+        // Re-login to another no-email account B: neither in-memory nor `--cached` report attributes A's quota to B.
+        b.write(tokenPath, #"{"token":{"refresh_token":"r-account-B"}}"#)
+        let fpB = try #require(b.profiles.credentialFingerprint(p, keychain: b.keychain))
+        #expect(fpA != fpB)
+        #expect(cache.quota(for: p, accountKey: nil, credentialFingerprint: fpB) == nil)
+        let report = CLIUsageReport.build(profiles: b.profiles, kinds: [.agy], now: b.now)
+        let workEntry = try #require(report.clis.first?.accounts.first { $0.name == "work" })
+        #expect(workEntry.windows.isEmpty)
     }
 }
 

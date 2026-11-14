@@ -18,29 +18,48 @@ public enum CLIShim {
         let root = env.profilesRoot(kind)
         let agyPre = kind == .agy ? """
         agy_explicit=
+        agy_explicit_dir=
+        agy_want_dir=
         for a in "$@"; do
+          if [ -n "$agy_want_dir" ]; then
+            agy_explicit_dir=$a
+            break
+          fi
           case "$a" in
-            --gemini_dir|--gemini_dir=*|-gemini_dir|-gemini_dir=*) agy_explicit=1; break ;;
+            --gemini_dir=*|-gemini_dir=*) agy_explicit=1; agy_explicit_dir=${a#*=}; break ;;
+            --gemini_dir|-gemini_dir) agy_explicit=1; agy_want_dir=1 ;;
           esac
         done
 
         """ : ""
         let agyGuard = kind == .agy ? " && [ -z \"$agy_explicit\" ]" : ""
         let agyPost = kind == .agy ? """
-        if [ "${SWITCHER_BYPASS:-}" != 1 ] && [ -z "$agy_explicit" ] && [ -n "${ANTIGRAVITY_GEMINI_DIR:-}" ]; then
-          agy_dir=$ANTIGRAVITY_GEMINI_DIR
-          if [ "$agy_dir" != \(shellQuote(env.defaultFolder(.agy))) ]; then
-            agy_marker="$agy_dir/antigravity-cli/cache/antigravity-keyring-unavailable"
-            agy_marker_ok=
-            if [ -d "$agy_dir" ] && [ ! -L "$agy_dir" ]; then
-              if [ ! -e "$agy_dir/antigravity-cli" ]; then
-                (umask 077 && mkdir "$agy_dir/antigravity-cli") 2>/dev/null || true
-              fi
-              if [ -d "$agy_dir/antigravity-cli" ] && [ ! -L "$agy_dir/antigravity-cli" ]; then
-                if [ ! -e "$agy_dir/antigravity-cli/cache" ]; then
-                  (umask 077 && mkdir "$agy_dir/antigravity-cli/cache") 2>/dev/null || true
+        if [ "${SWITCHER_BYPASS:-}" != 1 ]; then
+          agy_iso_dir=
+          if [ -z "$agy_explicit" ] && [ -n "${ANTIGRAVITY_GEMINI_DIR:-}" ]; then
+            agy_iso_dir=$ANTIGRAVITY_GEMINI_DIR
+          elif [ -n "$agy_explicit" ]; then
+            case "$agy_explicit_dir" in
+              \(shellQuote(root + "/"))*) agy_iso_dir=$agy_explicit_dir ;;
+              *)
+                if [ -n "${ANTIGRAVITY_GEMINI_DIR:-}" ] && [ "$ANTIGRAVITY_GEMINI_DIR" != \(shellQuote(env.defaultFolder(.agy))) ]; then
+                  agy_iso_dir=$ANTIGRAVITY_GEMINI_DIR
                 fi
-                if [ -d "$agy_dir/antigravity-cli/cache" ] && [ ! -L "$agy_dir/antigravity-cli/cache" ] && [ ! -L "$agy_marker" ]; then
+                ;;
+            esac
+          fi
+          if [ -n "$agy_iso_dir" ] && [ "$agy_iso_dir" != \(shellQuote(env.defaultFolder(.agy))) ]; then
+            agy_marker="$agy_iso_dir/antigravity-cli/cache/antigravity-keyring-unavailable"
+            agy_marker_ok=
+            if [ -d "$agy_iso_dir" ] && [ ! -L "$agy_iso_dir" ]; then
+              if [ ! -e "$agy_iso_dir/antigravity-cli" ]; then
+                (umask 077 && mkdir "$agy_iso_dir/antigravity-cli") 2>/dev/null || true
+              fi
+              if [ -d "$agy_iso_dir/antigravity-cli" ] && [ ! -L "$agy_iso_dir/antigravity-cli" ]; then
+                if [ ! -e "$agy_iso_dir/antigravity-cli/cache" ]; then
+                  (umask 077 && mkdir "$agy_iso_dir/antigravity-cli/cache") 2>/dev/null || true
+                fi
+                if [ -d "$agy_iso_dir/antigravity-cli/cache" ] && [ ! -L "$agy_iso_dir/antigravity-cli/cache" ] && [ ! -L "$agy_marker" ]; then
                   if (umask 077 && : > "$agy_marker") 2>/dev/null && chmod 600 "$agy_marker" 2>/dev/null && [ -f "$agy_marker" ] && [ ! -L "$agy_marker" ]; then
                     agy_marker_ok=1
                   fi
@@ -48,20 +67,23 @@ public enum CLIShim {
               fi
             fi
             if [ -z "$agy_marker_ok" ]; then
-              printf 'switcher: cannot isolate Antigravity CLI profile "%s" (keyring marker failed); refusing to start\\n' "$agy_dir" >&2
+              printf 'switcher: cannot isolate Antigravity CLI profile "%s" (keyring marker failed); refusing to start\\n' "$agy_iso_dir" >&2
               exit 1
             fi
           fi
-          case "${1:-}" in
-            agentapi|multicall|plugin-cli) ;;
-            *)
-              if [ "$#" -eq 0 ] && [ -n "${AGY_CLI_CDE_AUTH_ACTION:-}" ]; then
-                :
-              else
-                set -- "--gemini_dir=$agy_dir" "$@"
-              fi
-              ;;
-          esac
+          if [ -z "$agy_explicit" ] && [ -n "${ANTIGRAVITY_GEMINI_DIR:-}" ]; then
+            agy_dir=$ANTIGRAVITY_GEMINI_DIR
+            case "${1:-}" in
+              agentapi|multicall|plugin-cli) ;;
+              *)
+                if [ "$#" -eq 0 ] && [ -n "${AGY_CLI_CDE_AUTH_ACTION:-}" ]; then
+                  :
+                else
+                  set -- "--gemini_dir=$agy_dir" "$@"
+                fi
+                ;;
+            esac
+          fi
         fi
 
         """ : ""

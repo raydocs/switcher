@@ -276,6 +276,20 @@ import Testing
         #expect(r3.status == 1)
         #expect(r3.stderr.contains("cannot isolate Antigravity CLI profile"))
         #expect(r3.value("ANTIGRAVITY_GEMINI_DIR") == nil)
+
+        // 4. Explicit --gemini_dir pointing at a managed profile enforces marker isolation too,
+        // without duplicating --gemini_dir when healthy.
+        w.pointer("default\n", .agy)
+        let r4 = try w.run(.agy, args: ["--gemini_dir=" + symProf, "chat"])
+        #expect(r4.status == 1)
+        #expect(r4.stderr.contains("cannot isolate Antigravity CLI profile"))
+        let r5 = try w.run(.agy, args: ["--gemini_dir", agyRoot + "/nonexistent", "chat"])
+        #expect(r5.status == 1)
+        let healthy = agyRoot + "/a"
+        let r6 = try w.run(.agy, args: ["--gemini_dir=" + healthy, "chat"])
+        #expect(r6.status == 0)
+        #expect(r6.args == ["--gemini_dir=" + healthy, "chat"])
+        #expect(w.box.mode(healthy + "/antigravity-cli/cache/antigravity-keyring-unavailable") == 0o600)
     }
 
     @Test func invalidPointerAndMissingFolderProduceDistinctWarnings() throws {

@@ -99,6 +99,7 @@ func signIn(_ profile: CLIProfile, env: CLIEnv, profiles: CLIProfiles, keychain:
         fail("no real \(kind.command) found on PATH; sign in later with:\n  \(kind.loginCommand(profile))")
     }
     print("Signing in a \(kind.displayName) account: finish in the browser that opens (Ctrl-C cancels)…\n")
+    let beforeFP = profiles.credentialFingerprint(profile, keychain: keychain)
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: real)
     proc.arguments = kind.loginArguments
@@ -156,6 +157,9 @@ func signIn(_ profile: CLIProfile, env: CLIEnv, profiles: CLIProfiles, keychain:
             print("Not signed in yet. Try again any time with:\n  switcher cli login \(kind.command) \(profile.name)")
         }
         exit(1)
+    }
+    if profiles.credentialFingerprint(profile, keychain: keychain) != beforeFP {
+        CLIQuotaCache(env: env).remove(for: profile)
     }
     let who = profiles.identity(profile, keychain: keychain)
     let label = [who?.email, who?.plan.map { "(\($0))" }].compactMap { $0 }.joined(separator: " ")
@@ -296,6 +300,7 @@ func runCLI(_ args: [String]) -> Never {
                 fail("\(p.name)'s keychain item is still present after logout; run `CLAUDE_CONFIG_DIR=\(shellQuote(p.path)) claude auth logout` first, or pass --force to trash the folder anyway")
             }
             try profiles.remove(p)
+            CLIQuotaCache(env: env).remove(for: p)
             print("Removed \(label). New \(kind.command) sessions use \(profiles.active(kind).name).")
         case "link":
             let kinds = args.isEmpty ? CLIKind.allCases : [cli(args.first)]
@@ -453,7 +458,8 @@ func runCLIUsage(_ args: [String]) async -> Never {
                     q = try await read()
                 }
                 let updatedKey = profiles.identity(p, keychain: keychain)?.accountKey ?? accountKey
-                try? cache.store(q, for: p, accountKey: updatedKey)
+                let updatedFP = profiles.credentialFingerprint(p, keychain: keychain)
+                try? cache.store(q, for: p, accountKey: updatedKey, credentialFingerprint: updatedFP)
                 say(head + "  [\(q.source)]")
                 for w in q.windows {
                     say("    \(w.label): \(Int(w.usedPercent.rounded()))% used\(w.resetsAt.map { ", resets " + fmt.string(from: $0) } ?? "")")
@@ -461,7 +467,8 @@ func runCLIUsage(_ args: [String]) async -> Never {
             } catch {
                 errors[p.id] = error.localizedDescription
                 say(head + "  ! \(error.localizedDescription)\(error as? CLIQuotaError == .signInExpired && kind == .claude ? " (try --renew)" : "")")
-                if let old = cache.quota(for: p, accountKey: profiles.identity(p, keychain: keychain)?.accountKey) {
+                if let old = cache.quota(for: p, accountKey: profiles.identity(p, keychain: keychain)?.accountKey,
+                                         credentialFingerprint: profiles.credentialFingerprint(p, keychain: keychain)) {
                     say("    last read \(ago(old.observedAt)): " + old.windows.map { "\($0.label) \(Int($0.usedPercent.rounded()))%" }.joined(separator: ", "))
                 }
             }
