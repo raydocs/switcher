@@ -34,22 +34,55 @@ public protocol CLIKeychain: AnyObject {
     func read(service: String) -> String?
     /// Whether the item exists, without reading it.
     func exists(service: String) -> Bool
+    /// The item's value under an explicit keychain account (`nil` uses the login keychain user).
+    func read(service: String, account: String?) -> String?
+    /// Whether the item exists under an explicit keychain account.
+    func exists(service: String, account: String?) -> Bool
     /// Every `Claude Code-credentials*` service name in the login keychain.
     func claudeServices() -> [String]
+}
+
+public extension CLIKeychain {
+    func read(service: String, account: String?) -> String? {
+        guard account == nil else { return nil }
+        return read(service: service)
+    }
+
+    func exists(service: String, account: String?) -> Bool {
+        guard account == nil else { return false }
+        return exists(service: service)
+    }
 }
 
 public final class LiveCLIKeychain: CLIKeychain {
     let account: String
     public init(account: String = NSUserName()) { self.account = account }
 
-    public func read(service: String) -> String? {
-        let (status, out) = Self.security(["find-generic-password", "-a", account, "-s", service, "-w"])
+    public func read(service: String) -> String? { read(service: service, account: nil) }
+
+    public func read(service: String, account: String?) -> String? {
+        let (status, out) = Self.security(["find-generic-password", "-a", account ?? self.account, "-s", service, "-w"])
         guard status == 0 else { return nil }
-        return out.hasSuffix("\n") ? String(out.dropLast()) : out
+        let raw = out.hasSuffix("\n") ? String(out.dropLast()) : out
+        return Self.decodeSecurityOutput(raw)
     }
 
-    public func exists(service: String) -> Bool {
-        Self.security(["find-generic-password", "-a", account, "-s", service]).0 == 0
+    public func exists(service: String) -> Bool { exists(service: service, account: nil) }
+
+    public func exists(service: String, account: String?) -> Bool {
+        Self.security(["find-generic-password", "-a", account ?? self.account, "-s", service]).0 == 0
+    }
+
+    /// `security -w` prints lowercase hex whenever the secret contains non-ASCII UTF-8 or newlines.
+    static func decodeSecurityOutput(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.hasPrefix("{"), !trimmed.hasPrefix("["),
+              !trimmed.hasPrefix("go-keyring-base64:"), !trimmed.hasPrefix("go-keyring-encoded:"),
+              let data = AntigravityFiles.decodeHex(trimmed),
+              let decoded = String(data: data, encoding: .utf8) else {
+            return raw
+        }
+        return decoded
     }
 
     public func claudeServices() -> [String] {
@@ -84,25 +117,130 @@ public final class MemoryCLIKeychain: CLIKeychain {
     public init() {}
     public func read(service: String) -> String? { items[service] }
     public func exists(service: String) -> Bool { items[service] != nil }
+    public func read(service: String, account: String?) -> String? {
+        account.map { items["\(service)/\($0)"] } ?? items[service]
+    }
+    public func exists(service: String, account: String?) -> Bool {
+        read(service: service, account: account) != nil
+    }
     public func claudeServices() -> [String] { items.keys.filter { $0.hasPrefix("Claude Code-credentials") }.sorted() }
 }
 
 extension CLIProfiles {
-    public func identity(_ profile: CLIProfile) -> CLIIdentity? {
+    static func nonEmpty(_ v: Any?) -> String? {
+        guard let s = (v as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return nil }
+        return s
+    }
+
+    struct AgyTokenRecord {
+        var raw: String
+        var json: [String: Any]
+        var credential: AntigravityUsage.Credential
+        var fromKeychain: Bool
+    }
+
+    static func regularFileContents(_ path: String) -> Data? {
+        var st = stat()
+        guard lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { return nil }
+        return FileManager.default.contents(atPath: path)
+    }
+
+    static func isUsableAgyCredential(_ c: AntigravityUsage.Credential, now: Date = Date()) -> Bool {
+        if c.refreshToken != nil { return true }
+        guard c.accessToken != nil else { return false }
+        return c.expiry.map { $0 > now } ?? true
+    }
+
+    func agyRawToken(_ profile: CLIProfile, keychain: CLIKeychain?) -> (raw: String, fromKeychain: Bool)? {
+        if !profile.isDefault {
+            guard folderProblem(profile) == nil else { return nil }
+            let cliDir = profile.path + "/antigravity-cli"
+            guard Self.isRealDirectory(cliDir),
+                  let data = Self.regularFileContents(cliDir + "/antigravity-oauth-token") else { return nil }
+            return (String(decoding: data, as: UTF8.self), false)
+        }
+        let cliFile = profile.path + "/antigravity-cli/antigravity-oauth-token"
+        let marker = profile.path + "/antigravity-cli/cache/antigravity-keyring-unavailable"
+        let legacyFile = profile.path + "/jetski-standalone-oauth-token"
+        if let mtime = FS.mtime(URL(fileURLWithPath: marker)), abs(Date().timeIntervalSince(mtime)) < 3600,
+           let data = Self.regularFileContents(cliFile)
+        {
+            return (String(decoding: data, as: UTF8.self), false)
+        }
+        if let kc = keychain?.read(service: "gemini", account: "antigravity") {
+            return (kc, true)
+        }
+        if let data = Self.regularFileContents(cliFile) {
+            return (String(decoding: data, as: UTF8.self), false)
+        }
+        if let data = Self.regularFileContents(legacyFile) {
+            return (String(decoding: data, as: UTF8.self), false)
+        }
+        return nil
+    }
+
+    func agyTokenRecord(_ profile: CLIProfile, keychain: CLIKeychain?) -> AgyTokenRecord? {
+        guard let (raw, fromKeychain) = agyRawToken(profile, keychain: keychain),
+              let body = AntigravityFiles.decodeKeyringBody(raw),
+              let json = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: Any],
+              let credential = AntigravityUsage.Credential(keyring: raw) else { return nil }
+        return AgyTokenRecord(raw: raw, json: json, credential: credential, fromKeychain: fromKeychain)
+    }
+
+    private func agyDefaultFallbackEmail() -> String? {
+        let legacy = env.defaultFolder(.agy) + "/jetski-standalone-oauth-token"
+        if let d = Self.regularFileContents(legacy),
+           let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+           let email = Self.nonEmpty(obj["id_token_email"]), email.contains("@")
+        {
+            return email
+        }
+        let appStorage = URL(fileURLWithPath: env.home + "/Library/Application Support/Antigravity/User/globalStorage/app_storage.json")
+        if let doc = try? OrderedJSON(contentsOf: appStorage),
+           let email = AntigravityFiles.lastLogin.lazy.compactMap({ doc.string($0)?.trimmingCharacters(in: .whitespacesAndNewlines) }).first(where: { $0.contains("@") })
+        {
+            return email
+        }
+        return nil
+    }
+
+    public func identity(_ profile: CLIProfile, keychain: CLIKeychain? = nil) -> CLIIdentity? {
         switch profile.kind {
         case .claude:
             guard let d = fm.contents(atPath: env.claudeJSON(profile)),
                   let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
                   let a = o["oauthAccount"] as? [String: Any] else { return nil }
-            let key = (a["accountUuid"] as? String).map { "\($0):\(a["organizationUuid"] as? String ?? "")" }
-            return CLIIdentity(email: a["emailAddress"] as? String, organization: a["organizationName"] as? String, plan: nil, accountKey: key)
+            let email = Self.nonEmpty(a["emailAddress"])
+            let org = Self.nonEmpty(a["organizationName"])
+            let key = Self.nonEmpty(a["accountUuid"]).map { "\($0):\(Self.nonEmpty(a["organizationUuid"]) ?? "")" }
+            guard email != nil || org != nil || key != nil else { return nil }
+            return CLIIdentity(email: email, organization: org, plan: nil, accountKey: key)
         case .codex:
-            guard let auth = codexAuth(profile), let tokens = auth["tokens"] as? [String: Any] else { return nil }
-            let claims = (tokens["id_token"] as? String).flatMap(Self.jwtClaims) ?? [:]
+            guard let auth = codexAuth(profile),
+                  let tokens = auth["tokens"] as? [String: Any],
+                  Self.nonEmpty(tokens["refresh_token"]) != nil else { return nil }
+            let claims = Self.nonEmpty(tokens["id_token"]).flatMap(Self.jwtClaims) ?? [:]
             let openai = claims["https://api.openai.com/auth"] as? [String: Any] ?? [:]
-            let accountID = tokens["account_id"] as? String ?? openai["chatgpt_account_id"] as? String
-            return CLIIdentity(email: claims["email"] as? String, organization: nil,
-                               plan: openai["chatgpt_plan_type"] as? String, accountKey: accountID)
+            let accountID = Self.nonEmpty(tokens["account_id"]) ?? Self.nonEmpty(openai["chatgpt_account_id"])
+            return CLIIdentity(email: Self.nonEmpty(claims["email"]), organization: nil,
+                               plan: Self.nonEmpty(openai["chatgpt_plan_type"]), accountKey: accountID)
+        case .agy:
+            guard let record = agyTokenRecord(profile, keychain: keychain),
+                  Self.isUsableAgyCredential(record.credential) else { return nil }
+            let tokenObj = record.json["token"] as? [String: Any]
+            let rawIDToken = Self.nonEmpty(record.json["id_token"]) ?? Self.nonEmpty(tokenObj?["id_token"])
+            let claims = rawIDToken.flatMap(Self.jwtClaims) ?? [:]
+            var email = Self.nonEmpty(record.json["id_token_email"]).flatMap { $0.contains("@") ? $0 : nil }
+                ?? Self.nonEmpty(claims["email"]).flatMap { $0.contains("@") ? $0 : nil }
+            if email == nil, profile.isDefault, record.fromKeychain {
+                email = agyDefaultFallbackEmail()
+            }
+            let sub = Self.nonEmpty(claims["sub"])
+            let tier = Self.nonEmpty(record.json["user_tier"])
+            let plan = tier.map { AntigravityUsage.paidTiers[$0] ?? $0 }
+            let key = email?.lowercased() ?? sub.map { "sub:\($0)" }
+            guard email != nil || plan != nil || key != nil else { return nil }
+            return CLIIdentity(email: email, organization: nil, plan: plan, accountKey: key)
         }
     }
 
@@ -129,29 +267,98 @@ extension CLIProfiles {
         return o["claudeAiOauth"] as? [String: Any]
     }
 
+    /// Non-nil when a credential item or file exists on disk/keychain but is not valid JSON.
+    public func credentialProblem(_ profile: CLIProfile, keychain: CLIKeychain) -> String? {
+        switch profile.kind {
+        case .claude:
+            let service = claudeKeychainService(configDir: profile.envValue)
+            if let raw = keychain.read(service: service) {
+                if (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [String: Any] == nil {
+                    return "keychain item \"\(service)\" is not valid JSON"
+                }
+            } else if let d = fm.contents(atPath: profile.path + "/.credentials.json") {
+                if (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] == nil {
+                    return "\(profile.path)/.credentials.json is not valid JSON"
+                }
+            }
+            return nil
+        case .codex:
+            let path = profile.path + "/auth.json"
+            if let d = fm.contents(atPath: path), (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] == nil {
+                return "\(path) is not valid JSON"
+            }
+            return nil
+        case .agy:
+            guard let (raw, fromKeychain) = agyRawToken(profile, keychain: keychain) else { return nil }
+            guard let body = AntigravityFiles.decodeKeyringBody(raw),
+                  (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: Any] != nil else {
+                return fromKeychain
+                    ? "keychain item \"gemini/antigravity\" is not valid JSON"
+                    : "the saved OAuth token file in \(profile.path) is not valid JSON"
+            }
+            return nil
+        }
+    }
+
     public func signIn(_ profile: CLIProfile, keychain: CLIKeychain) -> CLISignIn {
         func date(_ v: Any?) -> Date? { (v as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) } }
         switch profile.kind {
         case .claude:
-            guard let o = claudeOAuth(profile, keychain: keychain), o["accessToken"] is String else { return CLISignIn(state: .signedOut) }
+            guard let o = claudeOAuth(profile, keychain: keychain), Self.nonEmpty(o["accessToken"]) != nil else {
+                return CLISignIn(state: .signedOut)
+            }
             return CLISignIn(state: .signedIn, accessExpiresAt: date(o["expiresAt"]), refreshExpiresAt: date(o["refreshTokenExpiresAt"]))
         case .codex:
             guard let auth = codexAuth(profile) else { return CLISignIn(state: .signedOut) }
-            let mode = auth["auth_mode"] as? String ?? (auth["tokens"] != nil ? "chatgpt" : "apikey")
-            let last = (auth["last_refresh"] as? String).flatMap { ISO8601DateFormatter.lenient($0) }
-            func present(_ v: Any?) -> Bool { (v as? String).map { !$0.isEmpty } ?? false }
-            guard present((auth["tokens"] as? [String: Any])?["refresh_token"]) else {
-                // An API-key sign-in with no key (`{}`, a null or empty key) is no sign-in at all.
-                let noKey = mode.lowercased() == "apikey" && !present(auth["OPENAI_API_KEY"])
-                return CLISignIn(state: mode.lowercased().contains("chatgpt") || noKey ? .signedOut : .other(mode), lastRefresh: last)
+            let tokens = auth["tokens"] as? [String: Any]
+            let mode = Self.nonEmpty(auth["auth_mode"]) ?? (tokens != nil ? "chatgpt" : "apikey")
+            let normalized = mode.lowercased().replacingOccurrences(of: "_", with: "").replacingOccurrences(of: "-", with: "")
+            let last = Self.nonEmpty(auth["last_refresh"]).flatMap { ISO8601DateFormatter.lenient($0) }
+            guard Self.nonEmpty(tokens?["refresh_token"]) != nil else {
+                // An API-key sign-in with no key (`{}`, a null or empty key, or `tokens: null`) is no sign-in at all.
+                let noKey = normalized == "apikey" && Self.nonEmpty(auth["OPENAI_API_KEY"]) == nil
+                return CLISignIn(state: normalized.contains("chatgpt") || noKey ? .signedOut : .other(mode), lastRefresh: last)
             }
-            return CLISignIn(state: mode.lowercased().contains("chatgpt") ? .signedIn : .other(mode), lastRefresh: last)
+            return CLISignIn(state: normalized.contains("chatgpt") ? .signedIn : .other(mode), lastRefresh: last)
+        case .agy:
+            guard let record = agyTokenRecord(profile, keychain: keychain),
+                  Self.isUsableAgyCredential(record.credential) else { return CLISignIn(state: .signedOut) }
+            return CLISignIn(state: .signedIn, accessExpiresAt: record.credential.expiry)
         }
     }
 
     /// The Claude subscription type the credentials name (`pro`, `max`, …).
     public func claudeSubscription(_ profile: CLIProfile, keychain: CLIKeychain) -> String? {
-        claudeOAuth(profile, keychain: keychain)?["subscriptionType"] as? String
+        Self.nonEmpty(claudeOAuth(profile, keychain: keychain)?["subscriptionType"])
+    }
+
+    /// A non-secret SHA-256 digest of `profile`'s current credentials, or `nil` when signed out.
+    /// Used in memory to tell whether a sign-in or renewal replaced an older credential.
+    public func credentialFingerprint(_ profile: CLIProfile, keychain: CLIKeychain) -> String? {
+        let state = signIn(profile, keychain: keychain)
+        guard state.state != .signedOut else { return nil }
+        let key = identity(profile, keychain: keychain)?.accountKey ?? ""
+        let raw: String
+        switch profile.kind {
+        case .claude:
+            guard let o = claudeOAuth(profile, keychain: keychain), let access = Self.nonEmpty(o["accessToken"]) else { return nil }
+            let refresh = Self.nonEmpty(o["refreshToken"]) ?? ""
+            let exp = (o["expiresAt"] as? NSNumber)?.stringValue ?? ""
+            let rexp = (o["refreshTokenExpiresAt"] as? NSNumber)?.stringValue ?? ""
+            raw = "claude|\(key)|\(access)|\(refresh)|\(exp)|\(rexp)"
+        case .codex:
+            guard let auth = codexAuth(profile) else { return nil }
+            let tokens = auth["tokens"] as? [String: Any]
+            let refresh = Self.nonEmpty(tokens?["refresh_token"]) ?? ""
+            let access = Self.nonEmpty(tokens?["access_token"]) ?? ""
+            let idTok = Self.nonEmpty(tokens?["id_token"]) ?? ""
+            let apiKey = Self.nonEmpty(auth["OPENAI_API_KEY"]) ?? ""
+            raw = "codex|\(key)|\(refresh)|\(access)|\(idTok)|\(apiKey)|\(state.lastRefresh?.timeIntervalSince1970 ?? 0)"
+        case .agy:
+            guard let rec = agyTokenRecord(profile, keychain: keychain), Self.isUsableAgyCredential(rec.credential) else { return nil }
+            raw = "agy|\(key)|\(rec.credential.refreshToken ?? "")|\(rec.credential.accessToken ?? "")|\(rec.credential.expiry?.timeIntervalSince1970 ?? 0)"
+        }
+        return SHA256.hex(Data(raw.utf8))
     }
 }
 
@@ -233,8 +440,11 @@ public struct CLIDoctor {
                 continue
             }
             if let real = CLIShim.realBinary(ofShim: shim) {
-                if !FileManager.default.isExecutableFile(atPath: real) { add(.problem, "\(kind.command): the shim runs \(real), which is missing") }
-                else if CLIShim.isShim(real) { add(.problem, "\(kind.command): the shim runs another shim (\(real))") }
+                if !real.hasPrefix("/") || !CLIShim.isRegularExecutable(real) {
+                    add(.problem, "\(kind.command): the shim runs \(real), which is missing")
+                } else if CLIShim.isShim(real) {
+                    add(.problem, "\(kind.command): the shim runs another shim (\(real))")
+                }
             }
             for (mode, path) in resolve(kind.command) {
                 if path == shim { continue }
@@ -242,40 +452,64 @@ public struct CLIDoctor {
             }
         }
         for rc in rcFiles {
-            let text = (try? String(contentsOfFile: rc, encoding: .utf8)) ?? ""
+            let text: String
+            do { text = try CLIShim.readRC(rc) } catch {
+                add(.problem, error.localizedDescription)
+                continue
+            }
             switch CLIShim.rcState(text) {
             case .absent: add(.note, "\(rc): no Switcher PATH line")
-            case .notLast: add(.warn, "\(rc): lines after Switcher's PATH line may put another claude/codex first; `switcher cli install` moves it to the end")
+            case .notLast: add(.warn, "\(rc): lines after Switcher's PATH line may put another claude/codex/agy first; `switcher cli install` moves it to the end")
+            case .malformed: add(.problem, "\(rc): incomplete or duplicated Switcher lines; fix or remove them by hand")
             case .last: break
             }
         }
 
         // Pointers and profiles.
         for kind in CLIKind.allCases {
+            let root = env.profilesRoot(kind)
             if let raw = try? String(contentsOfFile: env.pointer(kind), encoding: .utf8) {
                 let line = raw.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? ""
                 if line != "default", !line.isEmpty, profiles.active(kind).isDefault {
-                    add(.warn, "\(kind.displayName): the pointer names \(line), which is not a valid profile folder; new processes use the default account")
+                    if CLIPath.problem(line, root: root) == nil, CLIProfiles.lstatMode(line) == nil {
+                        add(.warn, "\(kind.displayName): the pointer points to a missing profile folder (\(line)); new processes use the default account")
+                    } else {
+                        add(.warn, "\(kind.displayName): the pointer names \(line), which is not a valid profile folder; new processes use the default account")
+                    }
                 }
             }
-            let root = env.profilesRoot(kind)
-            for name in ((try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []).sorted() where !name.hasPrefix(".") {
-                let path = root + "/" + name
-                if !CLIPath.isValidName(name) || !CLIProfiles.isRealDirectory(path) {
-                    add(.note, "\(kind.displayName): \(path) is skipped (a symlink, a file or an unusual name)")
+            if CLIProfiles.lstatMode(root) != nil, !CLIProfiles.isRealDirectory(root) {
+                add(.problem, "\(kind.displayName): \(root) is not a real folder (a symlink or a file)")
+            } else {
+                for name in ((try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []).sorted() where !name.hasPrefix(".") {
+                    let path = root + "/" + name
+                    if !CLIPath.isValidName(name) || !CLIProfiles.isRealDirectory(path) {
+                        add(.note, "\(kind.displayName): \(path) is skipped (a symlink, a file or an unusual name)")
+                    }
                 }
             }
             for p in profiles.list(kind) {
                 let label = "\(kind.displayName) \(p.name)"
-                let s = profiles.signIn(p, keychain: keychain)
-                switch s.state {
-                case .signedOut: add(.warn, "\(label): not signed in; run \(kind.loginCommand(p))")
-                case .other(let mode): add(.note, "\(label): signed in with \(mode); quota is not shown for it")
-                case .signedIn:
-                    if let r = s.refreshExpiresAt {
-                        let days = r.timeIntervalSinceNow / 86_400
-                        if days < 0 { add(.problem, "\(label): the sign-in ran out; run \(kind.loginCommand(p))") }
-                        else if days < 5 { add(.warn, "\(label): the sign-in runs out in \(Int(days.rounded(.up))) day(s) unless it is used") }
+                if let problem = profiles.credentialProblem(p, keychain: keychain) {
+                    add(.problem, "\(label): \(problem)")
+                } else {
+                    let s = profiles.signIn(p, keychain: keychain)
+                    switch s.state {
+                    case .signedOut: add(.warn, "\(label): not signed in; run \(kind.loginCommand(p))")
+                    case .other(let mode): add(.note, "\(label): signed in with \(mode); quota is not shown for it")
+                    case .signedIn:
+                        if let r = s.refreshExpiresAt {
+                            let days = r.timeIntervalSinceNow / 86_400
+                            if days < 0 { add(.problem, "\(label): the sign-in ran out; run \(kind.loginCommand(p))") }
+                            else if days < 5 { add(.warn, "\(label): the sign-in runs out in \(Int(days.rounded(.up))) day(s) unless it is used") }
+                        }
+                    }
+                }
+                if kind == .agy, !p.isDefault {
+                    let marker = p.path + "/antigravity-cli/cache/antigravity-keyring-unavailable"
+                    var mst = stat()
+                    if lstat(marker, &mst) != 0 || (mst.st_mode & S_IFMT) != S_IFREG {
+                        add(.warn, "\(label): keyring-isolation marker is missing (`switcher cli link agy` restores it)")
                     }
                 }
                 for c in profiles.checkLinks(p) {

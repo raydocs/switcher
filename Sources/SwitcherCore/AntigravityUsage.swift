@@ -85,14 +85,16 @@ public final class AntigravityUsage: @unchecked Sendable {
     private var accessTokens: [String: (token: String, expires: Date)] = [:]
     private var projects: [String: String] = [:]
 
+    static let defaultSend: Send = { request in
+        // No disk cache, no cookies, no redirects: a token goes to the Google address it was meant for, and nowhere is it kept.
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        return (data, http)
+    }
+
     public init(env: Env, send: Send? = nil) {
         self.env = env
-        self.send = send ?? { request in
-            // No disk cache, no cookies, no redirects: a token goes to the Google address it was meant for, and nowhere is it kept.
-            let (data, response) = try await Self.session.data(for: request)
-            guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
-            return (data, http)
-        }
+        self.send = send ?? Self.defaultSend
     }
 
     // MARK: Cache
@@ -126,16 +128,13 @@ public final class AntigravityUsage: @unchecked Sendable {
         var expiry: Date?
 
         init?(keyring value: String) {
-            var body = value
-            let prefix = "go-keyring-base64:"
-            if body.hasPrefix(prefix) {
-                guard let data = Data(base64Encoded: String(body.dropFirst(prefix.count))) else { return nil }
-                body = String(decoding: data, as: UTF8.self)
-            }
-            guard let obj = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any],
+            guard let body = AntigravityFiles.decodeKeyringBody(value),
+                  let obj = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any],
                   let token = obj["token"] as? [String: Any] else { return nil }
-            accessToken = token["access_token"] as? String
-            refreshToken = token["refresh_token"] as? String
+            let access = (token["access_token"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let refresh = (token["refresh_token"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            accessToken = access?.isEmpty == false ? access : nil
+            refreshToken = refresh?.isEmpty == false ? refresh : nil
             if let e = token["expiry"] as? String {
                 let f = ISO8601DateFormatter()
                 f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]

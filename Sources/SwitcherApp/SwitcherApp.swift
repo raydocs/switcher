@@ -62,15 +62,26 @@ struct MenuBarLabel: View {
         return Image(nsImage: MeterIcon.image(five: five, week: week))
     }
 
-    /// The active account (Claude Code or Codex) with the least room, and its two main windows.
+    /// The active terminal account with the least room, and its two main windows.
     static func tightest(_ boards: [CLIBoard]) -> (CLIRow, Int?, Int?)? {
-        let actives = boards.compactMap(\.active).filter { $0.headroom.status != .unknown }
-        guard let row = actives.min(by: { ($0.headroom.percentLeft ?? 100) < ($1.headroom.percentLeft ?? 100) }),
-              let windows = row.quota?.windows else { return nil }
-        func used(_ label: String) -> Int? { windows.first { $0.label == label }.map { Int($0.usedPercent.rounded()) } }
-        let five = used("5h"), week = used("week")
-        if five == nil, week == nil { return nil }
-        return (row, five, week)
+        let candidates = boards.compactMap { board -> (row: CLIRow, five: Int?, week: Int?)? in
+            guard let row = board.active, row.headroom.status != .unknown, let windows = row.quota?.windows else { return nil }
+            let main = windows.filter(CLIUsage.isMain)
+            let fiveWindow = main.first { $0.label == "5h" }
+                ?? main.filter { $0.label != "week" && (CLIUsage.duration($0) ?? 0) < 86400 }
+                       .min { (CLIUsage.duration($0) ?? .infinity) < (CLIUsage.duration($1) ?? .infinity) }
+            let weekWindow = main.first { $0.label == "week" }
+                ?? main.filter { $0.label != "5h" && (CLIUsage.duration($0) ?? 0) >= 86400 }
+                       .max { (CLIUsage.duration($0) ?? 0) < (CLIUsage.duration($1) ?? 0) }
+            let five = fiveWindow.map { Int($0.usedPercent.rounded()) }
+            let week = weekWindow.map { Int($0.usedPercent.rounded()) }
+            guard five != nil || week != nil else { return nil }
+            return (row, five, week)
+        }
+        guard let pick = candidates.min(by: { ($0.row.headroom.percentLeft ?? 100) < ($1.row.headroom.percentLeft ?? 100) }) else {
+            return nil
+        }
+        return (pick.row, pick.five, pick.week)
     }
 }
 

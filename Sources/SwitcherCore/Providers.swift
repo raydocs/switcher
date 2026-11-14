@@ -236,15 +236,37 @@ public enum AntigravityFiles {
         return nil
     }
 
-    /// go-keyring stores `go-keyring-base64:<base64 JSON>`.
-    static func email(fromKeyring value: String) -> String? {
-        var body = value
-        let prefix = "go-keyring-base64:"
-        if body.hasPrefix(prefix) {
-            guard let data = Data(base64Encoded: String(body.dropFirst(prefix.count))) else { return nil }
-            body = String(decoding: data, as: UTF8.self)
+    /// go-keyring stores `go-keyring-base64:<base64 JSON>`, `go-keyring-encoded:<hex JSON>`, or raw JSON.
+    static func decodeKeyringBody(_ value: String) -> String? {
+        let b64 = "go-keyring-base64:", enc = "go-keyring-encoded:"
+        if value.hasPrefix(b64) {
+            guard let data = Data(base64Encoded: String(value.dropFirst(b64.count))) else { return nil }
+            return String(decoding: data, as: UTF8.self)
         }
-        guard let obj = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any],
+        if value.hasPrefix(enc) {
+            guard let data = decodeHex(value.dropFirst(enc.count)) else { return nil }
+            return String(decoding: data, as: UTF8.self)
+        }
+        return value
+    }
+
+    static func decodeHex<S: StringProtocol>(_ hex: S) -> Data? {
+        guard !hex.isEmpty, hex.count % 2 == 0 else { return nil }
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(hex.count / 2)
+        var index = hex.startIndex
+        while index < hex.endIndex {
+            let next = hex.index(index, offsetBy: 2)
+            guard let byte = UInt8(hex[index..<next], radix: 16) else { return nil }
+            bytes.append(byte)
+            index = next
+        }
+        return Data(bytes)
+    }
+
+    static func email(fromKeyring value: String) -> String? {
+        guard let body = decodeKeyringBody(value),
+              let obj = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any],
               let email = obj["id_token_email"] as? String, email.contains("@") else { return nil }
         return email
     }

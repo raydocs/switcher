@@ -37,11 +37,12 @@
 - **Add accounts the normal way.** "Add account" opens the app on its sign-in page. Sign in as usual
   and Switcher remembers it; the account you left stays saved.
 - **Knows who you are.** Each account is shown by its email, read from the app's own files.
-- **Claude Code and Codex CLI accounts.** Choose which account new `claude` and `codex` terminal
-  sessions use, and see each account's quota. These are separate from the desktop apps: switching a
-  CLI account changes only which account *new* `claude` / `codex` processes use. Running sessions keep
-  theirs, nothing quits, and Claude Desktop and the ChatGPT app are not affected. Switching a desktop
-  app works as before. See [CLI accounts](#cli-accounts-claude-code-and-codex).
+- **Claude Code, Codex and Antigravity CLI accounts.** Choose which account new `claude`, `codex` and
+  `agy` terminal sessions use, and see each account's quota. These are separate from the desktop apps:
+  switching a CLI account changes only which account *new* `claude` / `codex` / `agy` processes use.
+  Running sessions keep theirs, nothing quits, and Claude Desktop, ChatGPT and Antigravity Desktop are
+  not affected. Switching a desktop app works as before. See
+  [CLI accounts](#cli-accounts-claude-code-codex-and-antigravity-cli).
 - **CLI included.** `switcher list`, `switcher switch claude 2`, `switcher usage` and more.
 
 ## Install
@@ -65,29 +66,37 @@ scripts/bundle.sh && cp -R dist/Switcher.app /Applications/
 
 Requires macOS 14 or later.
 
-## CLI accounts (Claude Code and Codex)
+## CLI accounts (Claude Code, Codex and Antigravity CLI)
 
 Each account gets its own folder, and Switcher points new terminal sessions at one of them.
 
-- **Profile folders.** `~/.claude-profiles/<name>` for Claude Code and `~/.codex-profiles/<name>` for
-  Codex. Account 1 is the default: your normal `~/.claude` and `~/.codex`, untouched.
-- **A pointer.** `~/.config/switcher/active-claude` and `active-codex` each hold one line: the folder
-  new processes should use. `switcher cli use` rewrites that line and nothing else. No credential moves.
-- **Shims.** `switcher cli install` puts small `claude` and `codex` shims in
+- **Profile folders.** `~/.claude-profiles/<name>` for Claude Code, `~/.codex-profiles/<name>` for
+  Codex, and `~/.agy-profiles/<name>` for Antigravity CLI. Account 1 is the default: your normal
+  `~/.claude`, `~/.codex` and `~/.gemini`, untouched.
+- **A pointer.** `~/.config/switcher/active-claude`, `active-codex` and `active-agy` each hold one
+  line: the folder new processes should use. `switcher cli use` rewrites that line and nothing else.
+  No credential moves.
+- **Shims.** `switcher cli install` puts small `claude`, `codex` and `agy` shims in
   `~/.local/share/switcher/bin` and adds one PATH line at the end of `~/.zshrc`. A shim reads the
-  pointer, sets `CLAUDE_CONFIG_DIR` or `CODEX_HOME` for that process, and runs the real CLI. For the
-  default account it sets nothing. `switcher cli uninstall` removes both.
+  pointer, sets `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `ANTIGRAVITY_GEMINI_DIR` (plus `--gemini_dir` for
+  normal `agy` commands) for that process, and runs the real CLI. For the default account it sets
+  nothing. `switcher cli uninstall` removes both.
 - **Shared settings.** A new profile symlinks your configuration and history from the default folder,
   so `--resume` still finds your sessions after a switch. Shared (Claude Code): `agents`, `commands`,
   `skills`, `plugins`, `scripts`, `hooks`, `projects`, `file-history`, `todos`, `CLAUDE.md`,
   `settings.json`, `keybindings.json`, `history.jsonl`. Shared (Codex): `skills`, `plugins`, `rules`,
   `prompts`, `sessions`, `archived_sessions`, `AGENTS.md`, `config.toml`, `session_index.jsonl`,
-  `history.jsonl`. Everything else stays per account: the sign-in, caches, databases and, for Claude
-  Code, `.claude.json`.
+  `history.jsonl`. Shared (Antigravity CLI): `GEMINI.md`, `settings.json`, `skills`, `policies`, and
+  `antigravity-cli/{settings,keybindings,hooks,mcp_config}.json`, `conversations`, `brain`. Everything
+  else stays per account: the sign-in, caches, databases and, for Claude Code, `.claude.json`. Named
+  `agy` profiles keep a fresh `antigravity-cli/cache/antigravity-keyring-unavailable` marker so their
+  OAuth token stays in `antigravity-cli/antigravity-oauth-token` without touching Antigravity Desktop's
+  keychain item.
 
-The folder layout is the same one [token-arcade](https://github.com/raydocs/token-arcade) uses.
-Switcher also coexists with Orca: if `CLAUDE_CONFIG_DIR` or `CODEX_HOME` is already set, the shim
-passes it through untouched. Set `SWITCHER_BYPASS=1` to skip the shim for one command.
+The folder layout is the same one [token-arcade](https://github.com/raydocs/token-arcade) uses (plus
+`~/.agy-profiles`). Switcher also coexists with Orca: if `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or
+`ANTIGRAVITY_GEMINI_DIR` is already set, the shim passes it through untouched. Set `SWITCHER_BYPASS=1`
+to skip the shim for one command.
 
 **Quick start**
 
@@ -105,7 +114,7 @@ switcher cli doctor                  # check shims, sign-ins, links and keychain
 | Command | What it does |
 |---|---|
 | `switcher cli [list] [--json]` | Every profile, who it is signed in as, and which is active |
-| `switcher cli use <cli> [<who>]` | New `claude` / `codex` processes use this account (no `<who>`: the next one) |
+| `switcher cli use <cli> [<who>]` | New `claude` / `codex` / `agy` processes use this account (no `<who>`: the next one) |
 | `switcher cli add [<cli>] [<name>]` | Add an account: the CLI's own sign-in opens the browser, then it offers to switch. The folder is named `account2`, `account3`, … unless you give a name; a cancelled sign-in leaves nothing. Says so when it is an account you already have. `--no-login`: folder only; `--use`: switch without asking |
 | `switcher cli login <cli> [<who>]` | Sign an account in again (default: the active one) |
 | `switcher cli remove <cli> <who> [--yes]` | Sign an account out and move its folder to the Trash (never the default account; shared sessions and settings stay) |
@@ -118,13 +127,13 @@ switcher cli doctor                  # check shims, sign-ins, links and keychain
 | `switcher cli usage [<cli>] --json` | The same as JSON (`switcher.usage.v1`): each account's windows, room left, an even-pace mark, and the account with the most room |
 | `switcher cli usage [<cli>] --cached` | The last readings as JSON, without any request, process or keychain access (for scripts and status bars) |
 
-`<cli>` is `claude` or `codex` (`cc` / `co`). `<who>` is a number (1 = the default account), a name,
-the email it is signed in as, or `default`.
+`<cli>` is `claude`, `codex` or `agy` (`cc` / `co` / `antigravity`). `<who>` is a number (1 = the
+default account), a name, the email it is signed in as, or `default`.
 
-In the menu bar app, **Add Account…** under Claude Code or Codex does the same with one click: the
-browser opens, and the account appears once you have signed in (Cancel, or **Use Terminal Instead**
-if no browser opened). Accounts are listed by email; a folder is never renamed after sign-in,
-because Claude Code names its keychain item after the folder's path.
+In the menu bar app, **Add Account…** under Claude Code, Codex or Antigravity CLI does the same with
+one click: the browser opens, and the account appears once you have signed in (Cancel, or **Use
+Terminal Instead** if no browser opened). Accounts are listed by email; a folder is never renamed
+after sign-in, because Claude Code names its keychain item after the folder's path.
 
 **Usage at a glance.** Each account shows its 5-hour and weekly use, with a mark on the weekly bar
 where an even pace would be. When the active account passes 80 %, the account with the most room
@@ -151,6 +160,7 @@ reads or sends your credentials anywhere.
 | Antigravity | The OAuth token in the login keychain (`gemini` / `antigravity`) and the onboarding keys in `app_storage.json` |
 | Claude Code CLI | The keychain item `Claude Code-credentials[-<8 hex of sha256(folder)>]` and `.claude.json` in the profile folder. Nothing is moved |
 | Codex CLI | `auth.json` in the profile folder. Nothing is moved |
+| Antigravity CLI | `antigravity-cli/antigravity-oauth-token` in named profile folders (or the login keychain `gemini` / `antigravity` item for `default`). Nothing is moved |
 
 Each switch is journaled: the app is quit first, the current sign-in is set aside, the target one is
 put back, and the journal is committed only once everything is on disk. If anything fails halfway, or
@@ -161,14 +171,14 @@ Saved sign-ins live in `~/Library/Application Support/Switcher/`.
 
 **Network.** Switcher makes these requests, and no others:
 
-- Antigravity quota: for each saved account it refreshes that account's own token in memory and asks
-  Google for its quota.
+- Antigravity quota (desktop and CLI): for each account it refreshes that account's own token in
+  memory and asks Google Cloud Code for its quota. Profile token files are never rewritten.
 - Claude Code quota: `https://api.anthropic.com/api/oauth/usage`, with that profile's own access
   token, and only when there is no fresh statusline reading.
 - Codex quota: through the local `codex app-server`, which talks to OpenAI itself.
 
-Switcher never refreshes a CLI token. `switcher cli usage --renew` runs one minimal `claude -p` (a
-tiny Haiku request) so Claude Code renews its own sign-in. Nothing else is sent.
+Switcher never writes refreshed CLI tokens back to disk. `switcher cli usage --renew` runs one
+minimal `claude -p` (a tiny Haiku request) so Claude Code renews its own sign-in. Nothing else is sent.
 
 ## Known limitations
 

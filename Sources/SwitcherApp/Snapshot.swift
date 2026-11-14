@@ -212,9 +212,13 @@ enum Snapshot {
                     s.cli(.codex, 1, "default", "ada@lovelace.dev", plan: "plus", active: true, usage: (12, 37, 3.1, 1)),
                     s.cli(.codex, 2, "side", nil, signedIn: false, usage: nil),
                 ]),
+                CLIBoard(kind: .agy, shimInstalled: installed, commandFound: true, rows: [
+                    s.cli(.agy, 1, "default", "ada@lovelace.dev", plan: "Google AI Pro", active: true, usage: (34, 12, 2.4, 3)),
+                    s.cli(.agy, 2, "studio", "studio@lovelace.dev", plan: "Google AI Ultra Lite", usage: (8, 22, 4.0, 9)),
+                ]),
             ]
         }
-        let both = MenuView.Staged(cli: .init(expanded: [.claude, .codex]))
+        let both = MenuView.Staged(cli: .init(expanded: [.claude, .codex, .agy]))
         // The active accounts nearly out: the one with the most room is marked; a model's own limit warns.
         let tight = [
             CLIBoard(kind: .claude, shimInstalled: true, commandFound: true, rows: CLIBoard.markingBest([
@@ -336,8 +340,9 @@ struct Make {
              signedIn: Bool = true, goodDays: Double? = nil,
              usage: (five: Double, week: Double, resetHours: Double, minutesAgo: Double)?, error: CLIQuotaError? = nil,
              scoped: (String, Double)? = nil, weekResetHours: Double = 90) -> CLIRow {
-        let folder = "/Users/ada/" + (kind == .claude ? ".claude" : ".codex")
-        let path = name == "default" ? "" : "\(kind.envVar)='\(folder)-profiles/\(name)' "
+        let profile = CLIProfile(kind: kind, name: name,
+                                 path: name == "default" ? "/Users/ada/\(kind.defaultFolderName)" : "/Users/ada/\(kind.profilesFolderName)/\(name)",
+                                 isDefault: name == "default")
         let quota = usage.map { u in
             CLIQuota(windows: [
                 CLIQuotaWindow(label: "5h", usedPercent: u.five, resetsAt: Date().addingTimeInterval(u.resetHours * 3600)),
@@ -348,7 +353,7 @@ struct Make {
         return CLIRow(
             kind: kind, number: number, name: name, isDefault: name == "default", isActive: active, email: email, plan: plan,
             signIn: signedIn ? .good(until: goodDays.map { Date().addingTimeInterval($0 * 86400) }) : .out,
-            loginCommand: path + (kind == .claude ? "claude auth login" : "codex login"),
+            loginCommand: kind.loginCommand(profile),
             quota: quota,
             quotaError: error,
             headroom: CLIUsage.headroom(quota, signedIn: signedIn, now: Date(), lastActivity: nil))

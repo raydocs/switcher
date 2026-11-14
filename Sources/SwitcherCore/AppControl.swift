@@ -90,9 +90,11 @@ public final class MacApp: AppController {
         // A process whose program can't be looked up but whose name looks like one of ours counts:
         // never move a sign-in while something of the app may still be running.
         let exe = bundleExecutable ?? name
+        let genericHelpers = bundleID == Self.claude.bundleID || bundleID == Self.antigravity.bundleID
         let unknown = list.unresolved.filter { p in
             !ignored.contains(where: { p.name.hasPrefix(String($0.prefix(15))) })
-                && (p.name.hasPrefix(String(exe.prefix(15))) || p.name.hasPrefix(String(name.prefix(15))) || p.name.hasPrefix("language_serv") || p.name.hasPrefix("Electron"))
+                && (p.name.hasPrefix(String(exe.prefix(15))) || p.name.hasPrefix(String(name.prefix(15)))
+                    || (genericHelpers && (p.name.hasPrefix("language_serv") || p.name.hasPrefix("Electron"))))
         }
         // Something we can't see into at all might be ours: count it, so nothing moves under it.
         return mine + unknown.map { ($0.pid, "?\($0.name)") } + list.unknown.map { ($0, "?") }

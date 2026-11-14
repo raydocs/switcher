@@ -13,15 +13,18 @@ final class CLIBox {
         try? FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
     }
 
-    deinit { try? FileManager.default.removeItem(atPath: top) }
+    deinit { destroy() }
 
-    var env: CLIEnv { CLIEnv(home: home) }
+    func destroy() { try? FileManager.default.removeItem(atPath: top) }
 
-    func env(realClaude: String? = nil, realCodex: String? = nil) -> CLIEnv {
+    var env: CLIEnv { CLIEnv(home: home, fallbackSearchDirs: []) }
+
+    func env(realClaude: String? = nil, realCodex: String? = nil, realAgy: String? = nil) -> CLIEnv {
         var real: [CLIKind: String] = [:]
         if let realClaude { real[.claude] = realClaude }
         if let realCodex { real[.codex] = realCodex }
-        return CLIEnv(home: home, realBinaries: real)
+        if let realAgy { real[.agy] = realAgy }
+        return CLIEnv(home: home, realBinaries: real, fallbackSearchDirs: [])
     }
 
     func mkdir(_ path: String) {
@@ -57,6 +60,7 @@ final class CLIBox {
         #!/bin/sh
         echo "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR-<unset>}"
         echo "CODEX_HOME=${CODEX_HOME-<unset>}"
+        echo "ANTIGRAVITY_GEMINI_DIR=${ANTIGRAVITY_GEMINI_DIR-<unset>}"
         for a in "$@"; do echo "arg=[$a]"; done
 
         """, mode: 0o755)

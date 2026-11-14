@@ -49,6 +49,25 @@ import Testing
         #expect(CLIUsage.pace(w("300m", 0, resetsIn: 150 * 60), now: now) == 50)
         #expect(CLIUsage.pace(w("5h", 0, resetsIn: nil), now: now) == nil)
         #expect(CLIUsage.pace(w("odd", 0, resetsIn: 60), now: now) == nil)
+        let zeroMin = w("0m", 0, resetsIn: 60)
+        #expect(!CLIUsage.isMain(zeroMin) && CLIUsage.duration(zeroMin) == nil)
+    }
+
+    @Test func scopePartsSplitsEveryWindowShape() {
+        #expect(CLIUsage.scopeParts("") == CLIUsage.ScopeParts(name: "", window: nil, isWeeklyModel: false))
+        #expect(CLIUsage.scopeParts("   ") == CLIUsage.ScopeParts(name: "", window: nil, isWeeklyModel: false))
+        #expect(CLIUsage.scopeParts("5h") == CLIUsage.ScopeParts(name: "5h", window: nil, isWeeklyModel: false))
+        #expect(CLIUsage.scopeParts("week") == CLIUsage.ScopeParts(name: "week", window: nil, isWeeklyModel: false))
+        #expect(CLIUsage.scopeParts("45m") == CLIUsage.ScopeParts(name: "45m", window: nil, isWeeklyModel: false))
+        #expect(CLIUsage.scopeParts("week (Opus)") == CLIUsage.ScopeParts(name: "Opus", window: nil, isWeeklyModel: true))
+        #expect(CLIUsage.scopeParts("week ()") == CLIUsage.ScopeParts(name: "scoped", window: nil, isWeeklyModel: true))
+        #expect(CLIUsage.scopeParts("Spark 45m") == CLIUsage.ScopeParts(name: "Spark", window: "45m", isWeeklyModel: false))
+        #expect(CLIUsage.scopeParts("GPT-5.3-Codex-Spark 5h") == CLIUsage.ScopeParts(name: "GPT-5.3-Codex-Spark", window: "5h", isWeeklyModel: false))
+        #expect(CLIUsage.scopeParts("Fast 5h week") == CLIUsage.ScopeParts(name: "Fast 5h", window: "week", isWeeklyModel: false))
+        #expect(CLIUsage.scopeParts("Pro 5h") == CLIUsage.ScopeParts(name: "Pro", window: "5h", isWeeklyModel: false))
+        #expect(CLIUsage.scopeParts("Claude week") == CLIUsage.ScopeParts(name: "Claude", window: "week", isWeeklyModel: false))
+        #expect(CLIUsage.scopeParts("credits") == CLIUsage.ScopeParts(name: "credits", window: nil, isWeeklyModel: false))
+        #expect(CLIUsage.scopeParts("Code Review daily") == CLIUsage.ScopeParts(name: "Code Review daily", window: nil, isWeeklyModel: false))
     }
 
     @Test func theBestAccountHasTheMostRoomAndIsKnown() {
@@ -103,6 +122,12 @@ import Testing
         let limitedAt = now.addingTimeInterval(-600)
         #expect(CLIRefreshPlan.backingOff(lastAttempt: limitedAt, failures: CLIRefreshPlan.rateLimitedFailures, now: now))
         #expect(!CLIRefreshPlan.backingOff(lastAttempt: limitedAt, failures: 1, now: now))
+        // Finding #22: Low Power Mode doubles backoff, and backward clock jumps clamp negative elapsed time.
+        let fourHundredAgo = now.addingTimeInterval(-400)
+        #expect(!CLIRefreshPlan.backingOff(lastAttempt: fourHundredAgo, failures: 1, lowPower: false, now: now))
+        #expect(CLIRefreshPlan.backingOff(lastAttempt: fourHundredAgo, failures: 1, lowPower: true, now: now))
+        let futureAttempt = now.addingTimeInterval(3600)
+        #expect(CLIRefreshPlan.backingOff(lastAttempt: futureAttempt, failures: 1, lowPower: false, now: now))
         #expect(!CLIRefreshPlan.backingOff(lastAttempt: limitedAt, failures: 0, now: now))
         #expect(!CLIRefreshPlan.backingOff(lastAttempt: nil, failures: 5, now: now))
         let failing = [s("a", active: true, seenAgo: 4000, triedAgo: 900, failures: 3)]
@@ -133,6 +158,13 @@ import Testing
         box.write(today + "/rollout-1.jsonl", "{}\n")
         touch(today + "/rollout-1.jsonl", now.addingTimeInterval(-30))
         #expect(CLIUsage.lastActivity(.codex, env: box.env, now: now) == now.addingTimeInterval(-30))
+
+        #expect(CLIUsage.lastActivity(.agy, env: box.env, now: now) == nil)
+        box.write(box.home + "/.gemini/antigravity-cli/cache/projects.json", "{}\n")
+        touch(box.home + "/.gemini/antigravity-cli/cache/projects.json", now.addingTimeInterval(-200))
+        box.write(box.home + "/.gemini/antigravity-cli/conversations/conv-1.pb", "x")
+        touch(box.home + "/.gemini/antigravity-cli/conversations/conv-1.pb", now.addingTimeInterval(-15))
+        #expect(CLIUsage.lastActivity(.agy, env: box.env, now: now) == now.addingTimeInterval(-15))
     }
 
     @Test func theReportComesFromTheCacheAndHoldsNoSecrets() throws {
@@ -170,6 +202,30 @@ import Testing
         #expect(text.contains("\"schema\" : \"switcher.usage.v1\""))
         let back = try JSONDecoder.iso.decode(CLIUsageReport.self, from: Data(text.utf8))
         #expect(back.clis.first?.best == "account2")
+    }
+
+    // Findings #9 & #18: active profile is included in `best`, and `--cached` never marks signed-out file profiles as ok/best.
+    @Test func reportIncludesActiveInBestAndChecksFileBackedCachedSignIn() throws {
+        let box = CLIBox()
+        let profiles = CLIProfiles(env: box.env)
+        let def = profiles.defaultProfile(.codex)
+        let two = try profiles.add(.codex, name: "account2")
+        let three = try profiles.add(.codex, name: "account3")
+        box.write(def.path + "/auth.json", box.json(["auth_mode": "chatgpt", "tokens": ["refresh_token": "r", "account_id": "a1"]]))
+        box.write(two.path + "/auth.json", box.json(["auth_mode": "chatgpt", "tokens": ["refresh_token": "r", "account_id": "a2"]]))
+        // account3 lost its refresh token (signed out), even though a nil-keyed cache entry exists.
+        box.write(three.path + "/auth.json", box.json([:]))
+
+        let cache = CLIQuotaCache(env: box.env)
+        try cache.store(q([w("5h", 15, resetsIn: 3600)]), for: def, accountKey: "a1")
+        try cache.store(q([w("5h", 70, resetsIn: 3600)]), for: two, accountKey: "a2")
+        try cache.store(q([w("5h", 1, resetsIn: 3600)]), for: three, accountKey: nil)
+
+        // `--cached` passes keychain: nil, signedIn: nil; file-backed profiles still verify local credentials.
+        let report = CLIUsageReport.build(profiles: profiles, kinds: [.codex], now: now)
+        let codex = try #require(report.clis.first)
+        #expect(codex.best == "default")
+        #expect(codex.accounts[2].status == .unknown)
     }
 }
 

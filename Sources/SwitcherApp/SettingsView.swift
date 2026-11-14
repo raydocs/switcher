@@ -354,10 +354,11 @@ struct AboutSettings: View {
                     VStack(alignment: .leading, spacing: 10) {
                         Point(symbol: "arrow.left.arrow.right", lead: L.t("Sign-ins are moved, never sent. ", "登录只在本机移动，从不外传。"),
                               text: L.t("Switching moves them between the app and Switcher's storage on this Mac.", "切换时，它们只在应用和 Switcher 在这台 Mac 上的存储之间移动。"))
-                        Point(symbol: "gauge.with.dots.needle.33percent", lead: L.t("Antigravity quota comes from Google. ", "Antigravity 配额来自 Google。"),
-                              text: L.t("Each account's own sign-in asks for its own numbers.", "每个账号用自己的登录读取自己的数字。"))
-                        Point(symbol: "doc.text", lead: L.t("Claude usage comes from Claude's own files. ", "Claude 用量来自 Claude 自己的文件。"),
-                              text: L.t("Switcher reads what Claude last saved on this Mac and asks no server.", "Switcher 只读取 Claude 上次保存在这台 Mac 上的数据，不请求任何服务器。"))
+                        Point(symbol: "doc.text", lead: L.t("Claude Desktop usage comes from local files. ", "Claude 桌面端用量来自本地文件。"),
+                              text: L.t("Switcher reads what the desktop app last saved on this Mac.", "Switcher 只读取桌面应用上次保存在这台 Mac 上的记录。"))
+                        Point(symbol: "gauge.with.dots.needle.33percent", lead: L.t("Quota checks ask each provider directly. ", "额度查询直接请求对应服务。"),
+                              text: L.t("Antigravity asks Google Cloud Code; Claude Code reads its statusline file or asks api.anthropic.com/api/oauth/usage (and runs claude -p only when you click Renew sign-in); Codex runs codex app-server.",
+                                        "Antigravity 请求 Google Cloud Code；Claude Code 优先读本地状态栏文件，没有新记录时请求 api.anthropic.com/api/oauth/usage（仅在点击“续期登录”时运行一次 claude -p）；Codex 运行 codex app-server。"))
                     }
                     .padding(Metrics.cardPad)
                 }

@@ -4,18 +4,19 @@ import Foundation
 // environment `cli exec` hands to a command. The command line tool only prints and execs.
 
 public enum CLICommands {
-    /// `claude` / `cc` → Claude Code, `codex` / `co` → Codex.
+    /// `claude` / `cc` → Claude Code, `codex` / `co` → Codex, `agy` / `antigravity` → Antigravity CLI.
     public static func kind(_ s: String?) -> CLIKind? {
         switch s?.lowercased() {
         case "claude", "cc": .claude
         case "codex", "co": .codex
+        case "agy", "antigravity": .agy
         default: nil
         }
     }
 
-    /// `<who>`: a number (1 = the default account), a name, or `default`.
-    public static func profile(_ profiles: CLIProfiles, _ kind: CLIKind, _ who: String) throws -> CLIProfile {
-        guard let p = profiles.resolve(kind, who) else {
+    /// `<who>`: a number (1 = the default account), a name, an email, or `default`.
+    public static func profile(_ profiles: CLIProfiles, _ kind: CLIKind, _ who: String, keychain: CLIKeychain? = nil) throws -> CLIProfile {
+        guard let p = profiles.resolve(kind, who, keychain: keychain) else {
             throw SwitcherError.message("no \(kind.displayName) account matches \"\(who)\" (see `switcher cli list`)")
         }
         return p
@@ -35,7 +36,7 @@ public enum CLICommands {
         let split = args.firstIndex(of: "--")
         let head = split.map { Array(args[..<$0]) } ?? args
         let command = split.map { Array(args[($0 + 1)...]) } ?? []
-        guard let kind = kind(head.first) else { throw SwitcherError.message("say which CLI: claude or codex") }
+        guard let kind = kind(head.first) else { throw SwitcherError.message("say which CLI: claude, codex or agy") }
         guard head.count >= 2 else { throw SwitcherError.message("say which account: a number, a name or default") }
         guard head.count == 2 else { throw SwitcherError.message("put the command after --, e.g. switcher cli exec \(kind.command) \(head[1]) -- <command>") }
         if split != nil, command.isEmpty { throw SwitcherError.message("nothing after --") }
@@ -122,7 +123,7 @@ public enum CLICommands {
         kinds.map { kind in
             let active = profiles.active(kind)
             let entries = profiles.list(kind).enumerated().map { i, p -> ListEntry in
-                let id = profiles.identity(p)
+                let id = profiles.identity(p, keychain: keychain)
                 let s = profiles.signIn(p, keychain: keychain)
                 let signIn: String, mode: String?
                 switch s.state {

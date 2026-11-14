@@ -34,7 +34,7 @@
 - **所有 Antigravity 账号的额度。** 每个账号的 Gemini 和 Claude 额度（5 小时和每周）并排显示，切之前就知道哪个号还有余量。
 - **照常添加账号。** 点"添加账号"，应用会停在登录页，正常登录即可，Switcher 会记住它；原来的账号也会保留。
 - **用邮箱区分账号。** 每个账号显示它的邮箱，从应用自己的文件里读出来。
-- **Claude Code 和 Codex CLI 账号。** 选择新的 `claude` 和 `codex` 终端会话用哪个账号，并查看每个账号的额度。这些与桌面应用是分开的：切换 CLI 账号只改变*新的* `claude` / `codex` 进程用哪个账号。正在运行的会话保留原账号，不会退出任何程序，Claude Desktop 和 ChatGPT 应用也不受影响。切换桌面应用的方式和以前一样。详见 [CLI 账号](#cli-accounts-claude-code-and-codex)。
+- **Claude Code、Codex 和 Antigravity CLI 账号。** 选择新的 `claude`、`codex` 和 `agy` 终端会话用哪个账号，并查看每个账号的额度。这些与桌面应用是分开的：切换 CLI 账号只改变*新的* `claude` / `codex` / `agy` 进程用哪个账号。正在运行的会话保留原账号，不会退出任何程序，Claude Desktop、ChatGPT 和 Antigravity 桌面应用也不受影响。切换桌面应用的方式和以前一样。详见 [CLI 账号](#cli-accounts-claude-code-codex-and-antigravity-cli)。
 - **附带命令行。** `switcher list`、`switcher switch claude 2`、`switcher usage` 等。
 
 ## 安装
@@ -58,16 +58,16 @@ scripts/bundle.sh && cp -R dist/Switcher.app /Applications/
 
 需要 macOS 14 或更新版本。
 
-## CLI accounts (Claude Code and Codex)
+## CLI accounts (Claude Code, Codex and Antigravity CLI)
 
 每个账号有自己的文件夹，Switcher 把新的终端会话指向其中一个。
 
-- **配置文件夹。** Claude Code 用 `~/.claude-profiles/<name>`，Codex 用 `~/.codex-profiles/<name>`。账号 1 是默认账号：你平时的 `~/.claude` 和 `~/.codex`，保持不动。
-- **指针。** `~/.config/switcher/active-claude` 和 `active-codex` 各只有一行：新进程应该使用的文件夹。`switcher cli use` 只改写这一行，不移动任何凭据。
-- **垫片（shim）。** `switcher cli install` 会在 `~/.local/share/switcher/bin` 放入小的 `claude` 和 `codex` 垫片，并在 `~/.zshrc` 末尾加一行 PATH。垫片读取指针，为该进程设置 `CLAUDE_CONFIG_DIR` 或 `CODEX_HOME`，然后运行真正的 CLI。默认账号则什么都不设。`switcher cli uninstall` 会把两者都删掉。
-- **共享设置。** 新建的配置文件夹会从默认文件夹链接你的配置和历史，所以切换之后 `--resume` 仍能找到你的会话。共享项（Claude Code）：`agents`、`commands`、`skills`、`plugins`、`scripts`、`hooks`、`projects`、`file-history`、`todos`、`CLAUDE.md`、`settings.json`、`keybindings.json`、`history.jsonl`。共享项（Codex）：`skills`、`plugins`、`rules`、`prompts`、`sessions`、`archived_sessions`、`AGENTS.md`、`config.toml`、`session_index.jsonl`、`history.jsonl`。其余内容各账号独立：登录状态、缓存、数据库，以及 Claude Code 的 `.claude.json`。
+- **配置文件夹。** Claude Code 用 `~/.claude-profiles/<name>`，Codex 用 `~/.codex-profiles/<name>`，Antigravity CLI 用 `~/.agy-profiles/<name>`。账号 1 是默认账号：你平时的 `~/.claude`、`~/.codex` 和 `~/.gemini`，保持不动。
+- **指针。** `~/.config/switcher/active-claude`、`active-codex` 和 `active-agy` 各只有一行：新进程应该使用的文件夹。`switcher cli use` 只改写这一行，不移动任何凭据。
+- **垫片（shim）。** `switcher cli install` 会在 `~/.local/share/switcher/bin` 放入小的 `claude`、`codex` 和 `agy` 垫片，并在 `~/.zshrc` 末尾加一行 PATH。垫片读取指针，为该进程设置 `CLAUDE_CONFIG_DIR`、`CODEX_HOME` 或 `ANTIGRAVITY_GEMINI_DIR`（普通 `agy` 命令同时传入 `--gemini_dir`），然后运行真正的 CLI。默认账号则什么都不设。`switcher cli uninstall` 会把两者都删掉。
+- **共享设置。** 新建的配置文件夹会从默认文件夹链接你的配置和历史，所以切换之后 `--resume` 仍能找到你的会话。共享项（Claude Code）：`agents`、`commands`、`skills`、`plugins`、`scripts`、`hooks`、`projects`、`file-history`、`todos`、`CLAUDE.md`、`settings.json`、`keybindings.json`、`history.jsonl`。共享项（Codex）：`skills`、`plugins`、`rules`、`prompts`、`sessions`、`archived_sessions`、`AGENTS.md`、`config.toml`、`session_index.jsonl`、`history.jsonl`。共享项（Antigravity CLI）：`GEMINI.md`、`settings.json`、`skills`、`policies`，以及 `antigravity-cli/{settings,keybindings,hooks,mcp_config}.json`、`conversations`、`brain`。其余内容各账号独立：登录状态、缓存、数据库，以及 Claude Code 的 `.claude.json`。命名的 `agy` 配置文件夹会维护新鲜的 `antigravity-cli/cache/antigravity-keyring-unavailable` 标记文件，使各自的 OAuth token 独立保存在 `antigravity-cli/antigravity-oauth-token` 中，不触碰 Antigravity 桌面版的钥匙串条目。
 
-这套文件夹结构与 [token-arcade](https://github.com/raydocs/token-arcade) 相同。Switcher 也能和 Orca 共存：如果 `CLAUDE_CONFIG_DIR` 或 `CODEX_HOME` 已经设置，垫片会原样透传。设置 `SWITCHER_BYPASS=1` 可以让某一条命令跳过垫片。
+这套文件夹结构与 [token-arcade](https://github.com/raydocs/token-arcade) 相同（并增加了 `~/.agy-profiles`）。Switcher 也能和 Orca 共存：如果 `CLAUDE_CONFIG_DIR`、`CODEX_HOME` 或 `ANTIGRAVITY_GEMINI_DIR` 已经设置，垫片会原样透传。设置 `SWITCHER_BYPASS=1` 可以让某一条命令跳过垫片。
 
 **快速开始**
 
@@ -85,7 +85,7 @@ switcher cli doctor                  # check shims, sign-ins, links and keychain
 | 命令 | 作用 |
 |---|---|
 | `switcher cli [list] [--json]` | 每个配置文件夹、它登录的是谁，以及哪个是当前激活的 |
-| `switcher cli use <cli> [<who>]` | 新的 `claude` / `codex` 进程使用这个账号（不带 `<who>`：下一个账号） |
+| `switcher cli use <cli> [<who>]` | 新的 `claude` / `codex` / `agy` 进程使用这个账号（不带 `<who>`：下一个账号） |
 | `switcher cli add [<cli>] [<name>]` | 添加账号：CLI 自己的登录会打开浏览器，完成后询问是否切换。不给名字时文件夹依次叫 `account2`、`account3`……；取消登录不会留下任何东西；如果是已有的账号会提示。`--no-login` 只建文件夹；`--use` 不询问直接切换 |
 | `switcher cli login <cli> [<who>]` | 重新登录某个账号（默认是当前账号） |
 | `switcher cli remove <cli> <who> [--yes]` | 退出某个账号的登录，并把它的文件夹移到废纸篓（默认账号不能删；共享的会话和设置保留） |
@@ -98,9 +98,9 @@ switcher cli doctor                  # check shims, sign-ins, links and keychain
 | `switcher cli usage [<cli>] --json` | 同上，输出 JSON（`switcher.usage.v1`）：每个账号的额度窗口、剩余、匀速参考线，以及最宽裕的账号 |
 | `switcher cli usage [<cli>] --cached` | 以 JSON 输出上次读到的数据，不联网、不启动进程、不访问钥匙串（适合脚本和状态栏） |
 
-`<cli>` 为 `claude` 或 `codex`（即 `cc` / `co`）。`<who>` 可以是数字（1 = 默认账号）、名称、登录的邮箱或 `default`。
+`<cli>` 为 `claude`、`codex` 或 `agy`（即 `cc` / `co` / `antigravity`）。`<who>` 可以是数字（1 = 默认账号）、名称、登录的邮箱或 `default`。
 
-在菜单栏 app 里，Claude Code 或 Codex 下的 **添加账号…** 一键完成同样的事：浏览器打开，登录完成后账号就会出现（可以取消；没打开浏览器时点 **改用终端**）。账号按邮箱显示；登录后文件夹不会改名，因为 Claude Code 的钥匙串项是按文件夹路径命名的。
+在菜单栏 app 里，Claude Code、Codex 或 Antigravity CLI 下的 **添加账号…** 一键完成同样的事：浏览器打开，登录完成后账号就会出现（可以取消；没打开浏览器时点 **改用终端**）。账号按邮箱显示；登录后文件夹不会改名，因为 Claude Code 的钥匙串项是按文件夹路径命名的。
 
 **一眼看清用量。** 每个账号显示 5 小时和每周用量，每周额度条上有一条匀速参考线。当前账号用到 80% 以上时，剩得最多的那个账号会标上 **余量最多**。菜单栏图标可以换成两根小条（上面是 5 小时，下面是每周），显示最接近上限的那个当前账号（设置 → 通用）。
 
@@ -116,6 +116,7 @@ switcher cli doctor                  # check shims, sign-ins, links and keychain
 | Antigravity | 登录钥匙串里的 OAuth token（`gemini` / `antigravity`）和 `app_storage.json` 里的 onboarding 键 |
 | Claude Code CLI | 钥匙串条目 `Claude Code-credentials[-<8 hex of sha256(folder)>]` 和配置文件夹里的 `.claude.json`。不移动任何内容 |
 | Codex CLI | 配置文件夹里的 `auth.json`。不移动任何内容 |
+| Antigravity CLI | 命名配置文件夹里的 `antigravity-cli/antigravity-oauth-token`（`default` 则用登录钥匙串的 `gemini` / `antigravity` 条目）。不移动任何内容 |
 
 每次切换都有日志：先退出应用，把当前登录放到一边，再放回目标账号的登录，全部落盘后才提交。中途出错或者断电，下次启动会把它做完或者撤销，
 不会出现两个账号各一半的情况。登录状态只移动、不复制，所以一份保存的登录永远只在一个地方。
@@ -124,11 +125,11 @@ switcher cli doctor                  # check shims, sign-ins, links and keychain
 
 **网络。** Switcher 只会发出以下请求，没有其他：
 
-- Antigravity 额度：对每个保存的账号，在内存里用它自己的 token 刷新一次，然后向 Google 查询额度。
+- Antigravity 额度（桌面版和 CLI）：对每个账号，在内存里用它自己的 token 刷新一次，然后向 Google Cloud Code 查询额度；不会改写配置文件夹里的 token 文件。
 - Claude Code 额度：`https://api.anthropic.com/api/oauth/usage`，使用该配置文件自己的访问 token，且仅在没有新鲜的 statusline 读数时发送。
 - Codex 额度：通过本地的 `codex app-server`，由它自己与 OpenAI 通信。
 
-Switcher 从不刷新 CLI 的 token。`switcher cli usage --renew` 会运行一次最小的 `claude -p`（一个很小的 Haiku 请求），让 Claude Code 自己续期登录。除此之外不发送任何内容。
+Switcher 从不把刷新后的 CLI token 写回磁盘。`switcher cli usage --renew` 会运行一次最小的 `claude -p`（一个很小的 Haiku 请求），让 Claude Code 自己续期登录。除此之外不发送任何内容。
 
 ## 已知限制
 

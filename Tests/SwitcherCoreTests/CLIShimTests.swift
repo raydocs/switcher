@@ -42,10 +42,12 @@ import Testing
         let box = CLIBox(homeName: homeName)
         let claude = box.fakeBinary(box.top + "/bin/claude-real")
         let codex = box.fakeBinary(box.top + "/bin/codex-real")
-        let env = box.env(realClaude: claude, realCodex: codex)
-        try CLIShim.installShims(env: env)
+        let agy = box.fakeBinary(box.top + "/bin/agy-real")
+        let env = box.env(realClaude: claude, realCodex: codex, realAgy: agy)
+        try CLIShim.installShims(env: env, path: "")
         box.mkdir(env.profilesRoot(.claude) + "/a")
         box.mkdir(env.profilesRoot(.codex) + "/a")
+        box.mkdir(env.profilesRoot(.agy) + "/a")
         return World(box: box, env: env, profiles: CLIProfiles(env: env))
     }
 
@@ -110,7 +112,8 @@ import Testing
     @Test func shimAndAppAgreeOnProfileNames() throws {
         let w = try world()
         let long64 = String(repeating: "a", count: 64)
-        let names = ["has space", "über", "a:b", "a*b", "a?b", "a[b", "tab\there", String(repeating: "a", count: 65), "default", ".hid", "-dash",
+        let names = ["has space", "über", "a:b", "a*b", "a?b", "a[b", "tab\there", String(repeating: "a", count: 65),
+                     "default", "Default", "DEFAULT", "1", "99", ".hid", "-dash",
                      "ok.name_1-x", "A", long64]
         for name in names {
             w.box.mkdir(w.root + "/" + name)
@@ -121,7 +124,7 @@ import Testing
             #expect(w.profiles.active(.claude).isDefault == !valid, "\(name.debugDescription)")
         }
         #expect(["ok.name_1-x", "A", long64].allSatisfy(CLIPath.isValidName))
-        #expect(!["has space", "über", "default", ".hid", "-dash", String(repeating: "a", count: 65), "", "ａb"].contains(where: CLIPath.isValidName))
+        #expect(!["has space", "über", "default", "Default", "1", ".hid", "-dash", String(repeating: "a", count: 65), "", "ａb"].contains(where: CLIPath.isValidName))
     }
 
     @Test func aVariableAlreadySetPassesThroughUnchanged() throws {
@@ -179,11 +182,13 @@ import Testing
         let box = CLIBox()
         let real = box.fakeBinary(box.top + "/b'in dir/claude")
         let env = box.env(realClaude: real)
-        try CLIShim.installShims(env: env)
+        try CLIShim.installShims(env: env, path: "")
         #expect(CLIShim.realBinary(ofShim: env.shim(.claude)) == real)
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
         p.arguments = [env.shim(.claude), "ok"]
+        p.environment = ["PATH": "/usr/bin:/bin"]
+        p.standardInput = FileHandle.nullDevice
         let out = Pipe()
         p.standardOutput = out
         try p.run()
@@ -195,12 +200,126 @@ import Testing
     @Test func aShimWhoseRealBinaryIsItselfExits127() throws {
         let box = CLIBox()
         let env = box.env(realClaude: box.home + "/.local/share/switcher/bin/claude")
-        try CLIShim.installShims(env: env)
+        try CLIShim.installShims(env: env, path: "")
         let w = World(box: box, env: env, profiles: CLIProfiles(env: env))
         let r = try w.run()
         #expect(r.status == 127)
         #expect(r.stderr.contains("points at itself"))
         #expect(r.lines.allSatisfy { !$0.hasPrefix("CLAUDE_CONFIG_DIR") })
+    }
+
+    @Test func agyShimInjectsGeminiDirRefreshesMarkerAndSkipsEarlyModes() throws {
+        let w = try world()
+        let agyRoot = w.env.profilesRoot(.agy)
+        let profPath = agyRoot + "/a"
+        // Default pointer: unset and no --gemini_dir.
+        w.pointer("default\n", .agy)
+        let d = try w.run(.agy, args: ["chat"])
+        #expect(d.value("ANTIGRAVITY_GEMINI_DIR") == "<unset>")
+        #expect(d.args == ["chat"])
+
+        // Named profile: sets ANTIGRAVITY_GEMINI_DIR, touches keyring-unavailable marker, prepends --gemini_dir.
+        w.pointer(profPath + "\n", .agy)
+        let r = try w.run(.agy, args: ["chat"])
+        #expect(r.value("ANTIGRAVITY_GEMINI_DIR") == profPath)
+        #expect(r.args == ["--gemini_dir=" + profPath, "chat"])
+        #expect(FS.exists(URL(fileURLWithPath: profPath + "/antigravity-cli/cache/antigravity-keyring-unavailable")))
+
+        // Early-routed subcommands and login action do not accept --gemini_dir.
+        for early in [["agentapi", "serve"], ["multicall", "x"], ["plugin-cli", "list"]] {
+            let e = try w.run(.agy, args: early)
+            #expect(e.value("ANTIGRAVITY_GEMINI_DIR") == profPath)
+            #expect(e.args == early, "\(early)")
+        }
+        let auth = try w.run(.agy, extra: ["AGY_CLI_CDE_AUTH_ACTION": "login"], args: [])
+        #expect(auth.value("ANTIGRAVITY_GEMINI_DIR") == profPath)
+        #expect(auth.args.isEmpty)
+
+        // Explicit --gemini_dir is not duplicated.
+        let explicit = try w.run(.agy, args: ["--gemini_dir=/custom", "chat"])
+        #expect(explicit.args == ["--gemini_dir=/custom", "chat"])
+        #expect(w.box.mode(profPath + "/antigravity-cli/cache/antigravity-keyring-unavailable") == 0o600)
+    }
+
+    @Test func agyShimFailsClosedWhenKeyringMarkerCannotBeIsolated() throws {
+        let w = try world()
+        let agyRoot = w.env.profilesRoot(.agy)
+
+        // 1. Symlinked cache directory is refused before real agy runs.
+        let symProf = agyRoot + "/symcache"
+        w.box.mkdir(symProf + "/antigravity-cli")
+        w.box.mkdir(w.box.top + "/elsewhere")
+        w.box.symlink(symProf + "/antigravity-cli/cache", to: w.box.top + "/elsewhere")
+        w.pointer(symProf + "\n", .agy)
+        let r1 = try w.run(.agy, args: ["chat"])
+        #expect(r1.status == 1)
+        #expect(r1.stderr.contains("cannot isolate Antigravity CLI profile"))
+        #expect(r1.value("ANTIGRAVITY_GEMINI_DIR") == nil)
+
+        // 2. Symlinked marker file is refused.
+        let symMarkerProf = agyRoot + "/symmarker"
+        w.box.mkdir(symMarkerProf + "/antigravity-cli/cache")
+        w.box.symlink(symMarkerProf + "/antigravity-cli/cache/antigravity-keyring-unavailable", to: w.box.top + "/elsewhere/m")
+        w.pointer(symMarkerProf + "\n", .agy)
+        let r2 = try w.run(.agy, args: ["chat"])
+        #expect(r2.status == 1)
+        #expect(r2.value("ANTIGRAVITY_GEMINI_DIR") == nil)
+
+        // 3. Read-only cache directory (mkdir/truncate fails) is refused.
+        let roProf = agyRoot + "/rocache"
+        let roCache = roProf + "/antigravity-cli/cache"
+        w.box.mkdir(roCache)
+        chmod(roCache, 0o500)
+        defer { chmod(roCache, 0o700) }
+        w.pointer(roProf + "\n", .agy)
+        let r3 = try w.run(.agy, args: ["chat"])
+        #expect(r3.status == 1)
+        #expect(r3.stderr.contains("cannot isolate Antigravity CLI profile"))
+        #expect(r3.value("ANTIGRAVITY_GEMINI_DIR") == nil)
+
+        // 4. Explicit --gemini_dir pointing at a managed profile enforces marker isolation too,
+        // without duplicating --gemini_dir when healthy.
+        w.pointer("default\n", .agy)
+        let r4 = try w.run(.agy, args: ["--gemini_dir=" + symProf, "chat"])
+        #expect(r4.status == 1)
+        #expect(r4.stderr.contains("cannot isolate Antigravity CLI profile"))
+        let r5 = try w.run(.agy, args: ["--gemini_dir", agyRoot + "/nonexistent", "chat"])
+        #expect(r5.status == 1)
+        let healthy = agyRoot + "/a"
+        let r6 = try w.run(.agy, args: ["--gemini_dir=" + healthy, "chat"])
+        #expect(r6.status == 0)
+        #expect(r6.args == ["--gemini_dir=" + healthy, "chat"])
+        #expect(w.box.mode(healthy + "/antigravity-cli/cache/antigravity-keyring-unavailable") == 0o600)
+    }
+
+    @Test func invalidPointerAndMissingFolderProduceDistinctWarnings() throws {
+        let w = try world()
+        func runWithTTYStderr() throws -> String {
+            var master: Int32 = -1, slave: Int32 = -1
+            guard openpty(&master, &slave, nil, nil, nil) == 0 else { throw POSIXError(.EIO) }
+            defer { close(master) }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/sh")
+            p.arguments = [w.env.shim(.claude)]
+            p.environment = ["PATH": "/usr/bin:/bin"]
+            p.standardInput = FileHandle.nullDevice
+            p.standardOutput = FileHandle.nullDevice
+            let errHandle = FileHandle(fileDescriptor: slave, closeOnDealloc: false)
+            p.standardError = errHandle
+            try p.run()
+            close(slave)
+            var out = Data(), buf = [UInt8](repeating: 0, count: 1024)
+            while true {
+                let n = read(master, &buf, buf.count)
+                if n > 0 { out.append(contentsOf: buf[0..<n]) } else { break }
+            }
+            p.waitUntilExit()
+            return String(decoding: out, as: UTF8.self)
+        }
+        w.pointer(w.root + "/gone\n")
+        #expect(try runWithTTYStderr().contains("is gone; using the default account"))
+        w.pointer("relative\n")
+        #expect(try runWithTTYStderr().contains("ignoring an unexpected"))
     }
 }
 
@@ -260,11 +379,37 @@ import Testing
     @Test func uninstallRemovesOnlyShims() throws {
         let box = CLIBox()
         let env = box.env(realClaude: box.fakeBinary(box.top + "/r/claude"), realCodex: box.fakeBinary(box.top + "/r/codex"))
-        try CLIShim.installShims(env: env)
+        try CLIShim.installShims(env: env, path: "")
         box.write(env.shim(.codex), "#!/bin/sh\necho mine\n", mode: 0o755)
         CLIShim.uninstallShims(env: env)
         #expect(!FS.exists(URL(fileURLWithPath: env.shim(.claude))))
         #expect(FS.exists(URL(fileURLWithPath: env.shim(.codex))))
+    }
+
+    // P1 Finding #1: relative PATH entries (`.`, `bin`, `../...`) must never be frozen into shims.
+    @Test func findRealBinaryIgnoresRelativePathEntries() {
+        let box = CLIBox()
+        let rogue = box.fakeBinary(box.top + "/rogue/claude")
+        let rel = String(repeating: "../", count: 20) + String((box.top + "/rogue").dropFirst())
+        #expect(FS.exists(URL(fileURLWithPath: rel + "/claude")) && rogue.hasPrefix("/"))
+        #expect(CLIShim.findRealBinary(.claude, env: box.env, path: ".::bin:" + rel) == nil)
+    }
+
+    // Finding #11: a directory named `claude` must never throw NSFileHandleOperationException or match.
+    @Test func directoriesNamedLikeBinariesAreIgnoredWithoutCrashing() {
+        let box = CLIBox()
+        box.mkdir(box.top + "/dirbin/claude")
+        chmod(box.top + "/dirbin/claude", 0o755)
+        #expect(!CLIShim.isShim(box.top + "/dirbin/claude"))
+        #expect(CLIShim.realBinary(ofShim: box.top + "/dirbin/claude") == nil)
+        #expect(CLIShim.findRealBinary(.claude, env: box.env, path: box.top + "/dirbin") == nil)
+    }
+
+    @Test func fallbackSearchDirsFindFinderLaunchedBinaries() {
+        let box = CLIBox()
+        box.fakeBinary(box.top + "/hb/codex")
+        let env = CLIEnv(home: box.home, fallbackSearchDirs: [box.top + "/hb"])
+        #expect(CLIShim.findRealBinary(.codex, env: env, path: "/usr/bin:/bin") == box.top + "/hb/codex")
     }
 }
 
@@ -372,12 +517,37 @@ import Testing
     }
 
     @Test func rcStates() {
-        let b = CLIShim.block(CLIEnv(home: "/h"))
+        let b = CLIShim.block(CLIEnv(home: "/h", fallbackSearchDirs: []))
         #expect(CLIShim.rcState("") == .absent)
         #expect(CLIShim.rcState("export A=1\n") == .absent)
         #expect(CLIShim.rcState(b) == .last)
         #expect(CLIShim.rcState("x\n" + b + "\n\n") == .last)
         #expect(CLIShim.rcState("x\n" + b + "y\n") == .notLast)
+        #expect(CLIShim.rcState("x\n" + b + "y\n" + b) == .notLast)
+        #expect(CLIShim.rcState(CLIShim.rcBegin + "\n" + b) == .malformed)
+        #expect(CLIShim.rcState(CLIShim.rcBegin + "\n") == .malformed)
+    }
+
+    // Finding #15: dangling symlink rc is refused without creating or clobbering the target; validateUninstallRC is atomic.
+    @Test func danglingSymlinkRCIsRefusedAndValidateUninstallRCRejectsBrokenSecondFile() throws {
+        let box = CLIBox()
+        let target = box.top + "/missing-dir/zshrc"
+        let link = box.home + "/.zshrc"
+        box.symlink(link, to: target)
+        #expect(throws: (any Error).self) { try CLIShim.installRC(link, env: box.env) }
+        #expect(throws: (any Error).self) { try CLIShim.uninstallRC(link) }
+        #expect(box.isLink(link))
+        #expect(!FS.exists(URL(fileURLWithPath: target)))
+
+        let box2 = CLIBox()
+        let good = box2.home + "/.zshrc"
+        let broken = box2.home + "/.bashrc"
+        box2.write(good, "export A=1\n")
+        try CLIShim.installRC(good, env: box2.env)
+        let goodBefore = box2.read(good)!
+        box2.write(broken, CLIShim.rcBegin + "\n")
+        #expect(throws: (any Error).self) { try CLIShim.validateUninstallRC([good, broken]) }
+        #expect(box2.read(good) == goodBefore)
     }
 
     // Review finding 1: only "does not exist" is an empty file.
