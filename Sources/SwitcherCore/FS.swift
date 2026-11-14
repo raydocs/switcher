@@ -23,6 +23,7 @@ public enum FS {
     /// A folder only this user can read.
     public static func makePrivateDir(_ url: URL) throws {
         try fm.createDirectory(at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        if isDirectory(url) { _ = chmod(url.path, 0o700) }
     }
 
     /// Write `data` to `url` atomically with mode 0600.
@@ -136,8 +137,8 @@ public final class FileLock {
     private let fd: Int32
 
     public init(_ url: URL, timeout: TimeInterval) throws {
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        fd = open(url.path, O_RDWR | O_CREAT, 0o600)
+        try FS.makePrivateDir(url.deletingLastPathComponent())
+        fd = open(url.path, O_RDWR | O_CREAT | O_NOFOLLOW, 0o600)
         guard fd >= 0 else { throw POSIXError.current("opening \(url.path)") }
         let deadline = Date().addingTimeInterval(timeout)
         while flock(fd, LOCK_EX | LOCK_NB) != 0 {

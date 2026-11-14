@@ -13,7 +13,7 @@ APP="dist/Switcher.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN/SwitcherApp" "$APP/Contents/MacOS/Switcher"
-cp "$BIN/switcher" "$APP/Contents/Resources/switcher"
+cp "$BIN/switcher" "$APP/Contents/MacOS/switcher"
 [ -f assets/AppIcon.icns ] && cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -36,5 +36,6 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+codesign --force --sign "${SIGN_ID:--}" --options runtime "$APP/Contents/MacOS/switcher"
 codesign --force --sign "${SIGN_ID:--}" --options runtime "$APP"
 echo "$APP"

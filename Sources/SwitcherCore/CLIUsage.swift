@@ -30,23 +30,59 @@ public enum CLIUsage {
     public static let staleAfter: TimeInterval = 30 * 60
 
     /// The 5-hour and weekly windows, and Codex's unprefixed ones (`300m`, …). Model-scoped windows
-    /// (`week (Opus)`) and other Codex buckets (`<name> 5h`) are not main windows.
+    /// (`week (Opus)`) and other Codex/Antigravity buckets (`<name> 5h`, `Claude week`, …) are not main windows.
     public static func isMain(_ w: CLIQuotaWindow) -> Bool {
         if w.label == "5h" || w.label == "week" { return true }
-        return w.label.hasSuffix("m") && Int(w.label.dropLast()) != nil
+        guard w.label.hasSuffix("m"), let m = Int(w.label.dropLast()) else { return false }
+        return m > 0
     }
 
     /// How long a window lasts, from its label.
     public static func duration(_ w: CLIQuotaWindow) -> TimeInterval? {
-        let last = w.label.split(separator: " ").last.map(String.init) ?? w.label
+        let trimmed = w.label.trimmingCharacters(in: .whitespaces)
+        let last = trimmed.split(separator: " ").last.map(String.init) ?? trimmed
         switch last {
         case "5h": return 5 * 3600
         case "week": return 7 * 86400
         default:
-            if w.label.hasPrefix("week") { return 7 * 86400 }
+            if trimmed.hasPrefix("week") { return 7 * 86400 }
             guard last.hasSuffix("m"), let m = Int(last.dropLast()), m > 0 else { return nil }
-            return TimeInterval(m * 60)
+            return TimeInterval(m) * 60
         }
+    }
+
+    /// A non-main quota window split into its bucket/model name and window suffix.
+    public struct ScopeParts: Equatable, Sendable {
+        public var name: String
+        public var window: String?
+        /// True only for Claude's `"week (<model>)"` scoped weekly windows.
+        public var isWeeklyModel: Bool
+
+        public init(name: String, window: String?, isWeeklyModel: Bool) {
+            self.name = name
+            self.window = window
+            self.isWeeklyModel = isWeeklyModel
+        }
+    }
+
+    /// Split a window label into its scope name and trailing main-window token (`"5h"`, `"week"`, `"<N>m"`),
+    /// keeping `"week (<model>)"` distinct from unparsed labels without fabricating a weekly window.
+    public static func scopeParts(_ label: String) -> ScopeParts {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return ScopeParts(name: "", window: nil, isWeeklyModel: false) }
+        if trimmed.hasPrefix("week ("), trimmed.hasSuffix(")") {
+            let scope = trimmed.dropFirst(6).dropLast().trimmingCharacters(in: .whitespacesAndNewlines)
+            return ScopeParts(name: scope.isEmpty ? "scoped" : scope, window: nil, isWeeklyModel: true)
+        }
+        guard let space = trimmed.lastIndex(of: " ") else {
+            return ScopeParts(name: trimmed, window: nil, isWeeklyModel: false)
+        }
+        let prefix = trimmed[..<space].trimmingCharacters(in: .whitespaces)
+        let suffix = String(trimmed[trimmed.index(after: space)...])
+        guard !prefix.isEmpty, isMain(CLIQuotaWindow(label: suffix, usedPercent: 0, resetsAt: nil)) else {
+            return ScopeParts(name: trimmed, window: nil, isWeeklyModel: false)
+        }
+        return ScopeParts(name: prefix, window: suffix, isWeeklyModel: false)
     }
 
     /// The windows as they stand now. A window whose reset time has passed is back to 0 % when
@@ -96,12 +132,16 @@ public enum CLIUsage {
     /// prompt or turn. They are shared by every account (links into the default folder), so this
     /// is when any account last ran. Only `stat`s; nothing is read.
     /// Claude: `history.jsonl`. Codex: `history.jsonl` and the newest session file of today and
-    /// yesterday (`sessions/YYYY/MM/DD`, local dates).
+    /// yesterday (`sessions/YYYY/MM/DD`, local dates). Antigravity CLI: `antigravity-cli/conversations`
+    /// and `antigravity-cli/cache/projects.json`.
     public static func lastActivity(_ kind: CLIKind, env: CLIEnv, now: Date = Date()) -> Date? {
         let root = env.defaultFolder(kind)
         var dates: [Date] = []
-        if let d = FS.mtime(URL(fileURLWithPath: root + "/history.jsonl")) { dates.append(d) }
-        if kind == .codex {
+        switch kind {
+        case .claude:
+            if let d = FS.mtime(URL(fileURLWithPath: root + "/history.jsonl")) { dates.append(d) }
+        case .codex:
+            if let d = FS.mtime(URL(fileURLWithPath: root + "/history.jsonl")) { dates.append(d) }
             let cal = Calendar.current
             for back in [0, -1] {
                 guard let day = cal.date(byAdding: .day, value: back, to: now) else { continue }
@@ -110,6 +150,20 @@ public enum CLIUsage {
                 guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { continue }
                 for n in names where n.hasSuffix(".jsonl") {
                     if let d = FS.mtime(URL(fileURLWithPath: dir + "/" + n)) { dates.append(d) }
+                }
+            }
+        case .agy:
+            var folders = [root]
+            let active = CLIProfiles(env: env).active(.agy)
+            if !active.isDefault { folders.append(active.path) }
+            for folder in folders {
+                if let d = FS.mtime(URL(fileURLWithPath: folder + "/antigravity-cli/cache/projects.json")) { dates.append(d) }
+                let conv = folder + "/antigravity-cli/conversations"
+                if let d = FS.mtime(URL(fileURLWithPath: conv)) { dates.append(d) }
+                if let names = try? FileManager.default.contentsOfDirectory(atPath: conv) {
+                    for n in names where !n.hasPrefix(".") {
+                        if let d = FS.mtime(URL(fileURLWithPath: conv + "/" + n)) { dates.append(d) }
+                    }
                 }
             }
         }
@@ -162,9 +216,10 @@ public enum CLIRefreshPlan {
     }
 
     /// Still waiting out the backoff of earlier failures: no automatic read of any kind until then.
-    public static func backingOff(lastAttempt: Date?, failures: Int, now: Date) -> Bool {
+    public static func backingOff(lastAttempt: Date?, failures: Int, lowPower: Bool = false, now: Date) -> Bool {
         guard let lastAttempt, failures > 0 else { return false }
-        return now.timeIntervalSince(lastAttempt) < backoff(failures: failures)
+        let elapsed = max(0, now.timeIntervalSince(lastAttempt))
+        return elapsed < backoff(failures: failures) * (lowPower ? 2 : 1)
     }
 
     public static func due(_ accounts: [CLIRefreshState], activeStatus: CLIHeadroom.Status, lastActivity: Date?,
@@ -174,10 +229,10 @@ public enum CLIRefreshPlan {
             guard a.signedIn else { return false }
             if let last = a.lastAttempt {
                 let wait = max(minSpacing * factor, backoff(failures: a.failures) * factor)
-                if now.timeIntervalSince(last) < wait { return false }
+                if max(0, now.timeIntervalSince(last)) < wait { return false }
             }
             guard let seen = a.observedAt else { return a.isActive || activeStatus == .low || activeStatus == .out }
-            let old = now.timeIntervalSince(seen) >= maxAge * factor
+            let old = max(0, now.timeIntervalSince(seen)) >= maxAge * factor
             if a.isActive { return old || (lastActivity.map { $0 > seen } ?? false) }
             return (activeStatus == .low || activeStatus == .out) && old
         }.map(\.id)
@@ -231,24 +286,40 @@ public struct CLIUsageReport: Codable, Equatable, Sendable {
     public var generatedAt: Date
     public var clis: [CLI]
 
-    /// Built from the cache. `signedIn`: nil to skip the sign-in check (no keychain); then an
-    /// account counts as signed in when it has an identity. `errors`: the newest failed read per
-    /// profile id, if any.
+    /// Built from the cache. `signedIn`: nil to skip the sign-in check (`--cached` never asks the
+    /// keychain); file-backed profiles still check their local credential file. `errors`: the newest
+    /// failed read per profile id, if any.
     public static func build(profiles: CLIProfiles, kinds: [CLIKind] = CLIKind.allCases, now: Date = Date(),
-                             signedIn: ((CLIProfile) -> Bool)? = nil, errors: [String: String] = [:]) -> CLIUsageReport {
+                             keychain: CLIKeychain? = nil, signedIn: ((CLIProfile) -> Bool)? = nil,
+                             errors: [String: String] = [:]) -> CLIUsageReport {
         let cache = CLIQuotaCache(env: profiles.env)
         let clis = kinds.map { kind -> CLI in
             let activity = CLIUsage.lastActivity(kind, env: profiles.env, now: now)
             let active = profiles.active(kind).path
             var heads: [(id: String, headroom: CLIHeadroom)] = []
             let accounts = profiles.list(kind).enumerated().map { i, p -> Account in
-                let identity = profiles.identity(p)
+                let identity = profiles.identity(p, keychain: keychain)
                 let checked = signedIn?(p)
-                let isIn = checked ?? (identity != nil)
+                let isIn: Bool
+                if let checked {
+                    isIn = checked
+                } else if let keychain {
+                    let s = profiles.signIn(p, keychain: keychain)
+                    isIn = s.state == .signedIn && (s.refreshExpiresAt.map { $0 > now } ?? true)
+                } else {
+                    switch p.kind {
+                    case .claude:
+                        isIn = identity != nil
+                    case .codex:
+                        isIn = profiles.signIn(p, keychain: MemoryCLIKeychain()).state == .signedIn
+                    case .agy:
+                        isIn = p.isDefault ? (identity != nil) : (profiles.signIn(p, keychain: MemoryCLIKeychain()).state == .signedIn)
+                    }
+                }
                 let quota = isIn ? cache.quota(for: p, accountKey: identity?.accountKey) : nil
                 let head = CLIUsage.headroom(quota, signedIn: isIn, now: now, lastActivity: activity)
                 let isActive = p.path == active
-                if !isActive { heads.append((p.name, head)) }
+                heads.append((p.name, head))
                 let windows = (quota?.windows ?? []).compactMap { read -> Window? in
                     guard let w = CLIUsage.current(read, now: now, lastActivity: activity) else { return nil }
                     return Window(label: w.label, usedPercent: w.usedPercent, resetsAt: w.resetsAt,

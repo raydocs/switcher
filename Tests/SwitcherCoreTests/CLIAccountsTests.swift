@@ -40,12 +40,17 @@ import Testing
         box.write(p.path + "/auth.json", box.json(["auth_mode": "chatgpt", "tokens": ["id_token": jwt, "refresh_token": "r", "access_token": "a", "account_id": "acct-1"]]))
         let id = profiles.identity(p)
         #expect(id == CLIIdentity(email: "codex@example.com", organization: nil, plan: "plus", accountKey: "acct-1"))
-        // Without tokens.account_id the claim is used.
-        box.write(p.path + "/auth.json", box.json(["tokens": ["id_token": jwt]]))
+        // Without tokens.account_id the claim is used (when refresh_token is still present).
+        box.write(p.path + "/auth.json", box.json(["tokens": ["id_token": jwt, "refresh_token": "r"]]))
         #expect(profiles.identity(p)?.accountKey == "acct-from-claims")
         // Default profile reads ~/.codex/auth.json.
-        box.write(box.home + "/.codex/auth.json", box.json(["tokens": ["id_token": jwt]]))
+        box.write(box.home + "/.codex/auth.json", box.json(["tokens": ["id_token": jwt, "refresh_token": "r"]]))
         #expect(profiles.identity(profiles.defaultProfile(.codex))?.email == "codex@example.com")
+        // Missing or empty refresh_token means signed out: stale id_token claims are ignored.
+        box.write(p.path + "/auth.json", box.json(["tokens": ["id_token": jwt]]))
+        #expect(profiles.identity(p) == nil)
+        box.write(p.path + "/auth.json", box.json(["tokens": ["id_token": jwt, "refresh_token": "  "]]))
+        #expect(profiles.identity(p) == nil)
     }
 
     @Test func codexIdentityToleratesJunk() {
@@ -69,6 +74,50 @@ import Testing
         #expect(decoded?["email"] as? String == "a?b>c@example.com")
         #expect(decoded?["name"] as? String == "\u{e9}\u{e9}\u{e9}~~~")
         #expect(CLIProfiles.jwtClaims("one-part") == nil)
+    }
+
+    @Test func decodeSecurityOutputHandlesHexUTF8AndLeavesPlainStringsAlone() {
+        let json = "{\"claudeAiOauth\":{\"accessToken\":\"tok\",\"org\":\"Caf\u{00e9}\"}}\n"
+        let hex = Data(json.utf8).map { String(format: "%02x", $0) }.joined()
+        #expect(LiveCLIKeychain.decodeSecurityOutput(hex) == json)
+        #expect(LiveCLIKeychain.decodeSecurityOutput("{\"claudeAiOauth\":{}}") == "{\"claudeAiOauth\":{}}")
+        #expect(LiveCLIKeychain.decodeSecurityOutput("go-keyring-base64:e30=") == "go-keyring-base64:e30=")
+    }
+
+    @Test func agyIdentitySignInAndCredentialFingerprintIsolateNamedProfiles() throws {
+        let box = CLIBox()
+        let profiles = CLIProfiles(env: box.env)
+        let keychain = MemoryCLIKeychain()
+        let def = profiles.defaultProfile(.agy)
+        let named = try profiles.add(.agy, name: "work")
+
+        let defPayload = box.json([
+            "token": ["access_token": "acc-def", "refresh_token": "ref-def", "expiry": "2026-11-15T10:00:00Z"],
+            "id_token_email": "Default@Example.com",
+        ])
+        keychain.items["gemini/antigravity"] = "go-keyring-base64:" + Data(defPayload.utf8).base64EncodedString()
+
+        // Default reads Keychain; named profile ignores Keychain completely when its own file is absent.
+        #expect(profiles.signIn(def, keychain: keychain).state == .signedIn)
+        #expect(profiles.identity(def, keychain: keychain) == CLIIdentity(email: "Default@Example.com", organization: nil, plan: nil, accountKey: "default@example.com"))
+        #expect(profiles.signIn(named, keychain: keychain).state == .signedOut)
+        #expect(profiles.identity(named, keychain: keychain) == nil)
+
+        // Default email falls back to ~/.gemini/jetski-standalone-oauth-token when Keychain omits id_token_email.
+        let barePayload = box.json(["token": ["refresh_token": "ref-def"]])
+        let hex = Data(barePayload.utf8).map { String(format: "%02x", $0) }.joined()
+        keychain.items["gemini/antigravity"] = "go-keyring-encoded:" + hex
+        box.write(box.home + "/.gemini/jetski-standalone-oauth-token", box.json(["id_token_email": "fallback@example.com"]))
+        #expect(profiles.identity(def, keychain: keychain)?.email == "fallback@example.com")
+
+        // Named profile reads its own file; fingerprint hashes refresh token without leaking secrets.
+        let namedPayload = box.json(["token": ["access_token": "acc-work", "refresh_token": "ref-work-SECRET"]])
+        box.write(named.path + "/antigravity-cli/antigravity-oauth-token", namedPayload)
+        #expect(profiles.signIn(named, keychain: keychain).state == .signedIn)
+        let fpNamed = try #require(profiles.credentialFingerprint(named, keychain: keychain))
+        let fpDef = try #require(profiles.credentialFingerprint(def, keychain: keychain))
+        #expect(fpNamed != fpDef)
+        #expect(!fpNamed.contains("ref-work-SECRET"))
     }
 }
 
@@ -133,6 +182,8 @@ import Testing
         #expect(profiles.signIn(p, keychain: keychain).state == .signedOut)
         keychain.items[service] = box.json(["claudeAiOauth": ["refreshToken": "r"]])
         #expect(profiles.signIn(p, keychain: keychain).state == .signedOut)
+        keychain.items[service] = box.json(["claudeAiOauth": ["accessToken": "   "]])
+        #expect(profiles.signIn(p, keychain: keychain).state == .signedOut)
         keychain.items[service] = box.json(["somethingElse": 1])
         #expect(profiles.signIn(p, keychain: keychain).state == .signedOut)
     }
@@ -163,8 +214,12 @@ import Testing
         let p = CLIProfile(kind: .codex, name: "alt", path: box.env.profilesRoot(.codex) + "/alt", isDefault: false)
         box.write(p.path + "/auth.json", box.json(["OPENAI_API_KEY": "sk-key"]))
         #expect(profiles.signIn(p, keychain: MemoryCLIKeychain()).state == .other("apikey"))
+        box.write(p.path + "/auth.json", box.json(["OPENAI_API_KEY": "sk-key", "tokens": NSNull()]))
+        #expect(profiles.signIn(p, keychain: MemoryCLIKeychain()).state == .other("apikey"))
         box.write(p.path + "/auth.json", box.json(["auth_mode": "apikey", "OPENAI_API_KEY": "sk-key"]))
         #expect(profiles.signIn(p, keychain: MemoryCLIKeychain()).state == .other("apikey"))
+        box.write(p.path + "/auth.json", box.json(["auth_mode": "api_key", "OPENAI_API_KEY": "sk-key"]))
+        #expect(profiles.signIn(p, keychain: MemoryCLIKeychain()).state == .other("api_key"))
         // ChatGPT mode that lost its refresh token is signed out.
         box.write(p.path + "/auth.json", box.json(["auth_mode": "chatgpt", "tokens": ["access_token": "a"]]))
         #expect(profiles.signIn(p, keychain: MemoryCLIKeychain()).state == .signedOut)
@@ -176,8 +231,10 @@ import Testing
         let p = CLIProfile(kind: .codex, name: "alt", path: box.env.profilesRoot(.codex) + "/alt", isDefault: false)
         for auth: [String: Any] in [
             [:],
+            ["auth_mode": ""],
             ["OPENAI_API_KEY": NSNull()],
             ["auth_mode": "apikey", "OPENAI_API_KEY": ""],
+            ["auth_mode": "api_key", "OPENAI_API_KEY": "   "],
             ["auth_mode": "chatgpt", "tokens": ["access_token": "a", "refresh_token": ""]],
         ] {
             box.write(p.path + "/auth.json", box.json(auth))
@@ -207,11 +264,18 @@ import Testing
         CLIBox().json(["auth_mode": "chatgpt", "tokens": ["id_token": fakeJWT(["email": "x@example.com"]), "refresh_token": secret, "access_token": secret + "-a"]])
     }
 
-    /// A clean setup: both shims installed, rc block last, default and `work` profiles signed in.
+    func agyJSON() -> String {
+        CLIBox().json(["token": ["access_token": secret + "-a", "refresh_token": secret + "-r"], "id_token_email": "agy@example.com"])
+    }
+
+    /// A clean setup: all shims installed, rc block last, default and `work` profiles signed in.
     func clean() throws -> Setup {
         let box = CLIBox()
-        let env = box.env(realClaude: box.fakeBinary(box.top + "/real/claude"), realCodex: box.fakeBinary(box.top + "/real/codex"))
-        try CLIShim.installShims(env: env)
+        let env = box.env(
+            realClaude: box.fakeBinary(box.top + "/real/claude"),
+            realCodex: box.fakeBinary(box.top + "/real/codex"),
+            realAgy: box.fakeBinary(box.top + "/real/agy"))
+        try CLIShim.installShims(env: env, path: "")
         let s = Setup(box: box, env: env, profiles: CLIProfiles(env: env), rc: box.home + "/.zshrc")
         box.write(s.rc, "export A=1\n")
         try CLIShim.installRC(s.rc, env: env)
@@ -220,6 +284,7 @@ import Testing
         s.keychain.items["Claude Code-credentials"] = claudeJSON()
         s.keychain.items[claudeKeychainService(configDir: work.path)] = claudeJSON()
         box.write(env.defaultFolder(.codex) + "/auth.json", codexJSON())
+        s.keychain.items["gemini/antigravity"] = agyJSON()
         return s
     }
 
@@ -255,13 +320,18 @@ import Testing
         let s = try clean()
         let shim = s.env.shim(.claude)
         let f = doctor(s) { cmd in
-            cmd == "claude" ? [("zsh -lc", shim), ("zsh -ic", "/usr/local/bin/claude"), ("zsh -c", nil)] : [("zsh -lc", s.env.shim(.codex))]
+            if cmd == "claude" {
+                return [("zsh -lc", shim), ("zsh -ic", "/usr/local/bin/claude"), ("zsh -c", nil)]
+            }
+            let kind = CLIKind.allCases.first { $0.command == cmd }!
+            return [("zsh -lc", s.env.shim(kind))]
         }
         let warns = messages(f, .warn)
         #expect(warns.contains { $0.contains("`zsh -ic` finds /usr/local/bin/claude before the shim") })
         #expect(warns.contains { $0.contains("`zsh -c` finds nothing before the shim") })
         #expect(!warns.contains { $0.contains("zsh -lc") })
         #expect(!warns.contains { $0.contains("codex:") })
+        #expect(!warns.contains { $0.contains("agy:") })
     }
 
     @Test func rcBlockNotLastAndAbsent() throws {
@@ -280,11 +350,33 @@ import Testing
         s.box.write(s.env.pointer(.claude), s.env.profilesRoot(.claude) + "/gone/\n")
         let f = doctor(s)
         #expect(messages(f, .warn).contains { $0.contains("Claude Code: the pointer names") && $0.contains("not a valid profile folder") })
+        // A valid path whose folder was deleted gets a distinct missing-folder warning.
+        s.box.write(s.env.pointer(.claude), s.env.profilesRoot(.claude) + "/missing\n")
+        #expect(messages(doctor(s), .warn).contains { $0.contains("points to a missing profile folder") })
         // A good pointer, and `default`, report nothing.
         s.box.write(s.env.pointer(.claude), "default\n")
         s.box.write(s.env.pointer(.codex), "default\n")
-        #expect(!messages(doctor(s)).contains { $0.contains("the pointer names") })
+        s.box.write(s.env.pointer(.agy), "default\n")
+        #expect(!messages(doctor(s)).contains { $0.contains("the pointer") })
         #expect(doctor(s).contains { $0.level == .ok })
+    }
+
+    @Test func malformedCredentialsBrokenRCAndMissingAgyMarkerAreReported() throws {
+        let s = try clean()
+        let work = s.profiles.resolve(.claude, "work")!
+        s.keychain.items[claudeKeychainService(configDir: work.path)] = nil
+        s.box.write(work.path + "/.credentials.json", "{corrupt")
+        let agyWork = try s.profiles.add(.agy, name: "work")
+        s.box.write(agyWork.path + "/antigravity-cli/antigravity-oauth-token", agyJSON())
+        unlink(agyWork.path + "/antigravity-cli/cache/antigravity-keyring-unavailable")
+        let brokenRC = s.box.home + "/.bashrc"
+        s.box.write(brokenRC, CLIShim.rcBegin + "\n")
+        let f = doctor(s, rcFiles: [s.rc, brokenRC])
+        let problems = messages(f, .problem)
+        let warns = messages(f, .warn)
+        #expect(problems.contains { $0.contains("Claude Code work:") && $0.contains("is not valid JSON") })
+        #expect(problems.contains { $0.contains("incomplete or duplicated Switcher lines") })
+        #expect(warns.contains { $0.contains("Antigravity CLI work: keyring-isolation marker is missing") })
     }
 
     @Test func skippedFoldersAreNoted() throws {

@@ -1,11 +1,11 @@
 import SwiftUI
 import SwitcherCore
 
-// Claude Code and Codex in the terminal, under the desktop apps in the popover. Choosing an account
-// here only changes which one new `claude` / `codex` processes use: nothing quits, running sessions
-// keep theirs, and the desktop apps are never touched.
+// Claude Code, Codex and Antigravity CLI in the terminal, under the desktop apps in the popover.
+// Choosing an account here only changes which one new `claude` / `codex` / `agy` processes use:
+// nothing quits, running sessions keep theirs, and the desktop apps are never touched.
 
-/// One Claude Code or Codex account folder, as the popover shows it.
+/// One Claude Code, Codex or Antigravity CLI account folder, as the popover shows it.
 struct CLIRow: Equatable, Identifiable {
     enum SignIn: Equatable {
         /// Signed in. `until`: when the sign-in runs out unless the CLI is used before then.
@@ -14,10 +14,12 @@ struct CLIRow: Equatable, Identifiable {
         /// Signed in another way (an API key).
         case other(String)
 
-        var isGood: Bool {
-            if case .good = self { return true }
+        func isGood(at now: Date) -> Bool {
+            if case .good(let until) = self { return until.map { $0 > now } ?? true }
             return false
         }
+
+        var isGood: Bool { isGood(at: Date()) }
     }
 
     var kind: CLIKind
@@ -39,6 +41,9 @@ struct CLIRow: Equatable, Identifiable {
     var headroom: CLIHeadroom = .unknown
     /// The account to go to: the most room, shown while the active one is low or out.
     var isBest = false
+    /// Non-secret account identifier and credential digest for clearing stale quota errors.
+    var accountKey: String? = nil
+    var credentialFingerprint: String? = nil
 
     var id: String { "\(kind.rawValue):\(name)" }
     /// The account in a sentence: its own name, or who the default account is.
@@ -64,12 +69,14 @@ struct CLIBoard: Equatable, Identifiable {
     /// Nothing to show: the CLI is not here and nobody is signed in to it.
     var isAbsent: Bool { !commandFound && !rows.contains { $0.signIn != .out || !$0.isDefault } }
 
-    /// `rows` with `isBest` on the account with the most room, only while the active one is low or out.
+    /// `rows` with `isBest` on the account with the most room, only while the active one is low or out
+    /// and the candidate strictly improves on the active account's room.
     static func markingBest(_ rows: [CLIRow]) -> [CLIRow] {
         var rows = rows
         guard let active = rows.first(where: \.isActive), active.headroom.status == .low || active.headroom.status == .out,
               let best = CLIUsage.best(rows.filter { !$0.isActive }.map { ($0.id, $0.headroom) }),
-              let i = rows.firstIndex(where: { $0.id == best }) else { return rows }
+              let i = rows.firstIndex(where: { $0.id == best }),
+              (rows[i].headroom.percentLeft ?? 0) > (active.headroom.percentLeft ?? 0) else { return rows }
         rows[i].isBest = true
         return rows
     }
@@ -112,6 +119,24 @@ extension L {
           "暂时无法续期 \(who) 的登录。用该账号运行一次 claude，或半小时后再试。")
     }
 
+    static func cliRemoved(_ who: String) -> String {
+        t("Removed \(who) and moved its folder to the Trash.", "已移除 \(who)，并将文件夹移到废纸篓。")
+    }
+
+    static func cliRemovedKeychainLeft(_ who: String) -> String {
+        t("Moved \(who)'s folder to the Trash. Its Keychain entry could not be signed out automatically.",
+          "已将 \(who) 的文件夹移到废纸篓；钥匙串里的登录未能自动退出。")
+    }
+
+    static var cliTerminalOpenFailed: String {
+        t("Terminal could not be opened for the sign-in.", "无法打开终端进行登录。")
+    }
+
+    static var cliRemoveExplained: String {
+        t("Switcher signs this account out and moves its folder to the Trash. Shared sessions and settings stay.",
+          "Switcher 会退出这个账号并将文件夹移到废纸篓，共享的会话和设置会保留。")
+    }
+
     /// "Dec 3", with the year when it is not this one.
     static func day(_ date: Date, now: Date = Date()) -> String {
         let calendar = Calendar.current
@@ -128,37 +153,41 @@ extension L {
         }
     }
 
-    /// A model's own weekly window, named beside the Week meter: "week (Opus)" is "Opus" there.
-    static func cliScope(_ label: String) -> String { cliScopeParts(label).name }
-
     /// A window outside the main ones, split into whose limit it is and how long it runs.
-    /// Claude's "week (Opus)" is ("Opus", nil): the window is the week, said by the meter beside it.
-    /// Codex's "<limit name> <window>" is (limit name, "5h" / "week" / "45m"); the name may hold spaces.
-    static func cliScopeParts(_ label: String) -> (name: String, window: String?) {
-        if label.hasPrefix("week ("), label.hasSuffix(")") {
-            let scope = String(label.dropFirst(6).dropLast())
-            return (scope == "scoped" ? t("Model", "模型") : scope, nil)
+    /// Claude's "week (Opus)" is ("Opus", nil, isWeeklyModel: true).
+    /// Codex's / Antigravity's "<limit name> <window>" is (limit name, "5h" / "week" / "45m", false).
+    static func cliScopeParts(_ label: String) -> CLIUsage.ScopeParts {
+        var parts = CLIUsage.scopeParts(label)
+        if parts.name.isEmpty {
+            parts.name = t("Limit", "额度")
+        } else if parts.isWeeklyModel, parts.name == "scoped" {
+            parts.name = t("Model", "模型")
+        } else if !parts.isWeeklyModel, parts.window == nil, !parts.name.contains(" ") {
+            parts.name = cliWindow(parts.name)
         }
-        guard let space = label.lastIndex(of: " ") else { return (cliWindow(label), nil) }
-        let window = String(label[label.index(after: space)...])
-        guard CLIUsage.isMain(CLIQuotaWindow(label: window, usedPercent: 0, resetsAt: nil)) else { return (label, nil) }
-        return (String(label[..<space]), window)
+        return parts
     }
 
     /// The tooltip of a separate limit, with its whole name.
-    static func cliScopeHelp(_ parts: (name: String, window: String?), percent: Int) -> String {
-        guard let window = parts.window else {
+    static func cliScopeHelp(_ parts: CLIUsage.ScopeParts, percent: Int) -> String {
+        if parts.isWeeklyModel {
             return t("\(parts.name)'s own weekly limit is \(percent)% used.", "\(parts.name) 单独的每周额度已用 \(percent)%。")
         }
-        return t("The separate limit “\(parts.name)” (\(cliWindow(window))) is \(percent)% used.",
-                 "单独的额度「\(parts.name)」（\(cliWindow(window))）已用 \(percent)%。")
+        if let window = parts.window {
+            return t("The separate limit “\(parts.name)” (\(cliWindow(window))) is \(percent)% used.",
+                     "单独的额度「\(parts.name)」（\(cliWindow(window))）已用 \(percent)%。")
+        }
+        return t("The separate limit “\(parts.name)” is \(percent)% used.",
+                 "单独的额度「\(parts.name)」已用 \(percent)%。")
     }
 
     /// Any window's full name, for tooltips and VoiceOver: "Spark (45m)", "Opus (Week)".
     static func cliWindowFull(_ label: String) -> String {
         if CLIUsage.isMain(CLIQuotaWindow(label: label, usedPercent: 0, resetsAt: nil)) { return cliWindow(label) }
-        let (name, window) = cliScopeParts(label)
-        return "\(name) (\(cliWindow(window ?? "week")))"
+        let parts = cliScopeParts(label)
+        if parts.isWeeklyModel { return "\(parts.name) (\(week))" }
+        if let window = parts.window { return "\(parts.name) (\(cliWindow(window)))" }
+        return parts.name
     }
 }
 
@@ -179,6 +208,7 @@ struct CLISection: View {
     private let staged: Staged
     @AppStorage("cliExpanded") private var stored = ""
     @State private var adding: CLIKind?
+    @State private var removing: String?
     @State private var groupsHeight: CGFloat = 0
     @Environment(\.staticRender) private var staticRender
 
@@ -210,8 +240,8 @@ struct CLISection: View {
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, Metrics.rowH)
                 .help(L.t(
-                    "Accounts for the claude and codex commands, apart from the desktop apps. The one you choose is used by sessions you start afterwards: running sessions keep theirs and nothing quits.",
-                    "claude 和 codex 命令使用的账号，与桌面应用无关。选用的账号只用于之后启动的会话：正在运行的会话保持不变，也不会退出任何程序。"))
+                    "Accounts for the claude, codex and agy commands, apart from the desktop apps. The one you choose is used by sessions you start afterwards: running sessions keep theirs and nothing quits.",
+                    "claude、codex 和 agy 命令使用的账号，与桌面应用无关。选用的账号只用于之后启动的会话：正在运行的会话保持不变，也不会退出任何程序。"))
                 if needsInstall {
                     installNotice
                 } else if model.cliJustInstalled {
@@ -246,8 +276,8 @@ struct CLISection: View {
                 .buttonStyle(SoftButtonStyle(kind: .tinted, compact: true))
                 .fixedSize()
                 .help(L.t(
-                    "Adds Switcher's launchers for claude and codex and one line at the end of ~/.zshrc (and ~/.bashrc if you have one). Open a new terminal for it to take effect.",
-                    "加入 Switcher 的 claude 和 codex 启动器，并在 ~/.zshrc（以及已有的 ~/.bashrc）末尾加入一行。打开新的终端窗口后生效。"))
+                    "Adds Switcher's launchers for claude, codex and agy and one line at the end of ~/.zshrc (and ~/.bashrc if you have one). Open a new terminal for it to take effect.",
+                    "加入 Switcher 的 claude、codex 和 agy 启动器，并在 ~/.zshrc（以及已有的 ~/.bashrc）末尾加入一行。打开新的终端窗口后生效。"))
         }
         .padding(.horizontal, Metrics.rowH)
     }
@@ -262,15 +292,23 @@ struct CLISection: View {
 
     @ViewBuilder private func group(_ board: CLIBoard) -> some View {
         let open = expanded.contains(board.kind)
-        CLIGroupHeader(board: board, expanded: open, reading: model.cliReading.contains(board.kind)) { toggle(board.kind) }
+        let reading = model.cliReading.contains(board.kind)
+        let canRefresh = open && !reading && board.rows.contains(where: \.signIn.isGood) && !staticRender
+        CLIGroupHeader(board: board, expanded: open, reading: reading,
+                       onRefresh: canRefresh ? { model.refreshCLIUsage(board.kind) } : nil) {
+            toggle(board.kind)
+        }
         if open {
             if !board.commandFound {
                 Note(symbol: "info.circle", text: L.cliNotFound(board.kind))
                     .padding(.leading, Metrics.rowH + Metrics.avatar + Metrics.avatarGap)
                     .padding(.vertical, 2)
             }
-            ForEach(board.rows) { row in
-                CLIRowView(model: model, row: row, forcedHover: staged.hover == row.id)
+            let visibleRows = board.rows.filter { row in
+                !(model.cliSignInCreatedNow.contains(board.kind) && model.cliSigningIn[board.kind] == row.name && row.signIn == .out)
+            }
+            ForEach(visibleRows) { row in
+                CLIRowView(model: model, row: row, removing: $removing, forcedHover: staged.hover == row.id)
             }
             if model.cliSigningIn[board.kind] != nil || adding == board.kind {
                 CLISigningInCard(model: model, kind: board.kind)
@@ -289,6 +327,7 @@ struct CLISection: View {
                     .padding(.vertical, 4)
                 }
                 .buttonStyle(QuietButtonStyle())
+                .disabled(model.cliStarting.contains(board.kind))
                 .font(.callout)
                 .help(L.t("Sign in to another \(board.kind.displayName) account in your browser",
                           "在浏览器里登录另一个 \(board.kind.displayName) 账号"))
@@ -314,6 +353,7 @@ struct CLIGroupHeader: View {
     let board: CLIBoard
     let expanded: Bool
     let reading: Bool
+    var onRefresh: (() -> Void)? = nil
     let toggle: () -> Void
 
     @State private var hovering = false
@@ -345,6 +385,8 @@ struct CLIGroupHeader: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .padding(.leading, -4)
+                } else if onRefresh != nil {
+                    Color.clear.frame(width: 18, height: 1)
                 }
                 Image(systemName: "chevron.right")
                     .font(.caption.weight(.semibold))
@@ -361,6 +403,19 @@ struct CLIGroupHeader: View {
         .focused($focused)
         .focusEffectDisabled()
         .onHover { hovering = $0 }
+        .overlay(alignment: .trailing) {
+            if let onRefresh {
+                Button(action: onRefresh) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.caption.weight(.medium))
+                        .frame(width: Metrics.controlCompact, height: Metrics.controlCompact)
+                }
+                .buttonStyle(QuietButtonStyle())
+                .padding(.trailing, Metrics.rowH + 16)
+                .help(L.t("Refresh \(board.kind.displayName) usage", "刷新 \(board.kind.displayName) 用量"))
+                .accessibilityLabel(L.t("Refresh \(board.kind.displayName) usage", "刷新 \(board.kind.displayName) 用量"))
+            }
+        }
         .accessibilityLabel(board.kind.displayName)
         .accessibilityValue(board.active?.label ?? "")
         .accessibilityHint(expanded ? L.t("Hide accounts", "收起账号") : L.t("Show accounts", "展开账号"))
@@ -374,10 +429,12 @@ struct CLIGroupHeader: View {
 struct CLIRowView: View {
     let model: AppModel
     let row: CLIRow
+    @Binding var removing: String?
     var forcedHover = false
 
     @State private var hovering = false
     @FocusState private var focused: Bool
+    @Environment(\.staticRender) private var staticRender
 
     private var command: String { row.kind.command }
 
@@ -388,18 +445,33 @@ struct CLIRowView: View {
 
     private var ranOut: Bool { timeLeft.map { $0 <= 0 } ?? false }
     private var needsSignIn: Bool { row.signIn == .out || ranOut }
-    private var usable: Bool { !row.isActive && !needsSignIn }
+    private var usable: Bool { !row.isActive && !needsSignIn && !isRemoving }
     private var highlighted: Bool { (hovering || forcedHover || focused) && usable }
     private var needsRenewal: Bool { row.quotaError == .signInExpired && !needsSignIn && row.kind == .claude }
+    private var isRemoving: Bool { model.cliRemoving.contains(row.id) }
+    private var canRemove: Bool { !row.isDefault && !isRemoving }
+    private var signInBusy: Bool { model.cliStarting.contains(row.kind) || model.cliSigningIn[row.kind] != nil }
 
-    /// The 5-hour and weekly windows, else the first two the CLI reports.
+    /// The main windows (short before weekly), else up to two non-warned windows if none are main.
     private var windows: [CLIQuotaWindow] {
         guard let all = row.quota?.windows, !needsSignIn else { return [] }
-        let main = ["5h", "week"].compactMap { label in all.first { $0.label == label } }
-        return main.isEmpty ? Array(all.prefix(2)) : main
+        let main = all.filter(CLIUsage.isMain).sorted {
+            (CLIUsage.duration($0) ?? .infinity) < (CLIUsage.duration($1) ?? .infinity)
+        }
+        if !main.isEmpty { return Array(main.prefix(2)) }
+        let warned = row.headroom.scopedWarning?.label
+        return Array(all.filter { $0.label != warned }.prefix(2))
     }
 
     var body: some View {
+        if removing == row.id {
+            removeConfirm
+        } else {
+            normalRow
+        }
+    }
+
+    private var normalRow: some View {
         VStack(alignment: .leading, spacing: 6) {
             Button {
                 model.useCLI(row)
@@ -448,6 +520,22 @@ struct CLIRowView: View {
                     .strokeBorder(Color.accentColor.opacity(0.7), lineWidth: 2)
             }
         }
+        .overlay(alignment: .topTrailing) {
+            if (hovering || forcedHover) && !row.isDefault && !isRemoving {
+                moreMenu
+                    .padding(.trailing, Metrics.rowH)
+                    .padding(.top, Metrics.rowV)
+            }
+        }
+        .contextMenu {
+            if !row.isDefault {
+                Button(L.t("Remove…", "移除…"), role: .destructive) { removing = row.id }
+                    .disabled(!canRemove)
+            }
+        }
+        .accessibilityAction(named: L.t("Remove…", "移除…")) {
+            if canRemove { removing = row.id }
+        }
         .onHover { hovering = $0 }
     }
 
@@ -463,38 +551,92 @@ struct CLIRowView: View {
                 Tag(text: plan.prefix(1).uppercased() + plan.dropFirst())
             }
             Spacer(minLength: 4)
-            if row.isBest, !highlighted {
-                // A status, so a coloured symbol and plain text, as "Claude is running" is.
-                HStack(spacing: 4) {
-                    Image(systemName: "arrow.right.circle.fill").foregroundStyle(.green)
-                    Text(L.t("Most room", "余量最多")).foregroundStyle(.secondary)
+            if isRemoving {
+                Spinner(size: 12)
+            } else {
+                if row.isBest, !highlighted {
+                    // A status, so a coloured symbol and plain text, as "Claude is running" is.
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.right.circle.fill").foregroundStyle(.green)
+                        Text(L.t("Most room", "余量最多")).foregroundStyle(.secondary)
+                    }
+                    .font(.subheadline.weight(.medium))
+                    .fixedSize()
+                    .help(L.t("The active account is nearly out; this one has the most usage left. Click to use it for new \(command) sessions.",
+                              "当前账号的额度快用完了，这个账号剩得最多。点它即可让新的 \(command) 会话使用它。"))
                 }
-                .font(.subheadline.weight(.medium))
-                .fixedSize()
-                .help(L.t("The active account is nearly out; this one has the most usage left. Click to use it for new \(command) sessions.",
-                          "当前账号的额度快用完了，这个账号剩得最多。点它即可让新的 \(command) 会话使用它。"))
-            }
-            if row.isActive {
-                HStack(spacing: 3) {
-                    Image(systemName: "checkmark").font(.caption2.weight(.bold))
-                    Text(L.t("Active", "使用中")).font(.subheadline.weight(.medium))
+                if row.isActive {
+                    HStack(spacing: 3) {
+                        Image(systemName: "checkmark").font(.caption2.weight(.bold))
+                        Text(L.t("Active", "使用中")).font(.subheadline.weight(.medium))
+                    }
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Fill.tint, in: Capsule())
+                    .fixedSize()
+                    .help(L.t("New \(command) sessions use this account", "新的 \(command) 会话使用这个账号"))
+                } else if highlighted {
+                    HStack(spacing: 3) {
+                        Text(L.t("Use", "选用"))
+                        Image(systemName: "arrow.right")
+                    }
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(Color.accentColor)
+                    .fixedSize()
                 }
-                .foregroundStyle(Color.accentColor)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 2)
-                .background(Fill.tint, in: Capsule())
-                .fixedSize()
-                .help(L.t("New \(command) sessions use this account", "新的 \(command) 会话使用这个账号"))
-            } else if highlighted {
-                HStack(spacing: 3) {
-                    Text(L.t("Use", "选用"))
-                    Image(systemName: "arrow.right")
+                if (hovering || forcedHover) && !row.isDefault {
+                    Color.clear.frame(width: 16, height: 1)
                 }
-                .font(.subheadline.weight(.medium))
-                .foregroundStyle(Color.accentColor)
-                .fixedSize()
             }
         }
+    }
+
+    @ViewBuilder private var moreMenu: some View {
+        let glyph = Image(systemName: "ellipsis.circle").font(.body).foregroundStyle(.secondary)
+        if staticRender {
+            glyph
+        } else {
+            Menu {
+                Button(L.t("Remove…", "移除…"), role: .destructive) { removing = row.id }
+                    .disabled(!canRemove)
+            } label: { glyph }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help(L.t("More", "更多"))
+        }
+    }
+
+    private var removeConfirm: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: Metrics.avatarGap) {
+                Avatar(label: "\(row.number)", seed: row.email ?? row.id)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(L.t("Remove \(row.label)?", "移除 \(row.label)？"))
+                        .font(.body.weight(.semibold))
+                        .lineLimit(2)
+                    Text(L.cliRemoveExplained)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            HStack(spacing: 6) {
+                Spacer()
+                Button(L.t("Cancel", "取消")) { removing = nil }
+                    .buttonStyle(SoftButtonStyle(compact: true))
+                    .keyboardShortcut(.cancelAction)
+                Button(L.t("Remove", "移除")) {
+                    model.removeCLIAccount(row)
+                    removing = nil
+                }
+                .buttonStyle(SoftButtonStyle(kind: .destructive, compact: true))
+            }
+        }
+        .padding(.horizontal, Metrics.rowH)
+        .padding(.vertical, Metrics.rowV)
+        .background(Fill.card, in: RoundedRectangle(cornerRadius: Metrics.radius, style: .continuous))
     }
 
     // MARK: Usage
@@ -647,9 +789,18 @@ struct CLIRowView: View {
 
     private var signInSteps: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Button(L.t("Sign In…", "登录…")) { model.signInCLI(row) }
-            .buttonStyle(SoftButtonStyle(kind: .tinted, compact: true))
-            .fixedSize()
+            HStack(spacing: 6) {
+                Button(L.t("Sign In…", "登录…")) { model.signInCLI(row) }
+                    .buttonStyle(SoftButtonStyle(kind: .tinted, compact: true))
+                    .disabled(signInBusy || isRemoving)
+                    .fixedSize()
+                if !row.isDefault {
+                    Button(L.t("Remove…", "移除…")) { removing = row.id }
+                        .buttonStyle(SoftButtonStyle(compact: true))
+                        .disabled(!canRemove)
+                        .fixedSize()
+                }
+            }
             CommandBox(model: model, command: row.loginCommand)
         }
         .padding(.leading, Metrics.avatar + Metrics.avatarGap)
@@ -732,6 +883,7 @@ struct CommandBox: View {
 struct CLISigningInCard: View {
     let model: AppModel
     let kind: CLIKind
+    @Environment(\.staticRender) private var staticRender
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -748,6 +900,7 @@ struct CLISigningInCard: View {
             HStack(spacing: 6) {
                 Button(L.t("Use Terminal Instead", "改用终端")) { model.continueCLISignInInTerminal(kind) }
                     .buttonStyle(QuietButtonStyle())
+                    .disabled(!model.cliCanHandoff.contains(kind) && !staticRender)
                     .font(.subheadline)
                     .help(L.t("If no browser opened: sign in in a Terminal window", "如果没有打开浏览器：在终端窗口里登录"))
                 Spacer()

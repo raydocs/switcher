@@ -21,6 +21,10 @@ import Testing
         // A name already taken in another case, or a stray file, is skipped.
         box.write(box.env.profilesRoot(.claude) + "/account2", "not a folder")
         #expect(profiles.suggestedName(.claude) == "account3")
+        // Finding #12: an orphaned Claude Keychain item for account3 is skipped too.
+        let kc = MemoryCLIKeychain()
+        kc.items[claudeKeychainService(configDir: box.env.profilesRoot(.claude) + "/account3")] = "{}"
+        #expect(profiles.suggestedName(.claude, keychain: kc) == "account4")
     }
 
     @Test func accountsResolveByAUniqueEmail() throws {
@@ -48,6 +52,12 @@ import Testing
         #expect(profiles.duplicates(of: b).map(\.path) == [a.path])
         #expect(profiles.duplicates(of: c).isEmpty)
         #expect(profiles.duplicates(of: try profiles.add(.codex, name: "d")).isEmpty)
+
+        // Fallback to credentialFingerprint when accountKey/email is absent.
+        let agy1 = try profiles.add(.agy, name: "one"), agy2 = try profiles.add(.agy, name: "two")
+        box.write(agy1.path + "/antigravity-cli/antigravity-oauth-token", box.json(["token": ["refresh_token": "same-refresh"]]))
+        box.write(agy2.path + "/antigravity-cli/antigravity-oauth-token", box.json(["token": ["refresh_token": "same-refresh"]]))
+        #expect(profiles.duplicates(of: agy2, keychain: MemoryCLIKeychain()).map(\.path) == [agy1.path])
     }
 
     @Test func aCancelledAddLeavesNothingAndTheSharedItemsStay() throws {
@@ -104,7 +114,11 @@ import Testing
         printf '{"auth_mode":"chatgpt","tokens":{"refresh_token":"r","account_id":"a"}}' > "$CODEX_HOME/auth.json"
 
         """, mode: 0o755)
-        let run = CLILoginRun(profile: p, binary: fake, baseEnvironment: ["PATH": "/usr/bin:/bin", "SWITCHER_BYPASS": "1"])
+        let run = CLILoginRun(
+            profile: p,
+            binary: fake,
+            workingDirectory: box.home,
+            baseEnvironment: ["HOME": box.home, "PATH": "/usr/bin:/bin", "SWITCHER_BYPASS": "1"])
         try run.start()
         #expect(run.wait() == 0)
         let said = run.output()
@@ -112,17 +126,74 @@ import Testing
         #expect(profiles.signIn(p, keychain: MemoryCLIKeychain()).state == .signedIn)
     }
 
-    @Test func cancelStopsAWaitingLogin() throws {
+    @Test func cancelAndTimeoutStopAWaitingLogin() throws {
         let box = CLIBox()
         let p = try CLIProfiles(env: box.env).add(.codex, name: "work")
         let fake = box.top + "/codex"
         // Waits for the browser forever, like a real login nobody finishes.
         box.write(fake, "#!/bin/sh\nexec sleep 60\n", mode: 0o755)
-        let run = CLILoginRun(profile: p, binary: fake, baseEnvironment: ["PATH": "/usr/bin:/bin"])
+        let run = CLILoginRun(
+            profile: p,
+            binary: fake,
+            workingDirectory: box.home,
+            baseEnvironment: ["HOME": box.home, "PATH": "/usr/bin:/bin"])
         try run.start()
         let started = Date()
         run.cancel(grace: 2)
         #expect(!run.isRunning)
         #expect(Date().timeIntervalSince(started) < 10)
+
+        let run2 = CLILoginRun(
+            profile: p,
+            binary: fake,
+            workingDirectory: box.home,
+            baseEnvironment: ["HOME": box.home, "PATH": "/usr/bin:/bin"])
+        try run2.start()
+        #expect(!run2.wait(timeout: 0.3).exited)
+        run2.cancel(grace: 1)
+        #expect(!run2.isRunning)
+    }
+
+    @Test func agyLoginStagesHomeMovesTokenViaRenameAndCleansUp() throws {
+        let box = CLIBox()
+        let profiles = CLIProfiles(env: box.env)
+        let p = try profiles.add(.agy, name: "work")
+        let fake = box.top + "/agy"
+        box.write(fake, """
+        #!/bin/sh
+        set -eu
+        [ "${AGY_CLI_CDE_AUTH_ACTION-}" = "login" ] || exit 4
+        [ -z "${ANTIGRAVITY_GEMINI_DIR+x}" ] || exit 5
+        [ -f "$HOME/.gemini/cache/antigravity-keyring-unavailable" ] || exit 6
+        printf '{"token":{"access_token":"a","refresh_token":"r-agy"},"id_token_email":"agy@example.com"}' > "$HOME/.gemini/jetski-standalone-oauth-token"
+
+        """, mode: 0o755)
+        let run = CLILoginRun(
+            profile: p,
+            binary: fake,
+            workingDirectory: box.home,
+            baseEnvironment: ["HOME": box.home, "PATH": "/usr/bin:/bin", "ANTIGRAVITY_GEMINI_DIR": "/other"])
+        try run.start()
+        #expect(run.wait() == 0)
+        let tokenFile = p.path + "/antigravity-cli/antigravity-oauth-token"
+        #expect(FS.exists(URL(fileURLWithPath: tokenFile)))
+        #expect(box.mode(tokenFile) == 0o600)
+        #expect(profiles.signIn(p, keychain: MemoryCLIKeychain()).state == .signedIn)
+        #expect(profiles.identity(p, keychain: MemoryCLIKeychain())?.email == "agy@example.com")
+        // Staging directory inside antigravity-cli was removed and real fake HOME was untouched.
+        let children = try FileManager.default.contentsOfDirectory(atPath: p.path + "/antigravity-cli")
+        #expect(!children.contains { $0.hasPrefix(".login-home-") })
+        #expect(!FS.exists(URL(fileURLWithPath: box.home + "/.gemini/jetski-standalone-oauth-token")))
+
+        // Failed login also removes its staging directory without creating a token file.
+        let p2 = try profiles.add(.agy, name: "fail")
+        let failFake = box.top + "/agy-fail"
+        box.write(failFake, "#!/bin/sh\nexit 2\n", mode: 0o755)
+        let failRun = CLILoginRun(profile: p2, binary: failFake, workingDirectory: box.home, baseEnvironment: ["HOME": box.home, "PATH": "/usr/bin:/bin"])
+        try failRun.start()
+        #expect(failRun.wait() == 2)
+        let children2 = try FileManager.default.contentsOfDirectory(atPath: p2.path + "/antigravity-cli")
+        #expect(!children2.contains { $0.hasPrefix(".login-home-") })
+        #expect(!FS.exists(URL(fileURLWithPath: p2.path + "/antigravity-cli/antigravity-oauth-token")))
     }
 }

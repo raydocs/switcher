@@ -35,7 +35,8 @@ import Testing
     }
 
     @Test func invalidNames() {
-        for n in ["", "default", ".x", "-x", "a/b", "a/", "/a", "..", "a'b", "a\"b", "a b", " a", "a\n", "é", "a$b", "a;b",
+        for n in ["", "default", "Default", "DEFAULT", "0", "1", "2", "99",
+                  ".x", "-x", "a/b", "a/", "/a", "..", "a'b", "a\"b", "a b", " a", "a\n", "é", "a$b", "a;b",
                   String(repeating: "a", count: 65)] {
             #expect(!CLIPath.isValidName(n), "\(n.debugDescription)")
         }
@@ -65,10 +66,15 @@ import Testing
     @Test func loginCommandsQuoteThePath() {
         let p = CLIProfile(kind: .claude, name: "o'k", path: "/h/o'k", isDefault: false)
         #expect(CLIKind.claude.loginCommand(p) == "CLAUDE_CONFIG_DIR='/h/o'\\''k' claude auth login")
-        let d = CLIProfiles(env: CLIEnv(home: "/h")).defaultProfile(.codex)
+        let d = CLIProfiles(env: CLIEnv(home: "/h", fallbackSearchDirs: [])).defaultProfile(.codex)
         #expect(CLIKind.codex.loginCommand(d) == "env -u CODEX_HOME SWITCHER_BYPASS=1 codex login")
-        let dc = CLIProfiles(env: CLIEnv(home: "/h")).defaultProfile(.claude)
+        let dc = CLIProfiles(env: CLIEnv(home: "/h", fallbackSearchDirs: [])).defaultProfile(.claude)
         #expect(CLIKind.claude.loginCommand(dc) == "env -u CLAUDE_CONFIG_DIR SWITCHER_BYPASS=1 claude auth login")
+        let da = CLIProfiles(env: CLIEnv(home: "/h", fallbackSearchDirs: [])).defaultProfile(.agy)
+        #expect(CLIKind.agy.loginCommand(da) == "env -u ANTIGRAVITY_GEMINI_DIR SWITCHER_BYPASS=1 AGY_CLI_CDE_AUTH_ACTION=login agy")
+        let pa = CLIProfile(kind: .agy, name: "o'k", path: "/h/o'k", isDefault: false)
+        #expect(CLIKind.agy.loginCommand(pa) ==
+            "touch '/h/o'\\''k/antigravity-cli/cache/antigravity-keyring-unavailable' && ANTIGRAVITY_GEMINI_DIR='/h/o'\\''k' agy --gemini_dir='/h/o'\\''k'")
     }
 }
 
@@ -82,7 +88,7 @@ import Testing
 
     @Test func listOrderSkipsLinksFilesAndOddNames() {
         let box = CLIBox()
-        let (profiles, root) = make(box, dirs: ["b", "a", "c-1", ".hidden", "has space"])
+        let (profiles, root) = make(box, dirs: ["b", "a", "c-1", ".hidden", "has space", "1", "Default"])
         box.write(root + "/file", "x")
         box.mkdir(box.top + "/elsewhere")
         box.symlink(root + "/linked", to: box.top + "/elsewhere")
@@ -91,6 +97,7 @@ import Testing
         #expect(l[0].isDefault && l[0].path == box.home + "/.claude" && l[0].envValue == nil)
         #expect(l[1].envValue == root + "/a")
         #expect(profiles.list(.codex).map(\.name) == ["default"])
+        #expect(profiles.list(.agy).map(\.name) == ["default"])
     }
 
     @Test func resolveByNumberNameAndCase() {
@@ -264,7 +271,8 @@ import Testing
         box.write(home + "/config.toml", """
         model_instructions_file = './instruction.md'
         experimental_instructions_file = "notes/extra.md"
-        auth_file = './auth.json'
+        auth_file = './Auth.json'
+        cred_file = './.Credentials.json'
         other_file = '/abs/path.md'
         up_file = '../outside.md'
         gone_file = './missing.md'
@@ -272,13 +280,16 @@ import Testing
         """)
         box.write(home + "/instruction.md", "x")
         box.write(home + "/notes/extra.md", "x")
-        box.write(home + "/auth.json", "{}")
+        box.write(home + "/Auth.json", "{}")
+        box.write(home + "/.Credentials.json", "{}")
         box.write(home + "/not-a-file-key-but-relative.md", "x")
         let p = try profiles.add(.codex, name: "work")
         #expect(box.isLink(p.path + "/instruction.md"))
         #expect(box.isLink(p.path + "/notes"))
         #expect(box.isLink(p.path + "/not-a-file-key-but-relative.md"))
+        #expect(!FS.exists(URL(fileURLWithPath: p.path + "/Auth.json")))
         #expect(!FS.exists(URL(fileURLWithPath: p.path + "/auth.json")))
+        #expect(!FS.exists(URL(fileURLWithPath: p.path + "/.Credentials.json")))
         #expect(!FS.exists(URL(fileURLWithPath: p.path + "/missing.md")))
         #expect(profiles.checkLinks(p).allSatisfy { $0.state == .ok || $0.state == .nothingToShare })
     }
@@ -372,5 +383,47 @@ import Testing
         let q = try profiles.add(.claude, name: "bare")
         try? FileManager.default.removeItem(atPath: q.path + "/.claude.json")
         #expect(profiles.mcpDifference(q).missing == ["a", "b"])
+    }
+
+    @Test func addForAgyCreatesKeyringMarkerAndSharesGeminiAndNestedItems() throws {
+        let box = CLIBox()
+        let d = box.env.defaultFolder(.agy)
+        box.write(d + "/GEMINI.md", "rules")
+        box.write(d + "/settings.json", "{}")
+        box.mkdir(d + "/skills")
+        box.write(d + "/antigravity-cli/settings.json", "{}")
+        box.write(d + "/antigravity-cli/mcp_config.json", "{}")
+        box.mkdir(d + "/antigravity-cli/conversations")
+        box.write(d + "/antigravity-cli/antigravity-oauth-token", "secret-token")
+        box.write(d + "/jetski-standalone-oauth-token", "desktop-secret")
+        box.write(d + "/installation_id", "install-1")
+
+        let profiles = CLIProfiles(env: box.env)
+        let p = try profiles.add(.agy, name: "work")
+        #expect(p.path == box.home + "/.agy-profiles/work" && !p.isDefault)
+        #expect(box.mode(p.path) == 0o700)
+        #expect(box.mode(p.path + "/antigravity-cli") == 0o700)
+        #expect(!box.isLink(p.path + "/antigravity-cli"))
+
+        for rel in ["GEMINI.md", "settings.json", "skills",
+                    "antigravity-cli/settings.json", "antigravity-cli/mcp_config.json", "antigravity-cli/conversations"] {
+            #expect(box.isLink(p.path + "/" + rel), "\(rel)")
+            #expect(try FileManager.default.destinationOfSymbolicLink(atPath: p.path + "/" + rel) == d + "/" + rel)
+        }
+        for secret in ["antigravity-cli/antigravity-oauth-token", "jetski-standalone-oauth-token", "installation_id"] {
+            #expect(!FS.exists(URL(fileURLWithPath: p.path + "/" + secret)), "\(secret)")
+        }
+
+        let marker = p.path + "/antigravity-cli/cache/antigravity-keyring-unavailable"
+        #expect(FS.exists(URL(fileURLWithPath: marker)) && !box.isLink(marker))
+        #expect(box.mode(marker) == 0o600)
+
+        // Make the marker stale (>24h old) and verify applyLinks refreshes its mtime.
+        let oldDate = Date(timeIntervalSinceNow: -2 * 86_400)
+        try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: marker)
+        _ = try profiles.applyLinks(p)
+        let mtime = try FileManager.default.attributesOfItem(atPath: marker)[.modificationDate] as? Date
+        #expect((mtime?.timeIntervalSinceNow ?? -86_400) > -60)
+        #expect(profiles.checkLinks(p).allSatisfy { $0.state == .ok || $0.state == .nothingToShare })
     }
 }

@@ -29,7 +29,7 @@ final class QuotaBox {
 
     init() {
         try! FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        env = CLIEnv(home: root.path)
+        env = CLIEnv(home: root.path, fallbackSearchDirs: [])
         profiles = CLIProfiles(env: env)
     }
 
@@ -149,6 +149,10 @@ final class QuotaBox {
         #expect(q.windows.map(\.usedPercent) == [30, 55.5, 80])
         #expect(q.windows[0].resetsAt == ISO8601DateFormatter().date(from: "2026-11-12T05:00:00Z"))
         #expect(q.windows[1].resetsAt == ISO8601DateFormatter.lenient("2026-11-15T00:00:00.000Z"))
+
+        // Finding #20: empty or whitespace model display_name/surface falls back to "week (scoped)", never "week ()".
+        b.http.body = Data(#"{"limits":[{"kind":"weekly_scoped","percent":40,"scope":{"model":{"id":"  ","display_name":""}}}]}"#.utf8)
+        #expect(try await b.read(p).windows.map(\.label) == ["week (scoped)"])
     }
 
     @Test func endpointNamedShape() async throws {
@@ -340,6 +344,9 @@ final class QuotaBox {
         runs.fail = false
         #expect(!ClaudeCodeQuota.renewLogin(profile: p, claudeBinary: "/bin/claude", stateDir: state, now: b.now.addingTimeInterval(60), environment: [:], run: runs.run))
         #expect(runs.calls.count == 1)
+        // Finding #22: a backward clock jump (future timestamp on disk) does not lock out renewLogin.
+        #expect(ClaudeCodeQuota.renewLogin(profile: p, claudeBinary: "/bin/claude", stateDir: state, now: b.now.addingTimeInterval(-3600), environment: [:], run: runs.run))
+        #expect(runs.calls.count == 2)
     }
 }
 
@@ -417,6 +424,40 @@ final class QuotaBox {
         let q = try await CodexQuota.read(profile: p, codexBinary: "codex", now: b.now, timeout: 10,
                                           spawn: spawns.spawn(script: script(in: b, limits: limits)))
         #expect(q.windows.map(\.label) == ["5h", "Spark 45m"])
+
+        let blankLimit = #"{"rateLimits":{"limitId":"  ","limitName":"  ","primary":{"usedPercent":3,"windowDurationMins":60,"resetsAt":1800003600}}}"#
+        let q2 = try await CodexQuota.read(profile: p, codexBinary: "codex", now: b.now, timeout: 10,
+                                           spawn: spawns.spawn(script: script(in: b, limits: blankLimit)))
+        #expect(q2.windows.map(\.label) == ["60m"])
+    }
+
+    @Test func accountIDFromJWTClaimAndOpenAIAPIKeyStripped() async throws {
+        let b = QuotaBox(), p = b.codex(), spawns = Spawns()
+        let jwt1 = fakeJWT(["https://api.openai.com/auth": ["chatgpt_account_id": "acct-jwt-1"]])
+        let jwt2 = fakeJWT(["https://api.openai.com/auth": ["chatgpt_account_id": "acct-jwt-2"]])
+        b.write(p.path + "/auth.json", b.profiles.env.home.isEmpty ? "" :
+            #"{"auth_mode":"chatgpt","tokens":{"id_token":"\#(jwt1)","refresh_token":"rt-1"}}"#)
+        let q = try await CodexQuota.read(
+            profile: p, codexBinary: "codex", now: b.now,
+            environment: ["PATH": "/usr/bin", "OPENAI_API_KEY": "sk-ambient"],
+            timeout: 10, spawn: spawns.spawn(script: script(in: b)))
+        #expect(q.windows.count == 2)
+        #expect(spawns.seen[0].env["OPENAI_API_KEY"] == nil)
+
+        // Mid-read swap when only id_token carries chatgpt_account_id is still rejected.
+        let swap = #"printf '%s' '{"auth_mode":"chatgpt","tokens":{"id_token":"\#(jwt2)","refresh_token":"rt-2"}}' > "$CODEX_HOME/auth.json""#
+        await #expect(throws: CLIQuotaError.unavailable("Account changed during quota read; rerun.")) {
+            try await CodexQuota.read(profile: p, codexBinary: "codex", now: b.now, timeout: 10, spawn: spawns.spawn(script: self.script(in: b, afterLimits: swap)))
+        }
+    }
+
+    @Test func zeroOrNegativeMinutesWindowIsRejected() async throws {
+        let b = QuotaBox(), p = b.codex(), spawns = Spawns()
+        signIn(p, box: b)
+        let limits = #"{"rateLimits":{"primary":{"usedPercent":10,"windowDurationMins":0,"resetsAt":1800003600}}}"#
+        await #expect(throws: CLIQuotaError.unavailable("Unsupported quota window schema.")) {
+            try await CodexQuota.read(profile: p, codexBinary: "codex", now: b.now, timeout: 10, spawn: spawns.spawn(script: self.script(in: b, limits: limits)))
+        }
     }
 
     @Test func outOfRangeWindowIsRejected() async throws {
@@ -565,5 +606,70 @@ private extension Date {
         let alive = kill(pid, 0) == 0
         if alive { kill(pid, SIGKILL) }
         #expect(!alive)
+    }
+}
+
+@Suite struct AgyCLIQuotaTests {
+    @Test func readsNamedAndDefaultProfilesRenewsInMemoryAndHandles429AndMidReadSwaps() async throws {
+        let b = QuotaBox()
+        let named = try b.profiles.add(.agy, name: "work")
+        let tokenPath = named.path + "/antigravity-cli/antigravity-oauth-token"
+        let initialPayload = #"{"token":{"access_token":"old-acc","refresh_token":"r-work","expiry":"2020-01-01T00:00:00Z"},"id_token_email":"work@example.com"}"#
+        b.write(tokenPath, initialPayload)
+
+        let summary = AntigravityUsageTests.summary
+        let q = try await AgyCLIQuota.read(profile: named, profiles: b.profiles, keychain: b.keychain, send: { req in
+            let url = req.url!.absoluteString
+            let ok = { (body: String) in (Data(body.utf8), HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!) }
+            if url.hasSuffix("/token") { return ok(#"{"access_token":"fresh-acc","expires_in":3600}"#) }
+            #expect(req.value(forHTTPHeaderField: "Authorization") == "Bearer fresh-acc")
+            if url.hasSuffix("loadCodeAssist") { return ok(#"{"paidTier":{"id":"g1-pro-tier"},"cloudaicompanionProject":"proj-1"}"#) }
+            return ok(summary)
+        }, now: b.now)
+        #expect(q.source == "google cloud code" && q.plan == "Google AI Pro" && q.observedAt == b.now)
+        #expect(q.windows.map(\.label) == ["5h", "week", "Argon week", "Claude 5h", "Claude week"])
+        #expect(q.windows.map(\.usedPercent) == [25, 60, 10, 0, 100])
+        // In-memory refresh leaves the token file untouched on disk.
+        #expect(try String(contentsOfFile: tokenPath, encoding: .utf8) == initialPayload)
+
+        // Default profile reads Keychain ("gemini", "antigravity").
+        let def = b.profiles.defaultProfile(.agy)
+        b.keychain.items["gemini/antigravity"] = "go-keyring-base64:" + Data(initialPayload.utf8).base64EncodedString()
+        let qDef = try await AgyCLIQuota.read(profile: def, profiles: b.profiles, keychain: b.keychain, send: { req in
+            let url = req.url!.absoluteString
+            let ok = { (body: String) in (Data(body.utf8), HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!) }
+            if url.hasSuffix("/token") { return ok(#"{"access_token":"fresh-def","expires_in":3600}"#) }
+            if url.hasSuffix("loadCodeAssist") { return ok(#"{"cloudaicompanionProject":"proj-1"}"#) }
+            return ok(summary)
+        }, now: b.now)
+        #expect(qDef.windows.count == 5)
+
+        // HTTP 429 surfaces a rate-limited CLIQuotaError so 1-hour backoff kicks in.
+        do {
+            _ = try await AgyCLIQuota.read(profile: named, profiles: b.profiles, keychain: b.keychain, send: { req in
+                let url = req.url!.absoluteString
+                if url.hasSuffix("/token") {
+                    return (Data(#"{"access_token":"fresh","expires_in":3600}"#.utf8), HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+                }
+                if url.hasSuffix("loadCodeAssist") {
+                    return (Data(#"{"cloudaicompanionProject":"proj-1"}"#.utf8), HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+                }
+                return (Data(), HTTPURLResponse(url: req.url!, statusCode: 429, httpVersion: nil, headerFields: nil)!)
+            }, now: b.now)
+            Issue.record("expected HTTP 429 error")
+        } catch let e as CLIQuotaError {
+            #expect(e.isRateLimited)
+        }
+
+        // Token swap mid-read is rejected.
+        await #expect(throws: CLIQuotaError.unavailable("the account changed during the read; try again")) {
+            try await AgyCLIQuota.read(profile: named, profiles: b.profiles, keychain: b.keychain, send: { req in
+                b.write(tokenPath, #"{"token":{"access_token":"swapped","refresh_token":"r-other"}}"#)
+                let url = req.url!.absoluteString
+                let body = url.hasSuffix("/token") ? #"{"access_token":"fresh","expires_in":3600}"#
+                    : (url.hasSuffix("loadCodeAssist") ? #"{"cloudaicompanionProject":"p"}"# : summary)
+                return (Data(body.utf8), HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+            }, now: b.now)
+        }
     }
 }

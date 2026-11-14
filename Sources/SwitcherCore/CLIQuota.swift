@@ -71,9 +71,7 @@ public final class URLSessionHTTPGetter: HTTPGetter {
         }
     }
 
-    let session: URLSession
-
-    public init() {
+    static let sharedSession: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 15
         config.timeoutIntervalForResource = 15
@@ -81,15 +79,17 @@ public final class URLSessionHTTPGetter: HTTPGetter {
         config.httpShouldSetCookies = false
         config.urlCache = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        session = URLSession(configuration: config, delegate: NoRedirects(), delegateQueue: nil)
-    }
+        return URLSession(configuration: config, delegate: NoRedirects(), delegateQueue: nil)
+    }()
+
+    public init() {}
 
     public func get(_ url: URL, headers: [String: String]) async throws -> (Int, Data) {
         var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
         req.httpMethod = "GET"
         req.httpShouldHandleCookies = false
         for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
-        let (data, response) = try await session.data(for: req)
+        let (data, response) = try await Self.sharedSession.data(for: req)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         return (http.statusCode, data)
     }
@@ -219,7 +219,7 @@ public enum ClaudeCodeQuota {
                 case "weekly_all": add("week", limit["percent"], limit["resets_at"])
                 case "weekly_scoped":
                     let scope = limit["scope"] as? [String: Any]
-                    let name = (scope?["model"] as? [String: Any])?["display_name"] as? String ?? scope?["surface"] as? String
+                    let name = CLIProfiles.nonEmpty((scope?["model"] as? [String: Any])?["display_name"]) ?? CLIProfiles.nonEmpty(scope?["surface"])
                     add(name.map { "week (\($0))" } ?? "week (scoped)", limit["percent"], limit["resets_at"])
                 default: break
                 }
@@ -267,7 +267,10 @@ public enum ClaudeCodeQuota {
                                   run: Run = ClaudeCodeQuota.defaultRun) -> Bool {
         guard profile.kind == .claude else { return false }
         let marker = stateDir + "/" + SHA256.hex(Data(profile.path.utf8)).prefix(16)
-        if let last = FS.mtime(URL(fileURLWithPath: marker)), now.timeIntervalSince(last) < renewInterval { return false }
+        if let last = FS.mtime(URL(fileURLWithPath: marker)) {
+            let elapsed = now.timeIntervalSince(last)
+            if elapsed >= 0, elapsed < renewInterval { return false }
+        }
         do {
             try FS.makePrivateDir(URL(fileURLWithPath: stateDir, isDirectory: true))
             try FS.atomicWrite(Data(), to: URL(fileURLWithPath: marker))
@@ -334,10 +337,18 @@ public final class CodexServer: @unchecked Sendable {
         process.standardError = FileHandle.nullDevice
         _ = fcntl(stdin.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
         stdout.fileHandleForReading.readabilityHandler = { [weak self] h in
+            guard let self else { h.readabilityHandler = nil; return }
             let chunk = h.availableData
-            self?.received(chunk)
+            if chunk.isEmpty { h.readabilityHandler = nil }
+            self.received(chunk)
         }
-        try process.run()
+        do {
+            try process.run()
+        } catch {
+            stdout.fileHandleForReading.readabilityHandler = nil
+            continuation.finish()
+            throw error
+        }
     }
 
     private func received(_ chunk: Data) {
@@ -374,11 +385,7 @@ public final class CodexServer: @unchecked Sendable {
         stdout.fileHandleForReading.readabilityHandler = nil
         try? stdin.fileHandleForWriting.close()
         if process.isRunning {
-            process.terminate()
-            let pid = process.processIdentifier
-            let deadline = Date().addingTimeInterval(1)
-            while process.isRunning, Date() < deadline { usleep(10_000) }
-            if process.isRunning { Foundation.kill(pid, SIGKILL) }
+            process.terminateAndWait(grace: 1)
         }
         continuation.finish()
     }
@@ -401,6 +408,7 @@ public enum CodexQuota {
         guard let accountID = accountID(profile) else { throw CLIQuotaError.signedOut }
 
         var env = environment
+        env.removeValue(forKey: "OPENAI_API_KEY")
         if let home = profile.envValue { env["CODEX_HOME"] = home } else { env.removeValue(forKey: "CODEX_HOME") }
         let server: CodexServer
         do { server = try spawn(codexBinary, ["app-server"], env) } catch { throw CLIQuotaError.unavailable("Unable to launch codex app-server.") }
@@ -420,9 +428,10 @@ public enum CodexQuota {
             catch { throw CLIQuotaError.unavailable(timedOut.value ? timeoutMessage(timeout) : "Codex app-server input closed.") }
             while let line = await iterator.next() {
                 guard let obj = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any],
-                      let got = QuotaJSON.number(obj["id"]), Int(got) == id else { continue }
+                      let got = QuotaJSON.number(obj["id"]), Int(exactly: got) == id else { continue }
                 if let err = obj["error"] as? [String: Any] {
-                    throw CLIQuotaError.unavailable("Codex RPC failed (code \(QuotaJSON.number(err["code"]).map { String(Int($0)) } ?? "unknown")).")
+                    let code = QuotaJSON.number(err["code"]).flatMap { Int(exactly: $0) }.map(String.init) ?? "unknown"
+                    throw CLIQuotaError.unavailable("Codex RPC failed (code \(code)).")
                 }
                 return obj["result"] as? [String: Any] ?? [:]
             }
@@ -438,7 +447,7 @@ public enum CodexQuota {
         let result = try await call("account/rateLimits/read", [:])
         guard self.accountID(profile) == accountID else { throw CLIQuotaError.unavailable("Account changed during quota read; rerun.") }
 
-        return CLIQuota(windows: try windows(result), source: "codex app-server", observedAt: now, plan: account?["planType"] as? String)
+        return CLIQuota(windows: try windows(result), source: "codex app-server", observedAt: now, plan: CLIProfiles.nonEmpty(account?["planType"]))
     }
 
     static func timeoutMessage(_ t: TimeInterval) -> String { "Quota read timed out after \(Int(t)) seconds." }
@@ -454,12 +463,16 @@ public enum CodexQuota {
         String(decoding: (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys, .withoutEscapingSlashes])) ?? Data("{}".utf8), as: UTF8.self)
     }
 
-    /// `tokens.account_id` of the profile's `auth.json`.
+    /// `tokens.account_id` (or `id_token`'s `chatgpt_account_id`) of a signed-in profile's `auth.json`.
     static func accountID(_ profile: CLIProfile) -> String? {
         guard let d = FileManager.default.contents(atPath: profile.path + "/auth.json"),
               let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
-              let id = (o["tokens"] as? [String: Any])?["account_id"] as? String, !id.isEmpty else { return nil }
-        return id
+              let tokens = o["tokens"] as? [String: Any],
+              CLIProfiles.nonEmpty(tokens["refresh_token"]) != nil else { return nil }
+        if let id = CLIProfiles.nonEmpty(tokens["account_id"]) { return id }
+        let claims = CLIProfiles.nonEmpty(tokens["id_token"]).flatMap(CLIProfiles.jwtClaims) ?? [:]
+        let openai = claims["https://api.openai.com/auth"] as? [String: Any] ?? [:]
+        return CLIProfiles.nonEmpty(openai["chatgpt_account_id"])
     }
 
     /// `rateLimitsByLimitId` (every bucket) or the single `rateLimits`; primary and secondary windows.
@@ -467,21 +480,24 @@ public enum CodexQuota {
         var buckets: [(id: String, bucket: [String: Any])] = []
         if let by = result["rateLimitsByLimitId"] as? [String: Any] {
             for key in by.keys.sorted(by: { ($0 == "codex" ? "" : $0) < ($1 == "codex" ? "" : $1) }) {
-                if let b = by[key] as? [String: Any] { buckets.append((key, b)) }
+                if let b = by[key] as? [String: Any] { buckets.append((CLIProfiles.nonEmpty(key) ?? "codex", b)) }
             }
         } else if let b = result["rateLimits"] as? [String: Any] {
-            buckets.append((b["limitId"] as? String ?? "codex", b))
+            buckets.append((CLIProfiles.nonEmpty(b["limitId"]) ?? "codex", b))
         }
         var out: [CLIQuotaWindow] = []
         for (id, bucket) in buckets {
-            let prefix = id == "codex" ? "" : ((bucket["limitName"] as? String) ?? id) + " "
+            let prefix = id == "codex" ? "" : (CLIProfiles.nonEmpty(bucket["limitName"]) ?? id) + " "
             for slot in ["primary", "secondary"] {
                 guard let w = bucket[slot] as? [String: Any] else { continue }
-                guard let used = QuotaJSON.percent(w["usedPercent"]), let minutes = QuotaJSON.number(w["windowDurationMins"]), minutes > 0 else {
+                guard let used = QuotaJSON.percent(w["usedPercent"]),
+                      let rawMinutes = QuotaJSON.number(w["windowDurationMins"]),
+                      rawMinutes >= 1, rawMinutes <= 10_000_000 else {
                     throw CLIQuotaError.unavailable("Unsupported quota window schema.")
                 }
+                let minutes = Int(rawMinutes.rounded())
                 let reset = QuotaJSON.number(w["resetsAt"]).map { Date(timeIntervalSince1970: $0) }
-                out.append(CLIQuotaWindow(label: prefix + windowLabel(minutes: Int(minutes)), usedPercent: used, resetsAt: reset))
+                out.append(CLIQuotaWindow(label: prefix + windowLabel(minutes: minutes), usedPercent: used, resetsAt: reset))
             }
         }
         guard !out.isEmpty else { throw CLIQuotaError.unavailable("No percentage quota windows returned.") }
@@ -494,6 +510,182 @@ public enum CodexQuota {
         case 10080: "week"
         default: "\(minutes)m"
         }
+    }
+}
+
+// MARK: - Antigravity CLI
+
+public enum AgyCLIQuota {
+    private static let lock = NSLock()
+    private static var renewedTokens: [String: (fingerprint: String, token: String, expires: Date)] = [:]
+    private static var projects: [String: (fingerprint: String, project: String)] = [:]
+
+    struct IdentityStamp: Equatable {
+        var accountKey: String?
+        var tokenPrefix: String
+    }
+
+    public static func read(profile: CLIProfile, profiles: CLIProfiles, keychain: CLIKeychain,
+                            send: AntigravityUsage.Send? = nil, now: Date = Date()) async throws -> CLIQuota {
+        guard profile.kind == .agy else { throw CLIQuotaError.unavailable("not an Antigravity CLI profile") }
+        guard let record = profiles.agyTokenRecord(profile, keychain: keychain),
+              CLIProfiles.isUsableAgyCredential(record.credential, now: now) else {
+            throw CLIQuotaError.signedOut
+        }
+        let before = identityStamp(profile: profile, profiles: profiles, record: record, keychain: keychain)
+        let transport = send ?? AntigravityUsage.defaultSend
+
+        var access = try await accessToken(profile: profile, credential: record.credential,
+                                           fingerprint: before.tokenPrefix, now: now, forceRenew: false, send: transport)
+        let fetched: (plan: String?, buckets: [QuotaBucket])
+        do {
+            fetched = try await queryCloudCode(profile: profile, fingerprint: before.tokenPrefix, token: access, send: transport)
+        } catch is AntigravityUsage.Refused {
+            access = try await accessToken(profile: profile, credential: record.credential,
+                                           fingerprint: before.tokenPrefix, now: now, forceRenew: true, send: transport)
+            do {
+                fetched = try await queryCloudCode(profile: profile, fingerprint: before.tokenPrefix, token: access, send: transport)
+            } catch is AntigravityUsage.Refused {
+                throw CLIQuotaError.unavailable(L10n.t("Google no longer accepts this sign-in. Sign in again.", "Google 已不接受这个登录，请重新登录。"))
+            }
+        }
+
+        guard let currentRecord = profiles.agyTokenRecord(profile, keychain: keychain),
+              identityStamp(profile: profile, profiles: profiles, record: currentRecord, keychain: keychain) == before else {
+            throw CLIQuotaError.unavailable("the account changed during the read; try again")
+        }
+
+        let windows = fetched.buckets.map { b in
+            CLIQuotaWindow(label: windowLabel(b.pool), usedPercent: Double(b.used), resetsAt: b.resetsAt)
+        }
+        guard !windows.isEmpty else {
+            throw CLIQuotaError.unavailable("Antigravity quota returned no usable windows.")
+        }
+        let plan = fetched.plan ?? profiles.identity(profile, keychain: keychain)?.plan
+        return CLIQuota(windows: windows, source: "google cloud code", observedAt: now, plan: plan)
+    }
+
+    static func windowLabel(_ pool: QuotaBucket.Pool) -> String {
+        switch pool {
+        case .gemini5h: "5h"
+        case .geminiWeekly: "week"
+        case .claude5h: "Claude 5h"
+        case .claudeWeekly: "Claude week"
+        case .argonWeekly: "Argon week"
+        }
+    }
+
+    static func identityStamp(profile: CLIProfile, profiles: CLIProfiles, record: CLIProfiles.AgyTokenRecord, keychain: CLIKeychain) -> IdentityStamp {
+        let secret = record.credential.refreshToken ?? record.credential.accessToken ?? ""
+        return IdentityStamp(accountKey: profiles.identity(profile, keychain: keychain)?.accountKey,
+                             tokenPrefix: String(SHA256.hex(Data(secret.utf8)).prefix(16)))
+    }
+
+    private static func accessToken(profile: CLIProfile, credential: AntigravityUsage.Credential,
+                                    fingerprint: String, now: Date, forceRenew: Bool,
+                                    send: AntigravityUsage.Send) async throws -> String {
+        if !forceRenew {
+            let cached = lock.withLock { renewedTokens[profile.path] }
+            if let cached, cached.fingerprint == fingerprint, cached.expires > now.addingTimeInterval(60) {
+                return cached.token
+            }
+            if let access = credential.accessToken {
+                if let expiry = credential.expiry {
+                    if expiry > now.addingTimeInterval(60) { return access }
+                } else {
+                    return access
+                }
+            }
+        }
+        guard let refresh = credential.refreshToken else {
+            throw CLIQuotaError.unavailable(L10n.t("Google no longer accepts this sign-in. Sign in again.", "Google 已不接受这个登录，请重新登录。"))
+        }
+        var req = URLRequest(url: AntigravityUsage.tokenURL, timeoutInterval: 15)
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        let form = [
+            "client_id": AntigravityUsage.clientID,
+            "client_secret": AntigravityUsage.clientSecret,
+            "refresh_token": refresh,
+            "grant_type": "refresh_token",
+        ]
+        req.httpBody = Data(form.map { "\($0.key)=\(AntigravityUsage.formEncode($0.value))" }.joined(separator: "&").utf8)
+        let data: Data, response: HTTPURLResponse
+        do {
+            (data, response) = try await send(req)
+        } catch {
+            throw CLIQuotaError.unavailable("Antigravity token request failed or timed out.")
+        }
+        if response.statusCode == 429 {
+            throw CLIQuotaError.unavailable("Antigravity quota HTTP 429; do not poll or retry now.")
+        }
+        if response.statusCode == 400 || response.statusCode == 401 {
+            throw CLIQuotaError.unavailable(L10n.t("Google no longer accepts this sign-in. Sign in again.", "Google 已不接受这个登录，请重新登录。"))
+        }
+        guard (200..<300).contains(response.statusCode),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let token = CLIProfiles.nonEmpty(obj["access_token"]) else {
+            throw CLIQuotaError.unavailable("Antigravity token HTTP \(response.statusCode).")
+        }
+        let expires = now.addingTimeInterval(QuotaJSON.number(obj["expires_in"]) ?? 3600)
+        lock.withLock { renewedTokens[profile.path] = (fingerprint, token, expires) }
+        return token
+    }
+
+    private static func queryCloudCode(profile: CLIProfile, fingerprint: String, token: String,
+                                       send: AntigravityUsage.Send) async throws -> (plan: String?, buckets: [QuotaBucket]) {
+        var plan: String?
+        var project: String? = lock.withLock {
+            guard let cached = projects[profile.path], cached.fingerprint == fingerprint else { return nil }
+            return cached.project
+        }
+        let assistBody = Data(#"{"metadata":{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}"#.utf8)
+        if let data = try await post(AntigravityUsage.loadCodeAssistPath, token: token, body: assistBody, send: send) {
+            plan = AntigravityUsage.parsePlan(data)
+            if let p = AntigravityUsage.parseProject(data) {
+                project = p
+                lock.withLock { projects[profile.path] = (fingerprint, p) }
+            }
+        }
+        let payload = try JSONSerialization.data(withJSONObject: project.map { ["project": $0] } ?? [:])
+        guard let quotaData = try await post(AntigravityUsage.quotaPath, token: token, body: payload, wantComplete: true, send: send) else {
+            throw CLIQuotaError.unavailable(L10n.t("Antigravity's quota is unavailable right now.", "暂时读不到 Antigravity 额度。"))
+        }
+        return (plan, AntigravityUsage.parseBuckets(quotaData))
+    }
+
+    private static func post(_ path: String, token: String, body: Data, wantComplete: Bool = false,
+                             send: AntigravityUsage.Send) async throws -> Data? {
+        var good: Data?
+        var lastStatus: Int?
+        for base in AntigravityUsage.bases {
+            var req = URLRequest(url: URL(string: base + path)!, timeoutInterval: 15)
+            req.httpMethod = "POST"
+            req.httpBody = body
+            for (k, v) in [
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": "Bearer \(token)",
+                "User-Agent": AntigravityUsage.userAgent,
+            ] {
+                req.setValue(v, forHTTPHeaderField: k)
+            }
+            guard let (data, response) = try? await send(req) else { continue }
+            if response.statusCode == 401 { throw AntigravityUsage.Refused() }
+            if response.statusCode == 429 {
+                throw CLIQuotaError.unavailable("Antigravity quota HTTP 429; do not poll or retry now.")
+            }
+            lastStatus = response.statusCode
+            guard (200..<300).contains(response.statusCode) else { continue }
+            if good == nil { good = data }
+            if !wantComplete || AntigravityUsage.parseBuckets(data).filter({ $0.pool != .argonWeekly }).count == 4 {
+                return data
+            }
+        }
+        if good == nil, wantComplete, let status = lastStatus {
+            throw CLIQuotaError.unavailable("Antigravity quota HTTP \(status).")
+        }
+        return good
     }
 }
 
