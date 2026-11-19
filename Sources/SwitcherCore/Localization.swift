@@ -120,3 +120,26 @@ public enum QuotaDisplayMode: String, CaseIterable, Codable, Sendable, Identifia
         }
     }
 }
+
+/// How Switcher draws its icon in the macOS menu bar.
+public enum MenuBarStyle: String, CaseIterable, Codable, Sendable, Identifiable {
+    case icon
+    case bars
+    case barsPercent
+
+    public static let settingKey = "menuBarStyle"
+
+    public var id: String { rawValue }
+}
+
+/// Which tool drives the menu bar usage meter.
+public enum MenuBarSource: String, CaseIterable, Codable, Sendable, Identifiable {
+    case auto
+    case antigravity
+    case claudeCode
+    case codex
+
+    public static let settingKey = "menuBarSource"
+
+    public var id: String { rawValue }
+}

@@ -111,7 +111,12 @@ enum Snapshot {
         let view = HStack(spacing: 14) {
             Image(systemName: "person.2.circle").font(.system(size: 14))
             ForEach(levels.indices, id: \.self) { i in
-                Image(nsImage: MeterIcon.image(five: levels[i].0, week: levels[i].1)).renderingMode(.template)
+                let tight = max(levels[i].0 ?? 0, levels[i].1 ?? 0) >= 90
+                Image(nsImage: MeterIcon.image(five: levels[i].0, week: levels[i].1, tight: tight)).renderingMode(.template)
+            }
+            HStack(spacing: 4) {
+                Image(nsImage: MeterIcon.image(five: 88, week: 61)).renderingMode(.template)
+                Text("88%").font(.system(size: 11, weight: .medium)).monospacedDigit()
             }
             Image(systemName: "wifi").font(.system(size: 13))
             Text("Fri 9:41").font(.system(size: 13, weight: .medium))
@@ -196,11 +201,15 @@ enum Snapshot {
 
         func model(_ boards: [AppBoard], ccSame: CCSameImport.Found? = nil, job: SwitchJob? = nil, banner: Banner? = nil,
                    selected: MenuTab = .claude, cli: [CLIBoard] = [], cliJustInstalled: Bool = false, hideEmails: Bool = false,
-                   quotaMode: QuotaDisplayMode = .used, terminalStatus: TerminalSetupStatus? = nil,
+                   quotaMode: QuotaDisplayMode = .used, menuBarStyle: MenuBarStyle = .bars,
+                   menuBarSource: MenuBarSource = .auto, globalHotkey: GlobalHotkeyPreset = .off,
+                   updateResult: UpdateCheckResult? = nil, terminalStatus: TerminalSetupStatus? = nil,
                    doctorFindings: [DoctorFinding] = []) -> AppModel {
             AppModel(preview: boards, ccSame: ccSame, job: job, banner: banner, cli: cli,
                      cliJustInstalled: cliJustInstalled, hideEmails: hideEmails, selectedTab: selected,
-                     quotaDisplayMode: quotaMode, terminalStatus: terminalStatus, doctorFindings: doctorFindings)
+                     quotaDisplayMode: quotaMode, menuBarStyle: menuBarStyle, menuBarSource: menuBarSource,
+                     globalHotkey: globalHotkey, updateResult: updateResult,
+                     terminalStatus: terminalStatus, doctorFindings: doctorFindings)
         }
 
         // The terminal accounts: two of each CLI, one sign-in about to run out, one not signed in.
@@ -284,7 +293,8 @@ enum Snapshot {
             Fixture(name: "19-privacy", model: model(boards(), selected: .overview, cli: cli(), hideEmails: true)),
 
             Fixture(name: "20-settings-general", model: model(boards(), cli: cli()), settings: .general, page: .init(openAtLogin: true)),
-            Fixture(name: "20-settings-general-meter", model: model(boards(), cli: tight), settings: .general, page: .init(openAtLogin: true)),
+            Fixture(name: "20-settings-general-meter", model: model(boards(), cli: tight, menuBarStyle: .barsPercent, globalHotkey: .optionShiftS),
+                    settings: .general, page: .init(openAtLogin: true)),
             Fixture(name: "21-settings-accounts", model: model(boards(claude: edgeRows), cli: cli()), settings: .accounts,
                     page: .init(hover: AccountsSettings.key(.claude, grace))),
             Fixture(name: "22-settings-accounts-ccsame", model: model(boards(), ccSame: found), settings: .accounts),
@@ -296,6 +306,12 @@ enum Snapshot {
                     model: model(boards(), cli: cli(), terminalStatus: sampleTerminal, doctorFindings: sampleDoctor),
                     settings: .terminal),
             Fixture(name: "27-settings-about", model: model(boards()), settings: .about),
+            Fixture(name: "27b-settings-about-update",
+                    model: model(boards(), updateResult: .updateAvailable(
+                        current: "1.0.0",
+                        release: ReleaseInfo(tagName: "v1.1.0", name: "Switcher 1.1.0", htmlURL: URL(string: "https://github.com/raydocs/switcher/releases/tag/v1.1.0")!)
+                    )),
+                    settings: .about),
         ]
     }
 }

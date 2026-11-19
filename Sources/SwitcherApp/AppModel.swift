@@ -175,11 +175,18 @@ final class AppModel {
     /// True once "Install" has run here: what is left is to open a new terminal.
     private(set) var cliJustInstalled = false
     private(set) var readingQuotas = false
+    static let notifyQuotaWarningKey = "notifyQuotaWarning"
+    static let notifyQuotaResetKey = "notifyQuotaReset"
+    static let notifySignInExpiryKey = "notifySignInExpiry"
+
     /// Terminal setup and Doctor results for Settings → Terminal & Doctor.
     private(set) var terminalStatus: TerminalSetupStatus?
     private(set) var doctorFindings: [DoctorFinding] = []
     private(set) var runningDoctor = false
     private(set) var doctorLastRun: Date?
+    /// Manual GitHub Release update check state in Settings → About.
+    private(set) var checkingUpdate = false
+    private(set) var updateResult: UpdateCheckResult?
     var banner: Banner?
     /// The active tab in the unified popover switcher.
     var selectedTab: MenuTab = .claude {
@@ -212,6 +219,51 @@ final class AppModel {
             UserDefaults.standard.set(quotaDisplayMode.rawValue, forKey: QuotaDisplayMode.settingKey)
         }
     }
+    /// How the menu bar icon renders: classic icon, dual bars, or dual bars + compact percentage.
+    var menuBarStyle: MenuBarStyle = .bars {
+        didSet {
+            guard oldValue != menuBarStyle, !isPreview else { return }
+            UserDefaults.standard.set(menuBarStyle.rawValue, forKey: MenuBarStyle.settingKey)
+            UserDefaults.standard.set(menuBarStyle != .icon, forKey: MenuBarLabel.settingKey)
+        }
+    }
+    /// Which tool drives the menu bar meter (Auto across Antigravity + Claude Code + Codex, or pinned).
+    var menuBarSource: MenuBarSource = .auto {
+        didSet {
+            guard oldValue != menuBarSource, !isPreview else { return }
+            UserDefaults.standard.set(menuBarSource.rawValue, forKey: MenuBarSource.settingKey)
+        }
+    }
+    /// Proactive local notifications (only delivered inside a `.app` bundle).
+    var notifyQuotaWarning: Bool = true {
+        didSet {
+            guard oldValue != notifyQuotaWarning, !isPreview else { return }
+            UserDefaults.standard.set(notifyQuotaWarning, forKey: Self.notifyQuotaWarningKey)
+            if notifyQuotaWarning { NotificationBridge.requestAuthorizationIfNeeded() }
+        }
+    }
+    var notifyQuotaReset: Bool = true {
+        didSet {
+            guard oldValue != notifyQuotaReset, !isPreview else { return }
+            UserDefaults.standard.set(notifyQuotaReset, forKey: Self.notifyQuotaResetKey)
+            if notifyQuotaReset { NotificationBridge.requestAuthorizationIfNeeded() }
+        }
+    }
+    var notifySignInExpiry: Bool = true {
+        didSet {
+            guard oldValue != notifySignInExpiry, !isPreview else { return }
+            UserDefaults.standard.set(notifySignInExpiry, forKey: Self.notifySignInExpiryKey)
+            if notifySignInExpiry { NotificationBridge.requestAuthorizationIfNeeded() }
+        }
+    }
+    /// Global hotkey to summon/dismiss the popover from any app (Carbon, zero Accessibility needed).
+    var globalHotkey: GlobalHotkeyPreset = .off {
+        didSet {
+            guard oldValue != globalHotkey, !isPreview else { return }
+            UserDefaults.standard.set(globalHotkey.rawValue, forKey: GlobalHotkeyPreset.settingKey)
+            hotkeyController.apply(globalHotkey)
+        }
+    }
     /// Tools explicitly hidden from the popover tab bar by the user.
     var hiddenTools: Set<ToolID> = [] {
         didSet {
@@ -239,11 +291,14 @@ final class AppModel {
     @ObservationIgnored private var cliHandoff: [CLIKind: (name: String, command: String)] = [:]
     @ObservationIgnored private var usageScheduler: NSBackgroundActivityScheduler?
     @ObservationIgnored private var screensAsleep = false
+    @ObservationIgnored private let hotkeyController = GlobalHotkeyController()
 
     /// Fixed data for previews and screenshots: touches nothing on disk.
     init(preview boards: [AppBoard], ccSame: CCSameImport.Found? = nil, job: SwitchJob? = nil, banner: Banner? = nil,
          cli cliBoards: [CLIBoard] = [], cliJustInstalled: Bool = false, hideEmails: Bool = false,
          selectedTab: MenuTab = .claude, quotaDisplayMode: QuotaDisplayMode = .used,
+         menuBarStyle: MenuBarStyle = .bars, menuBarSource: MenuBarSource = .auto,
+         globalHotkey: GlobalHotkeyPreset = .off, updateResult: UpdateCheckResult? = nil,
          hiddenTools: Set<ToolID> = [], terminalStatus: TerminalSetupStatus? = nil,
          doctorFindings: [DoctorFinding] = []) {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent("switcher-preview", isDirectory: true)
@@ -261,6 +316,10 @@ final class AppModel {
         self.language = L10n.language
         self.hideEmails = hideEmails
         self.quotaDisplayMode = quotaDisplayMode
+        self.menuBarStyle = menuBarStyle
+        self.menuBarSource = menuBarSource
+        self.globalHotkey = globalHotkey
+        self.updateResult = updateResult
         self.hiddenTools = hiddenTools
         self.selectedTab = selectedTab
         self.terminalStatus = terminalStatus
@@ -273,17 +332,47 @@ final class AppModel {
         self.cli = CLIProfiles(env: .live)
         self.cliKeychain = LiveCLIKeychain()
         self.language = L10n.language
-        self.hideEmails = UserDefaults.standard.bool(forKey: Self.hideEmailsKey)
-        if let raw = UserDefaults.standard.string(forKey: QuotaDisplayMode.settingKey),
+        let defaults = UserDefaults.standard
+        self.hideEmails = defaults.bool(forKey: Self.hideEmailsKey)
+        if let raw = defaults.string(forKey: QuotaDisplayMode.settingKey),
            let mode = QuotaDisplayMode(rawValue: raw) {
             self.quotaDisplayMode = mode
         }
-        if let raw = UserDefaults.standard.string(forKey: Self.hiddenToolsKey) {
+        if let raw = defaults.string(forKey: MenuBarStyle.settingKey),
+           let style = MenuBarStyle(rawValue: raw) {
+            self.menuBarStyle = style
+        } else if defaults.object(forKey: MenuBarLabel.settingKey) != nil {
+            self.menuBarStyle = defaults.bool(forKey: MenuBarLabel.settingKey) ? .bars : .icon
+        }
+        if let raw = defaults.string(forKey: MenuBarSource.settingKey),
+           let source = MenuBarSource(rawValue: raw) {
+            self.menuBarSource = source
+        }
+        if defaults.object(forKey: Self.notifyQuotaWarningKey) != nil {
+            self.notifyQuotaWarning = defaults.bool(forKey: Self.notifyQuotaWarningKey)
+        }
+        if defaults.object(forKey: Self.notifyQuotaResetKey) != nil {
+            self.notifyQuotaReset = defaults.bool(forKey: Self.notifyQuotaResetKey)
+        }
+        if defaults.object(forKey: Self.notifySignInExpiryKey) != nil {
+            self.notifySignInExpiry = defaults.bool(forKey: Self.notifySignInExpiryKey)
+        }
+        if let raw = defaults.string(forKey: GlobalHotkeyPreset.settingKey),
+           let preset = GlobalHotkeyPreset(rawValue: raw) {
+            self.globalHotkey = preset
+        }
+        if let raw = defaults.string(forKey: Self.hiddenToolsKey) {
             self.hiddenTools = Set(raw.split(separator: ",").compactMap { ToolID(rawValue: String($0)) })
         }
-        if let raw = UserDefaults.standard.string(forKey: Self.selectedTabKey),
+        if let raw = defaults.string(forKey: Self.selectedTabKey),
            let tab = MenuTab(rawValue: raw) {
             self.selectedTab = tab
+        }
+        if self.globalHotkey != .off {
+            self.hotkeyController.apply(self.globalHotkey)
+        }
+        if self.notifyQuotaWarning || self.notifyQuotaReset || self.notifySignInExpiry {
+            NotificationBridge.requestAuthorizationIfNeeded()
         }
         queue.async { board.recoverIfIdle() }
         refresh()
@@ -525,6 +614,7 @@ final class AppModel {
                 self.readingQuotas = false
                 self.quotasReadAt = Date()
                 if self.boards != boards { self.boards = boards }
+                self.evaluateAlerts()
             }
         }
     }
@@ -639,6 +729,132 @@ final class AppModel {
             for r in boards[b].rows.indices { boards[b].rows[r].quotaError = cliQuotaErrors[boards[b].rows[r].id] }
         }
         if cliBoards != boards { cliBoards = boards }
+        evaluateAlerts()
+    }
+
+    // MARK: Proactive alerts & manual release check
+
+    /// Evaluates active accounts' quota and sign-in expiry against `AlertLedger` and delivers new local
+    /// notifications (only when running inside a `.app` bundle and at least one alert toggle is on).
+    private func evaluateAlerts() {
+        guard !isPreview, NotificationBridge.isBundledApp else { return }
+        let prefs = AlertPreferences(
+            quotaWarning: notifyQuotaWarning,
+            quotaReset: notifyQuotaReset,
+            signInExpiry: notifySignInExpiry
+        )
+        guard prefs.quotaWarning || prefs.quotaReset || prefs.signInExpiry else { return }
+
+        let now = Date()
+        var windowSamples: [AlertWindowSample] = []
+        var expirySamples: [AlertExpirySample] = []
+
+        // Active Antigravity account windows + saved sign-ins approaching 28 days.
+        if let ag = board(.antigravity) {
+            let bestLabel: String? = bestAntigravityAccount.flatMap { bestID in
+                ag.rows.first(where: { $0.id == bestID }).map { displayTabLabel($0.slot) }
+            }
+            if let cur = ag.currentRow, let quota = cur.quota {
+                let label = displayLabel(cur.slot).title
+                for bucket in quota.buckets where bucket.pool.isCore {
+                    if let reset = bucket.resetsAt, reset <= now { continue }
+                    windowSamples.append(AlertWindowSample(
+                        tool: "Antigravity",
+                        accountID: cur.id,
+                        accountLabel: label,
+                        windowLabel: L.poolName(bucket.pool),
+                        usedPercent: bucket.used,
+                        resetsAt: bucket.resetsAt,
+                        bestFallback: bestLabel
+                    ))
+                }
+            }
+        }
+
+        // Desktop saved sign-ins aged >= 25 days.
+        for b in boards {
+            for row in b.rows where !row.isCurrent && row.canSwitch && !row.probablyExpired {
+                guard let savedAt = row.setAsideAt else { continue }
+                let ageDays = Int(now.timeIntervalSince(savedAt) / 86_400)
+                if ageDays >= 25 {
+                    expirySamples.append(AlertExpirySample(
+                        kind: .desktopSaved,
+                        tool: b.provider.displayName,
+                        accountID: row.id,
+                        accountLabel: displayLabel(row.slot).title,
+                        daysLeft: max(0, 28 - ageDays),
+                        stamp: Int(savedAt.timeIntervalSince1970)
+                    ))
+                }
+            }
+        }
+
+        // Active CLI accounts' main windows + expiring CLI refresh tokens.
+        for b in cliBoards where !b.isAbsent {
+            let bestLabel = b.rows.first(where: \.isBest).map { displayCLIActiveLabel($0) }
+            if let active = b.active, active.signIn.isGood, let quota = active.quota {
+                let label = displayCLIActiveLabel(active)
+                for w in quota.windows where CLIUsage.isMain(w) {
+                    windowSamples.append(AlertWindowSample(
+                        tool: b.kind.displayName,
+                        accountID: active.id,
+                        accountLabel: label,
+                        windowLabel: L.cliWindow(w.label),
+                        usedPercent: Int(w.usedPercent.rounded()),
+                        resetsAt: w.resetsAt,
+                        bestFallback: bestLabel
+                    ))
+                }
+            }
+            for row in b.rows {
+                if case .good(let until?) = row.signIn {
+                    let daysLeft = Int((until.timeIntervalSince(now) / 86_400).rounded(.up))
+                    if daysLeft <= 4 {
+                        expirySamples.append(AlertExpirySample(
+                            kind: .cliRefresh,
+                            tool: b.kind.displayName,
+                            accountID: row.id,
+                            accountLabel: displayCLIActiveLabel(row),
+                            daysLeft: daysLeft,
+                            stamp: Int(until.timeIntervalSince1970)
+                        ))
+                    }
+                }
+            }
+        }
+
+        let env = board.env
+        let wSamples = windowSamples
+        let eSamples = expirySamples
+        queue.async {
+            var ledger = AlertLedger.load(env)
+            let before = ledger
+            let events = AlertEngine.evaluate(
+                windows: wSamples,
+                expiries: eSamples,
+                preferences: prefs,
+                ledger: &ledger,
+                now: now
+            )
+            if ledger != before { try? ledger.save(env) }
+            if !events.isEmpty {
+                Task { @MainActor in NotificationBridge.deliver(events) }
+            }
+        }
+    }
+
+    /// Manually check GitHub Releases for a newer Switcher version (never runs automatically).
+    func checkForUpdates() {
+        guard !isPreview, !checkingUpdate else { return }
+        checkingUpdate = true
+        let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+        Task.detached(priority: .userInitiated) {
+            let result = await UpdateChecker.check(currentVersion: current)
+            await MainActor.run {
+                self.checkingUpdate = false
+                self.updateResult = result
+            }
+        }
     }
 
     private nonisolated static func readCLI(_ cli: CLIProfiles, _ keychain: CLIKeychain) -> [CLIBoard] {

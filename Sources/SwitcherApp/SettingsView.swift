@@ -91,7 +91,7 @@ struct SettingsPage: View {
             case .general: GeneralSettings(model: model, staged: staged)
             case .accounts: AccountsSettings(model: model, staged: staged)
             case .terminal: TerminalDoctorSettings(model: model, staged: staged)
-            case .about: AboutSettings()
+            case .about: AboutSettings(model: model)
             }
         }
         .padding(Metrics.settingsPad)
@@ -239,7 +239,6 @@ struct GeneralSettings: View {
     let model: AppModel
     private let staged: SettingsPage.Staged
     @State private var openAtLogin: Bool
-    @AppStorage(MenuBarLabel.settingKey) private var menuBarMeter = true
     @Environment(\.staticRender) private var staticRender
 
     init(model: AppModel, staged: SettingsPage.Staged = .init()) {
@@ -265,11 +264,31 @@ struct GeneralSettings: View {
                 }
                 RowDivider()
                 SettingRow(
-                    title: L.t("Usage in the menu bar", "在菜单栏显示用量"),
-                    detail: L.t("Shows the terminal account nearest its limit as two bars: 5-hour over weekly.",
-                                "图标换成上下两根小条：最接近上限的终端账号的 5 小时和每周用量。")
+                    title: L.t("Menu bar display", "菜单栏样式"),
+                    detail: L.t("Show the classic icon, two usage bars, or bars with a compact percentage.",
+                                "可显示经典图标、双柱状用量条，或柱状条加紧凑百分比。")
                 ) {
-                    SwitchControl(isOn: $menuBarMeter, label: L.t("Usage in the menu bar", "在菜单栏显示用量"))
+                    pickerControl(
+                        label: L.t("Menu bar display", "菜单栏样式"),
+                        selection: Binding(get: { model.menuBarStyle }, set: { model.menuBarStyle = $0 }),
+                        cases: MenuBarStyle.allCases,
+                        title: menuBarStyleName
+                    )
+                }
+                if model.menuBarStyle != .icon {
+                    RowDivider()
+                    SettingRow(
+                        title: L.t("Menu bar source", "菜单栏监控来源"),
+                        detail: L.t("Automatically tracks the tightest active account across Antigravity, Claude Code and Codex, or pin one tool.",
+                                    "自动追踪 Antigravity、Claude Code 和 Codex 中最紧的活跃账号，或固定显示某一个工具。")
+                    ) {
+                        pickerControl(
+                            label: L.t("Menu bar source", "菜单栏监控来源"),
+                            selection: Binding(get: { model.menuBarSource }, set: { model.menuBarSource = $0 }),
+                            cases: MenuBarSource.allCases,
+                            title: menuBarSourceName
+                        )
+                    }
                 }
                 RowDivider()
                 SettingRow(
@@ -277,28 +296,25 @@ struct GeneralSettings: View {
                     detail: L.t("Show meters as percent used or percent remaining.",
                                 "将用量条与百分比显示为“已用”或“剩余”。")
                 ) {
-                    if staticRender {
-                        HStack(spacing: 4) {
-                            Text(quotaModeName(model.quotaDisplayMode))
-                            Image(systemName: "chevron.up.chevron.down")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        .font(.callout)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Fill.hover, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    } else {
-                        Picker(L.t("Quota display", "配额显示方式"), selection: Binding(
-                            get: { model.quotaDisplayMode },
-                            set: { model.quotaDisplayMode = $0 })) {
-                            ForEach(QuotaDisplayMode.allCases) { mode in
-                                Text(quotaModeName(mode)).tag(mode)
-                            }
-                        }
-                        .labelsHidden()
-                        .fixedSize()
-                    }
+                    pickerControl(
+                        label: L.t("Quota display", "配额显示方式"),
+                        selection: Binding(get: { model.quotaDisplayMode }, set: { model.quotaDisplayMode = $0 }),
+                        cases: QuotaDisplayMode.allCases,
+                        title: quotaModeName
+                    )
+                }
+                RowDivider()
+                SettingRow(
+                    title: L.t("Global shortcut", "全局唤出快捷键"),
+                    detail: L.t("Summon or dismiss Switcher from any app without Accessibility permission.",
+                                "在任意应用内一键唤出或收起 Switcher，无需辅助功能权限。")
+                ) {
+                    pickerControl(
+                        label: L.t("Global shortcut", "全局唤出快捷键"),
+                        selection: Binding(get: { model.globalHotkey }, set: { model.globalHotkey = $0 }),
+                        cases: GlobalHotkeyPreset.allCases,
+                        title: \.label
+                    )
                 }
                 RowDivider()
                 SettingRow(
@@ -317,27 +333,53 @@ struct GeneralSettings: View {
                     detail: L.t("Choose Switcher's display language or follow macOS.",
                                 "选择 Switcher 的界面语言，或跟随 macOS 系统设置。")
                 ) {
-                    if staticRender {
-                        HStack(spacing: 4) {
-                            Text(languageName(model.language))
-                            Image(systemName: "chevron.up.chevron.down")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        .font(.callout)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Fill.hover, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    } else {
-                        Picker(L.t("Language", "界面语言"), selection: Binding(
-                            get: { model.language },
-                            set: { model.language = $0 })) {
-                            ForEach(AppLanguage.allCases) { lang in
-                                Text(languageName(lang)).tag(lang)
-                            }
-                        }
-                        .labelsHidden()
-                        .fixedSize()
+                    pickerControl(
+                        label: L.t("Language", "界面语言"),
+                        selection: Binding(get: { model.language }, set: { model.language = $0 }),
+                        cases: AppLanguage.allCases,
+                        title: languageName
+                    )
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                SectionHeader(
+                    symbol: "bell",
+                    title: L.t("Notifications", "系统通知"),
+                    detail: L.t("Sent at most once per reset cycle", "同一重置周期内最多提醒一次")
+                )
+                SettingsCard {
+                    SettingRow(
+                        title: L.t("Quota warnings (80% / 95%)", "配额预警（80% / 95%）"),
+                        detail: L.t("Alerts when an active account runs low and suggests the account with the most room.",
+                                    "当前活跃账号配额偏紧时提醒，并提示余量最多的备用账号。")
+                    ) {
+                        SwitchControl(isOn: Binding(
+                            get: { model.notifyQuotaWarning },
+                            set: { model.notifyQuotaWarning = $0 }),
+                            label: L.t("Quota warnings", "配额预警"), small: true)
+                    }
+                    RowDivider()
+                    SettingRow(
+                        title: L.t("Quota reset recovery", "配额重置恢复"),
+                        detail: L.t("Notifies when a previously low or exhausted window resets.",
+                                    "之前触达预警或耗尽的配额窗口重置后通知恢复可用。")
+                    ) {
+                        SwitchControl(isOn: Binding(
+                            get: { model.notifyQuotaReset },
+                            set: { model.notifyQuotaReset = $0 }),
+                            label: L.t("Quota reset recovery", "配额重置恢复"), small: true)
+                    }
+                    RowDivider()
+                    SettingRow(
+                        title: L.t("Expiring sign-ins", "登录即将过期"),
+                        detail: L.t("Reminds before a CLI refresh token or saved desktop sign-in expires.",
+                                    "在 CLI 刷新令牌或已保存的桌面登录即将过期前温和提醒。")
+                    ) {
+                        SwitchControl(isOn: Binding(
+                            get: { model.notifySignInExpiry },
+                            set: { model.notifySignInExpiry = $0 }),
+                            label: L.t("Expiring sign-ins", "登录即将过期"), small: true)
                     }
                 }
             }
@@ -357,14 +399,12 @@ struct GeneralSettings: View {
 
             SettingsCard {
                 VStack(alignment: .leading, spacing: 10) {
-                    MenuBarSketch(icon: MenuBarLabel.icon(model.cliBoards, meter: menuBarMeter))
+                    MenuBarSketch(model: model)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(L.t("Switcher lives in the menu bar", "Switcher 常驻菜单栏"))
                             .font(.body.weight(.medium))
-                        (Text(L.t("Click ", "点击菜单栏里的 "))
-                            + Text(MenuBarLabel.icon(model.cliBoards, meter: menuBarMeter)).foregroundStyle(.primary)
-                            + Text(L.t(" to switch accounts, check usage or add an account. There is no Dock icon and no main window: that menu is the app, and this window only holds its settings.",
-                                       " 即可切换账号、查看用量或添加账号。Switcher 没有程序坞图标，也没有主窗口：那个菜单就是整个应用，这个窗口只放设置。")))
+                        Text(L.t("Click Switcher in the menu bar (or press your global shortcut) to switch accounts, check usage or add an account. There is no Dock icon and no main window.",
+                                 "点击菜单栏中的 Switcher（或按下全局快捷键）即可切换账号、查看用量或添加账号。Switcher 没有程序坞图标，也没有主窗口。"))
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -374,6 +414,35 @@ struct GeneralSettings: View {
             }
         }
         .onAppear { if !staticRender { openAtLogin = model.openAtLogin } }
+    }
+
+    @ViewBuilder
+    private func pickerControl<T: Identifiable & Hashable>(
+        label: String,
+        selection: Binding<T>,
+        cases: [T],
+        title: @escaping (T) -> String
+    ) -> some View {
+        if staticRender {
+            HStack(spacing: 4) {
+                Text(title(selection.wrappedValue))
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .font(.callout)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Fill.hover, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        } else {
+            Picker(label, selection: selection) {
+                ForEach(cases) { item in
+                    Text(title(item)).tag(item)
+                }
+            }
+            .labelsHidden()
+            .fixedSize()
+        }
     }
 
     private func toolVisibilityRow(_ tool: ToolID) -> some View {
@@ -409,6 +478,23 @@ struct GeneralSettings: View {
         .padding(.vertical, 9)
     }
 
+    private func menuBarStyleName(_ style: MenuBarStyle) -> String {
+        switch style {
+        case .icon: L.t("Icon only", "仅图标")
+        case .bars: L.t("Dual bars", "双柱状条")
+        case .barsPercent: L.t("Bars + %", "柱状条 + 百分比")
+        }
+    }
+
+    private func menuBarSourceName(_ source: MenuBarSource) -> String {
+        switch source {
+        case .auto: L.t("Auto (tightest)", "自动（最紧张）")
+        case .antigravity: "Antigravity"
+        case .claudeCode: "Claude Code"
+        case .codex: "Codex"
+        }
+    }
+
     private func quotaModeName(_ mode: QuotaDisplayMode) -> String {
         switch mode {
         case .used: L.t("Used %", "已用百分比")
@@ -425,17 +511,18 @@ struct GeneralSettings: View {
     }
 }
 
-/// The right end of a menu bar, with Switcher's icon picked out.
+/// The right end of a menu bar, with Switcher's live icon/meter picked out.
 private struct MenuBarSketch: View {
-    let icon: Image
+    let model: AppModel
 
     var body: some View {
         HStack(spacing: 12) {
             Spacer(minLength: 0)
-            icon
+            MenuBarLabel(model: model)
                 .font(.body.weight(.medium))
                 .foregroundStyle(Color.accentColor)
-                .frame(width: 30, height: 20)
+                .padding(.horizontal, 6)
+                .frame(minWidth: 30, minHeight: 20)
                 .background(Fill.tint, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
             Image(systemName: "wifi")
             Image(systemName: "battery.75percent")
@@ -456,6 +543,9 @@ private struct MenuBarSketch: View {
 // MARK: About
 
 struct AboutSettings: View {
+    let model: AppModel
+    @Environment(\.openURL) private var openURL
+
     private var version: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
     }
@@ -488,6 +578,40 @@ struct AboutSettings: View {
             .padding(.horizontal, Metrics.cardPad)
 
             VStack(alignment: .leading, spacing: 6) {
+                SectionHeader(title: L.t("Updates", "软件更新"))
+                SettingsCard {
+                    HStack(alignment: .center, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            updateTitle
+                            updateSubtitle
+                        }
+                        Spacer(minLength: 8)
+                        if case .updateAvailable(_, let release) = model.updateResult {
+                            Button(L.t("View Release", "查看新版本")) {
+                                openURL(release.htmlURL)
+                            }
+                            .buttonStyle(SoftButtonStyle(kind: .tinted, compact: true))
+                        }
+                        Button {
+                            model.checkForUpdates()
+                        } label: {
+                            if model.checkingUpdate {
+                                HStack(spacing: 4) {
+                                    Spinner(size: 10)
+                                    Text(L.t("Checking…", "检查中…"))
+                                }
+                            } else {
+                                Text(L.t("Check for Updates", "检查更新"))
+                            }
+                        }
+                        .buttonStyle(SoftButtonStyle(compact: true))
+                        .disabled(model.checkingUpdate)
+                    }
+                    .padding(Metrics.cardPad)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
                 SectionHeader(title: L.t("Privacy", "隐私"))
                 SettingsCard {
                     VStack(alignment: .leading, spacing: 10) {
@@ -511,6 +635,56 @@ struct AboutSettings: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, Metrics.cardPad)
+        }
+    }
+
+    @ViewBuilder private var updateTitle: some View {
+        switch model.updateResult {
+        case nil:
+            Text(L.t("Manual update check", "手动检查更新"))
+                .font(.body.weight(.medium))
+        case .upToDate(_, let latest):
+            Label(L.t("You're up to date (\(latest))", "已是最新版本（\(latest)）"), systemImage: "checkmark.circle.fill")
+                .font(.body.weight(.medium))
+                .foregroundStyle(.primary)
+        case .updateAvailable(_, let release):
+            Label(L.t("Version \(release.tagName) available", "发现新版本 \(release.tagName)"), systemImage: "arrow.down.circle.fill")
+                .font(.body.weight(.medium))
+                .foregroundStyle(Color.accentColor)
+        case .noReleases:
+            Text(L.t("No GitHub releases published yet", "GitHub 尚未发布正式版本"))
+                .font(.body.weight(.medium))
+        case .failed:
+            Text(L.t("Couldn't check for updates", "无法检查更新"))
+                .font(.body.weight(.medium))
+        }
+    }
+
+    @ViewBuilder private var updateSubtitle: some View {
+        switch model.updateResult {
+        case nil:
+            Text(L.t("Checks GitHub Releases only when you click; never runs in the background.",
+                     "仅在手动点击时查询 GitHub Releases，不在后台静默联网。"))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        case .upToDate(let current, _):
+            Text(L.t("Current version: \(current)", "当前版本：\(current)"))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        case .updateAvailable(let current, let release):
+            Text(L.t("Current: \(current) · Release: \(release.name)", "当前：\(current) · 发布：\(release.name)"))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        case .noReleases:
+            Text(L.t("Check back after the first tagged release.", "发布首个正式版本后可在此检查。"))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        case .failed(let message):
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
