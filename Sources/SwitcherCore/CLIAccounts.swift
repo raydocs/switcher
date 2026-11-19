@@ -179,6 +179,11 @@ public struct DoctorFinding: Equatable, Sendable {
     public enum Level: String, Sendable { case ok, note, warn, problem }
     public var level: Level
     public var message: String
+
+    public init(level: Level, message: String) {
+        self.level = level
+        self.message = message
+    }
 }
 
 public struct CLIDoctor {
