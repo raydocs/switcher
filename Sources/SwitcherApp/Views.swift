@@ -10,12 +10,14 @@ struct MenuView: View {
     struct Staged {
         var hover: String?
         var confirmRemove: String?
+        var rename: String?
         var confirmAdd = false
         var cli = CLISection.Staged()
     }
 
     private let staged: Staged
     @State private var removing: String?
+    @State private var renaming: String?
     @State private var confirmingAdd: Bool
     @State private var listHeight: CGFloat = 0
     @State private var cliHeight: CGFloat = 0
@@ -26,6 +28,7 @@ struct MenuView: View {
         self.model = model
         self.staged = staged
         _removing = State(initialValue: staged.confirmRemove)
+        _renaming = State(initialValue: staged.rename)
         _confirmingAdd = State(initialValue: staged.confirmAdd)
     }
 
@@ -33,6 +36,7 @@ struct MenuView: View {
     private var board: AppBoard? { model.board(model.selected) }
 
     var body: some View {
+        let _ = model.language
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: Metrics.gap) {
                 AppTabs(model: model)
@@ -63,7 +67,7 @@ struct MenuView: View {
             }
             .padding(Metrics.pad)
             Divider()
-            Footer()
+            Footer(model: model)
                 .inert(busy)
         }
         .frame(width: Metrics.width)
@@ -77,6 +81,7 @@ struct MenuView: View {
         }
         .onChange(of: model.selected) {
             removing = nil
+            renaming = nil
             confirmingAdd = false
         }
         .task(id: model.banner?.id) {
@@ -145,7 +150,7 @@ struct MenuView: View {
             ForEach(Array(board.rows.enumerated()), id: \.element.id) { index, row in
                 AccountRowView(
                     model: model, provider: board.provider, row: row, index: index,
-                    removing: $removing, forcedHover: staged.hover == row.id)
+                    removing: $removing, renaming: $renaming, forcedHover: staged.hover == row.id)
             }
         }
         .disabled(busy)
@@ -205,7 +210,7 @@ struct MenuView: View {
 
     // MARK: Keyboard
 
-    /// ⌘1…⌘9 pick a row, ⌘↩ is Next Account, ⌘N adds, ⌃Tab changes app.
+    /// ⌘1…⌘9 pick a row, ⌘↩ is Next Account, ⌘N adds, ⌘R refreshes, ⌃Tab changes app.
     private var shortcuts: some View {
         ZStack {
             if let board, board.installed, !busy {
@@ -219,6 +224,8 @@ struct MenuView: View {
                     .keyboardShortcut("n", modifiers: .command)
             }
             if !busy {
+                Button("") { model.refreshAllNow() }
+                    .keyboardShortcut("r", modifiers: .command)
                 Button("") { model.selected = model.selected == .claude ? .antigravity : .claude }
                     .keyboardShortcut(.tab, modifiers: .control)
             }
@@ -264,7 +271,7 @@ struct AppTabs: View {
         let who: String = {
             guard let board else { return " " }
             if !board.installed { return L.t("Not installed", "未安装") }
-            if let row = board.currentRow { return row.slot.label }
+            if let row = board.currentRow { return model.displayTabLabel(row.slot) }
             return board.current == nil ? L.t("Signed out", "未登录") : L.t("Signed in", "已登录")
         }()
         let state: String = {
@@ -525,16 +532,42 @@ struct EmptyState: View {
 // MARK: Footer
 
 struct Footer: View {
+    let model: AppModel
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        HStack {
+        HStack(spacing: 12) {
             Button(L.t("Settings…", "设置…")) {
                 NSApp.activate(ignoringOtherApps: true)
                 openSettings()
             }
             .keyboardShortcut(",", modifiers: .command)
             Spacer()
+            Button {
+                model.refreshAllNow()
+            } label: {
+                if model.isRefreshing {
+                    Spinner(size: 11)
+                        .frame(width: 16, height: 16)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                        .frame(width: 16, height: 16)
+                }
+            }
+            .disabled(model.isRefreshing)
+            .help(L.t("Refresh accounts and quotas now (⌘R)", "立即刷新账号与配额（⌘R）"))
+            .accessibilityLabel(L.t("Refresh", "刷新"))
+            Button {
+                model.hideEmails.toggle()
+            } label: {
+                Image(systemName: model.hideEmails ? "eye.slash" : "eye")
+                    .frame(width: 16, height: 16)
+            }
+            .buttonStyle(QuietButtonStyle(tinted: model.hideEmails))
+            .help(model.hideEmails
+                ? L.t("Show email addresses", "显示邮箱地址")
+                : L.t("Hide email addresses for screenshots or screen sharing", "隐藏邮箱地址（便于录屏或共享屏幕）"))
+            .accessibilityLabel(model.hideEmails ? L.t("Show email addresses", "显示邮箱地址") : L.t("Hide email addresses", "隐藏邮箱地址"))
             Button(L.t("Quit Switcher", "退出 Switcher")) { NSApp.terminate(nil) }
                 .keyboardShortcut("q", modifiers: .command)
         }

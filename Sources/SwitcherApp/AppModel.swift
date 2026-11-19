@@ -31,6 +31,8 @@ struct Banner: Equatable, Identifiable {
 @MainActor
 @Observable
 final class AppModel {
+    static let hideEmailsKey = "hideEmails"
+
     private(set) var boards: [AppBoard] = []
     private(set) var job: SwitchJob?
     private(set) var ccSame: CCSameImport.Found?
@@ -43,9 +45,24 @@ final class AppModel {
     private(set) var cliSigningIn: [CLIKind: String] = [:]
     /// True once "Install" has run here: what is left is to open a new terminal.
     private(set) var cliJustInstalled = false
+    private(set) var readingQuotas = false
     var banner: Banner?
     /// The app section the popover shows first.
     var selected: ProviderID = .claude
+    /// Display language preference, synced with `UserDefaults.standard` and observed by views.
+    var language: AppLanguage = .system {
+        didSet {
+            guard oldValue != language, !isPreview else { return }
+            UserDefaults.standard.set(language.rawValue, forKey: L10n.settingKey)
+        }
+    }
+    /// Privacy mode: masks email addresses in the UI for screenshots and screen sharing.
+    var hideEmails: Bool = false {
+        didSet {
+            guard oldValue != hideEmails, !isPreview else { return }
+            UserDefaults.standard.set(hideEmails, forKey: Self.hideEmailsKey)
+        }
+    }
 
     @ObservationIgnored let board: Switchboard
     @ObservationIgnored private let queue = DispatchQueue(label: "switcher.core", qos: .userInitiated)
@@ -68,7 +85,7 @@ final class AppModel {
 
     /// Fixed data for previews and screenshots: touches nothing on disk.
     init(preview boards: [AppBoard], ccSame: CCSameImport.Found? = nil, job: SwitchJob? = nil, banner: Banner? = nil,
-         cli cliBoards: [CLIBoard] = [], cliJustInstalled: Bool = false) {
+         cli cliBoards: [CLIBoard] = [], cliJustInstalled: Bool = false, hideEmails: Bool = false) {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent("switcher-preview", isDirectory: true)
         let env = Env(home: home)
         self.cli = CLIProfiles(env: CLIEnv(home: home.path))
@@ -81,12 +98,16 @@ final class AppModel {
         self.job = job
         self.banner = banner
         self.isPreview = true
+        self.language = L10n.language
+        self.hideEmails = hideEmails
     }
 
     init(board: Switchboard = Switchboard()) {
         self.board = board
         self.cli = CLIProfiles(env: .live)
         self.cliKeychain = LiveCLIKeychain()
+        self.language = L10n.language
+        self.hideEmails = UserDefaults.standard.bool(forKey: Self.hideEmailsKey)
         queue.async { board.recoverIfIdle() }
         refresh()
         refreshCLI()
@@ -165,6 +186,47 @@ final class AppModel {
     func board(_ p: ProviderID) -> AppBoard? { boards.first { $0.provider == p } }
 
     var isBusy: Bool { job != nil }
+    var isRefreshing: Bool { readingQuotas || !cliReading.isEmpty }
+
+    // MARK: Display helpers (aliases & privacy mode)
+
+    func displayEmail(_ email: String?) -> String? {
+        Privacy.displayEmail(email, masked: hideEmails)
+    }
+
+    func displayLabel(_ slot: Slot) -> (title: String, subtitle: String?) {
+        if let alias = slot.alias, !alias.isEmpty {
+            return (alias, displayEmail(slot.email))
+        }
+        if let email = displayEmail(slot.email) {
+            return (email, nil)
+        }
+        return (slot.label, nil)
+    }
+
+    func displayTabLabel(_ slot: Slot) -> String {
+        displayLabel(slot).title
+    }
+
+    func displayCLILabel(_ row: CLIRow) -> (title: String, subtitle: String?) {
+        let folderTag = row.isDefault ? L.t("default", "默认") : row.name
+        let shownEmail = displayEmail(row.email)
+        if let alias = row.alias, !alias.isEmpty {
+            let showFolder = alias.lowercased() != row.name.lowercased() && (!row.isDefault || alias.lowercased() != folderTag.lowercased())
+            if let shownEmail {
+                return (alias, showFolder ? "\(shownEmail) · \(folderTag)" : shownEmail)
+            }
+            return (alias, showFolder ? folderTag : nil)
+        }
+        if let shownEmail {
+            return (shownEmail, folderTag)
+        }
+        return (row.name, nil)
+    }
+
+    func displayCLIActiveLabel(_ row: CLIRow) -> String {
+        displayCLILabel(row).title
+    }
 
     /// Re-read every app. Cheap: run when the menu opens and every 15 seconds while it is open.
     func refresh() {
@@ -182,8 +244,24 @@ final class AppModel {
         }
     }
 
+    /// Force-refresh desktop state, Antigravity quotas, and CLI accounts/quotas now.
+    func refreshAllNow() {
+        if isPreview { return }
+        refresh()
+        refreshQuotasIfDue(force: true)
+        let cli = self.cli, keychain = self.cliKeychain
+        queue.async {
+            let boards = Self.readCLI(cli, keychain)
+            Task { @MainActor in
+                self.setCLI(boards)
+                for b in boards where b.commandFound {
+                    self.loadCLIQuota(b.kind, force: true)
+                }
+            }
+        }
+    }
+
     @ObservationIgnored private var quotasReadAt: Date?
-    @ObservationIgnored private var readingQuotas = false
 
     /// Antigravity quotas come from Google: read them at most every 5 minutes (sooner with `force`).
     func refreshQuotasIfDue(force: Bool = false) {
@@ -205,7 +283,7 @@ final class AppModel {
     /// Switch `p` to `row`'s account.
     func switchTo(_ p: ProviderID, _ row: AccountRow) {
         guard !row.isCurrent, row.canSwitch else { return }
-        start(p, target: row.slot.account, label: row.slot.label)
+        start(p, target: row.slot.account, label: displayLabel(row.slot).title)
     }
 
     func next(_ p: ProviderID) {
@@ -219,7 +297,7 @@ final class AppModel {
                     self.banner = Banner(kind: .info, text: L.noOtherAccount(p.displayName))
                     return
                 }
-                self.start(p, target: slot.account, label: slot.label)
+                self.start(p, target: slot.account, label: self.displayLabel(slot).title)
             }
         }
     }
@@ -248,14 +326,23 @@ final class AppModel {
         let token = CancelToken()
         cancel = token
         let name = board.provider(p).app.name
-        job = SwitchJob(provider: p, target: target, targetLabel: label, phase: .quitting(app: name, waited: 0))
+        let initial: SwitchPhase = (board(p)?.running == true) ? .quitting(app: name, waited: 0) : .swapping
+        job = SwitchJob(provider: p, target: target, targetLabel: label, phase: initial)
         let board = self.board
         queue.async {
             let result: Result<SwitchResult, Error>
             do {
-                let r = try board.switchTo(p, account: target, alwaysLaunch: true, cancel: token) { waited in
+                let r = try board.switchTo(p, account: target, alwaysLaunch: true, cancel: token, phase: { stage in
+                    let mapped: SwitchPhase
+                    switch stage {
+                    case .quitting: mapped = .quitting(app: name, waited: 0)
+                    case .swapping: mapped = .swapping
+                    case .opening: mapped = .opening(app: name)
+                    }
+                    Task { @MainActor in self.job?.phase = mapped }
+                }, waiting: { waited in
                     Task { @MainActor in self.job?.phase = .quitting(app: name, waited: Int(waited)) }
-                }
+                })
                 result = .success(r)
             } catch {
                 result = .failure(error)
@@ -267,7 +354,11 @@ final class AppModel {
                 case .success:
                     self.banner = Banner(kind: .success, text: target == nil ? L.signInToAdd(name) : L.switched(name, label ?? ""))
                 case .failure(let error):
-                    self.banner = Banner(kind: .error, text: error.localizedDescription)
+                    if (error as? QuitError) == .cancelled {
+                        self.banner = Banner(kind: .info, text: L.switchCancelled(name))
+                    } else {
+                        self.banner = Banner(kind: .error, text: error.localizedDescription)
+                    }
                 }
                 self.refresh()
             }
@@ -302,13 +393,15 @@ final class AppModel {
     }
 
     private nonisolated static func readCLI(_ cli: CLIProfiles, _ keychain: CLIKeychain) -> [CLIBoard] {
-        let cache = CLIQuotaCache(env: cli.env)
+        let cache = CLIQuotaCache(env: cli.env).snapshot()
+        let groups = Dictionary(uniqueKeysWithValues: CLICommands.list(cli, keychain: keychain).map { ($0.cli, $0) })
         let now = Date()
         return CLIKind.allCases.compactMap { kind -> CLIBoard? in
             let activity = CLIUsage.lastActivity(kind, env: cli.env, now: now)
-            guard let group = CLICommands.list(cli, keychain: keychain, kinds: [kind]).first else { return nil }
+            guard let group = groups[kind.rawValue] else { return nil }
             let listed = cli.list(kind)
-            let commands = Dictionary(listed.map { ($0.path, kind.loginCommand($0)) }) { a, _ in a }
+            let loginCommands = Dictionary(listed.map { ($0.path, kind.loginCommand($0)) }) { a, _ in a }
+            let launchCommands = Dictionary(listed.map { ($0.path, kind.launchCommand($0)) }) { a, _ in a }
             // A cached quota counts only for the account the profile is signed in to now.
             let cached = Dictionary(listed.map { p in (p.id, cache.quota(for: p, accountKey: cli.identity(p)?.accountKey)) }) { a, _ in a }
             var rows = group.profiles.map { e -> CLIRow in
@@ -322,9 +415,10 @@ final class AppModel {
                 // A window that reset since the reading shows 0 % (or goes) instead of the old number.
                 var quota = signIn == .out ? nil : cached[id] ?? nil
                 if let read = quota { quota?.windows = CLIUsage.current(read, now: now, lastActivity: activity) }
-                return CLIRow(kind: kind, number: e.number, name: e.name, isDefault: e.isDefault, isActive: e.active,
+                return CLIRow(kind: kind, number: e.number, name: e.name, alias: e.alias, isDefault: e.isDefault, isActive: e.active,
                               email: e.email, plan: e.plan ?? cached[id]??.plan, signIn: signIn,
-                              loginCommand: commands[e.path] ?? "", quota: quota,
+                              loginCommand: loginCommands[e.path] ?? "", launchCommand: launchCommands[e.path] ?? "",
+                              quota: quota,
                               headroom: CLIUsage.headroom(quota, signedIn: signIn.isGood, now: now, lastActivity: activity))
             }
             rows = CLIBoard.markingBest(rows)
@@ -346,6 +440,7 @@ final class AppModel {
     func useCLI(_ row: CLIRow) {
         guard !isPreview, !row.isActive else { return }
         let cli = self.cli, keychain = self.cliKeychain
+        let displayName = displayCLIActiveLabel(row)
         queue.async {
             let result = Result { try cli.setActive(try Self.profile(cli, row.kind, row.name)) }
             let boards = Self.readCLI(cli, keychain)
@@ -355,8 +450,8 @@ final class AppModel {
                 case .success:
                     let ready = self.cliBoard(row.kind)?.shimInstalled ?? false
                     self.banner = ready
-                        ? Banner(kind: .success, text: L.cliNowUses(row.kind, row.label))
-                        : Banner(kind: .info, text: L.cliChosenNoEffect(row.kind, row.label))
+                        ? Banner(kind: .success, text: L.cliNowUses(row.kind, displayName))
+                        : Banner(kind: .info, text: L.cliChosenNoEffect(row.kind, displayName))
                 case .failure(let error):
                     self.banner = Banner(kind: .error, text: error.localizedDescription)
                 }
@@ -364,6 +459,85 @@ final class AppModel {
         }
     }
 
+    /// Set or clear a display alias for a CLI account (stored in `cli-meta.json`; never renames its folder).
+    func setCLIAlias(_ row: CLIRow, _ alias: String?) {
+        if isPreview { return }
+        let cli = self.cli, keychain = self.cliKeychain
+        queue.async {
+            let result = Result {
+                try CLIMeta.edit(cli.env) { try $0.setAlias(kind: row.kind, name: row.name, alias) }
+            }
+            let boards = Self.readCLI(cli, keychain)
+            Task { @MainActor in
+                self.setCLI(boards)
+                if case .failure(let error) = result {
+                    self.banner = Banner(kind: .error, text: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// Sign a non-default CLI account out and move its profile folder to the Trash.
+    func removeCLI(_ row: CLIRow) {
+        guard !isPreview, !row.isDefault else { return }
+        let cli = self.cli, keychain = self.cliKeychain
+        let displayName = displayCLIActiveLabel(row)
+        queue.async {
+            let result = Result {
+                let p = try Self.profile(cli, row.kind, row.name)
+                if cli.signIn(p, keychain: keychain).state != .signedOut, let real = Self.realBinary(cli, row.kind) {
+                    var base = ProcessInfo.processInfo.environment
+                    base["PATH"] = CLIShim.enrichedPath(env: cli.env, realBinary: real, base: base["PATH"])
+                    let run = CLILoginRun(profile: p, binary: real, arguments: row.kind.logoutArguments, baseEnvironment: base)
+                    if (try? run.start()) != nil {
+                        let timer = DispatchWorkItem { run.cancel(grace: 1) }
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 8, execute: timer)
+                        run.wait()
+                        timer.cancel()
+                    }
+                }
+                try cli.remove(p)
+            }
+            let boards = Self.readCLI(cli, keychain)
+            Task { @MainActor in
+                self.cliQuotaErrors[row.id] = nil
+                self.cliAttempt[row.id] = nil
+                self.cliFailures[row.id] = nil
+                self.setCLI(boards)
+                switch result {
+                case .success:
+                    self.banner = Banner(kind: .success, text: L.cliRemoved(displayName))
+                case .failure(let error):
+                    self.banner = Banner(kind: .error, text: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// Open a Terminal window running one session as this CLI account without changing the global pointer.
+    func openTerminalForCLI(_ row: CLIRow) {
+        if isPreview { return }
+        let bundled = Bundle.main.resourceURL?.appendingPathComponent("switcher").path
+        let command: String
+        if let bundled, FileManager.default.isExecutableFile(atPath: bundled) {
+            command = "exec \(shellQuote(bundled)) cli exec \(row.kind.command) \(shellQuote(row.name))"
+        } else if !row.launchCommand.isEmpty {
+            command = row.launchCommand
+        } else {
+            return
+        }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("switcher-terminal", isDirectory: true)
+        let url = dir.appendingPathComponent("launch-\(row.kind.command)-\(UUID().uuidString.prefix(8)).command")
+        do {
+            try FS.makePrivateDir(dir)
+            let pathExport = "export PATH=\(shellQuote(CLIShim.enrichedPath(env: cli.env)))\n"
+            try FS.atomicWrite(Data("#!/bin/sh\nrm -f \"$0\"\nclear\n\(pathExport)\(command)\n".utf8), to: url)
+            guard chmod(url.path, 0o700) == 0 else { throw SwitcherError.message("cannot make \(url.path) executable") }
+            NSWorkspace.shared.open(url)
+        } catch {
+            banner = Banner(kind: .error, text: error.localizedDescription)
+        }
+    }
 
     /// Add an account with one click: Switcher names the folder (`account2`, …), and the CLI's own
     /// sign-in runs in the background and opens the browser. If it ends without a sign-in, the
@@ -417,7 +591,7 @@ final class AppModel {
         }
         // Launched from Finder the app has a bare PATH; the CLI may look for its helpers there.
         var base = ProcessInfo.processInfo.environment
-        base["PATH"] = [cli.env.home + "/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", base["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"].joined(separator: ":")
+        base["PATH"] = CLIShim.enrichedPath(env: cli.env, realBinary: binary, base: base["PATH"])
         let run = CLILoginRun(profile: p, binary: binary, baseEnvironment: base)
         do { try run.start() } catch {
             banner = Banner(kind: .error, text: error.localizedDescription)
@@ -467,11 +641,14 @@ final class AppModel {
                 if let handoff {
                     self.openSignIn(p.kind, name: handoff.name, loginCommand: handoff.command)
                 } else if signedIn {
+                    let shown = self.displayEmail(email) ?? p.name
                     if let twin {
-                        self.banner = Banner(kind: .info, text: L.cliDuplicate(email ?? p.name, twin.isDefault ? "1" : twin.name))
+                        self.banner = Banner(kind: .info, text: L.cliDuplicate(shown, twin.isDefault ? "1" : twin.name))
                     } else {
-                        self.banner = Banner(kind: .success, text: L.cliSignedIn(p.kind, email ?? p.name))
+                        self.banner = Banner(kind: .success, text: L.cliSignedIn(p.kind, shown))
                     }
+                    self.cliQuotaErrors[p.id] = nil
+                    self.cliFailures[p.id] = nil
                     self.loadCLIQuota(p.kind, force: true)
                 } else if !cancelled, !cancelledLate {
                     let last = output.split(separator: "\n").last.map(String.init) ?? ""
@@ -501,16 +678,46 @@ final class AppModel {
         }
     }
 
+    private nonisolated static func readOneCLIQuota(
+        _ p: CLIProfile, env: CLIEnv, keychain: CLIKeychain, cache: CLIQuotaCache,
+        codexBinary: String?, codexEnv: [String: String]?
+    ) async -> (String, CLIQuotaError?) {
+        let profiles = CLIProfiles(env: env)
+        do {
+            let quota: CLIQuota
+            switch p.kind {
+            case .claude:
+                quota = try await ClaudeCodeQuota.read(profile: p, profiles: profiles, keychain: keychain, http: URLSessionHTTPGetter())
+            case .codex:
+                guard let binary = codexBinary, let processEnv = codexEnv else {
+                    throw CLIQuotaError.unavailable(L.cliNotFound(.codex))
+                }
+                quota = try await CodexQuota.read(profile: p, codexBinary: binary, environment: processEnv)
+            }
+            try? cache.store(quota, for: p, accountKey: profiles.identity(p)?.accountKey)
+            return (p.id, nil)
+        } catch let error as CLIQuotaError {
+            return (p.id, error)
+        } catch {
+            return (p.id, .unavailable(error.localizedDescription))
+        }
+    }
+
     /// Read the usage of every signed-in account of `kind`, at most every 5 minutes (sooner with
     /// `force`). Never renews a sign-in: an expired one is reported on its row.
     /// `only`: these accounts, from the background check (it has its own rule, so no throttle here).
     func loadCLIQuota(_ kind: CLIKind, force: Bool = false, only: [String]? = nil) {
         if isPreview || cliReading.contains(kind) { return }
         if !force, only == nil, let at = cliQuotaReadAt[kind], Date().timeIntervalSince(at) < 300 { return }
-        // Opening the menu does not cut short the backoff after failures (a rate limit waits an hour).
+        // Opening the menu does not cut short the backoff after failures; manual refresh still respects 429 backoff.
         let now = Date()
         func backingOff(_ row: CLIRow) -> Bool {
-            !force && CLIRefreshPlan.backingOff(lastAttempt: cliAttempt[row.id], failures: cliFailures[row.id] ?? 0, now: now)
+            let failures = cliFailures[row.id] ?? 0
+            if !force {
+                return CLIRefreshPlan.backingOff(lastAttempt: cliAttempt[row.id], failures: failures, now: now)
+            }
+            return failures >= CLIRefreshPlan.rateLimitedFailures
+                && CLIRefreshPlan.backingOff(lastAttempt: cliAttempt[row.id], failures: failures, now: now)
         }
         guard let names = cliBoard(kind)?.rows.filter({ $0.signIn.isGood && (only?.contains($0.name) ?? true) && !backingOff($0) }).map(\.name),
               !names.isEmpty else { return }
@@ -519,24 +726,34 @@ final class AppModel {
         let cli = self.cli, keychain = self.cliKeychain
         Task.detached {
             let cache = CLIQuotaCache(env: cli.env)
+            let codexBinary = kind == .codex ? Self.realBinary(cli, .codex) : nil
+            let codexEnv: [String: String]? = codexBinary.map { binary in
+                var processEnv = ProcessInfo.processInfo.environment
+                processEnv["PATH"] = CLIShim.enrichedPath(env: cli.env, realBinary: binary, base: processEnv["PATH"])
+                return processEnv
+            }
+            let targets = names.compactMap { try? Self.profile(cli, kind, $0) }
+            let maxConcurrent = 3
             var errors: [String: CLIQuotaError?] = [:]
-            for name in names {
-                guard let p = try? Self.profile(cli, kind, name) else { continue }
-                do {
-                    let quota: CLIQuota
-                    switch kind {
-                    case .claude:
-                        quota = try await ClaudeCodeQuota.read(profile: p, profiles: cli, keychain: keychain, http: URLSessionHTTPGetter())
-                    case .codex:
-                        guard let binary = Self.realBinary(cli, .codex) else { throw CLIQuotaError.unavailable(L.cliNotFound(.codex)) }
-                        quota = try await CodexQuota.read(profile: p, codexBinary: binary)
+            await withTaskGroup(of: (String, CLIQuotaError?).self) { group in
+                var nextIndex = 0
+                let initial = min(maxConcurrent, targets.count)
+                while nextIndex < initial {
+                    let target = targets[nextIndex]
+                    nextIndex += 1
+                    group.addTask {
+                        await Self.readOneCLIQuota(target, env: cli.env, keychain: keychain, cache: cache, codexBinary: codexBinary, codexEnv: codexEnv)
                     }
-                    try? cache.store(quota, for: p, accountKey: cli.identity(p)?.accountKey)
-                    errors[p.id] = .some(nil)
-                } catch let error as CLIQuotaError {
-                    errors[p.id] = error
-                } catch {
-                    errors[p.id] = .unavailable(error.localizedDescription)
+                }
+                for await (id, error) in group {
+                    errors.updateValue(error, forKey: id)
+                    if nextIndex < targets.count {
+                        let target = targets[nextIndex]
+                        nextIndex += 1
+                        group.addTask {
+                            await Self.readOneCLIQuota(target, env: cli.env, keychain: keychain, cache: cache, codexBinary: codexBinary, codexEnv: codexEnv)
+                        }
+                    }
                 }
             }
             let boards = Self.readCLI(cli, keychain)
@@ -562,19 +779,23 @@ final class AppModel {
         guard !isPreview, row.kind == .claude, !cliRenewing.contains(row.id) else { return }
         cliRenewing.insert(row.id)
         let cli = self.cli
+        let displayName = displayCLIActiveLabel(row)
         Task.detached {
             var renewed = false
             if let p = try? Self.profile(cli, row.kind, row.name), let binary = Self.realBinary(cli, .claude) {
-                renewed = ClaudeCodeQuota.renewLogin(profile: p, claudeBinary: binary, stateDir: cli.env.config + "/renew")
+                var processEnv = ProcessInfo.processInfo.environment
+                processEnv["PATH"] = CLIShim.enrichedPath(env: cli.env, realBinary: binary, base: processEnv["PATH"])
+                renewed = ClaudeCodeQuota.renewLogin(profile: p, claudeBinary: binary, stateDir: cli.env.config + "/renew", environment: processEnv)
             }
             let ok = renewed
             await MainActor.run {
                 self.cliRenewing.remove(row.id)
                 if ok {
                     self.cliQuotaErrors[row.id] = nil
+                    self.cliFailures[row.id] = nil
                     self.loadCLIQuota(.claude, force: true)
                 } else {
-                    self.banner = Banner(kind: .info, text: L.cliRenewFailed(row.label))
+                    self.banner = Banner(kind: .info, text: L.cliRenewFailed(displayName))
                 }
             }
         }
@@ -598,7 +819,8 @@ final class AppModel {
         let url = dir.appendingPathComponent("sign-in-\(kind.command)-\(UUID().uuidString.prefix(8)).command")
         do {
             try FS.makePrivateDir(dir)
-            try FS.atomicWrite(Data("#!/bin/sh\nrm -f \"$0\"\nclear\n\(command)\n".utf8), to: url)
+            let pathExport = "export PATH=\(shellQuote(CLIShim.enrichedPath(env: cli.env)))\n"
+            try FS.atomicWrite(Data("#!/bin/sh\nrm -f \"$0\"\nclear\n\(pathExport)\(command)\n".utf8), to: url)
             guard chmod(url.path, 0o700) == 0 else { throw SwitcherError.message("cannot make \(url.path) executable") }
             NSWorkspace.shared.open(url)
         } catch {
@@ -614,12 +836,20 @@ final class AppModel {
 
     // MARK: Account list
 
+    func setAlias(_ p: ProviderID, _ account: String, _ alias: String?) {
+        edit { try Roster.edit($0.env) { try $0.setAlias(p, account, alias) } }
+    }
+
     func setDisabled(_ p: ProviderID, _ account: String, _ disabled: Bool) {
         edit { try Roster.edit($0.env) { $0.setDisabled(p, account, disabled) } }
     }
 
     func move(_ p: ProviderID, _ account: String, to number: Int) {
         edit { try Roster.edit($0.env) { try $0.move(p, account, to: number) } }
+    }
+
+    func reorder(_ p: ProviderID, _ account: String, toIndex: Int) {
+        edit { try Roster.edit($0.env) { try $0.reorder(p, account, toIndex: toIndex) } }
     }
 
     func remove(_ p: ProviderID, _ account: String) {
@@ -653,9 +883,9 @@ final class AppModel {
     }
 }
 
-/// The words on screen, in English and Simplified Chinese, following the system language.
+/// The words on screen, in English and Simplified Chinese, following the user's preference or the system language.
 enum L {
-    static let zh = Locale.preferredLanguages.first?.hasPrefix("zh") ?? false
+    static var zh: Bool { L10n.zh }
 
     static func t(_ en: String, _ cn: String) -> String { zh ? cn : en }
 
@@ -671,7 +901,20 @@ enum L {
         t("\(app) is now signed in to \(who).", "\(app) 已切换到 \(who)。")
     }
 
+    static func switchCancelled(_ app: String) -> String {
+        t("Cancelled. \(app) was left as it is.", "已取消，\(app) 保持原样。")
+    }
+
     static func imported(_ n: Int) -> String {
         t("Imported \(n) saved sign-in(s) from CC Same.", "已从 CC Same 导入 \(n) 个已保存登录。")
+    }
+
+    static func cliRemoved(_ who: String) -> String {
+        t("Removed \(who). Shared sessions and settings stay.", "已移除 \(who)，共享会话和设置保持不变。")
+    }
+
+    static func cliRemoveExplained(_ kind: CLIKind) -> String {
+        t("Signs this \(kind.displayName) account out and moves its folder to the Trash. Shared sessions and settings stay.",
+          "会先退出这个 \(kind.displayName) 账号的登录，再把它的配置文件夹移入废纸篓。共享的会话和设置保持不变。")
     }
 }

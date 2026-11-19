@@ -236,7 +236,7 @@ public struct CLIUsageReport: Codable, Equatable, Sendable {
     /// profile id, if any.
     public static func build(profiles: CLIProfiles, kinds: [CLIKind] = CLIKind.allCases, now: Date = Date(),
                              signedIn: ((CLIProfile) -> Bool)? = nil, errors: [String: String] = [:]) -> CLIUsageReport {
-        let cache = CLIQuotaCache(env: profiles.env)
+        let cache = CLIQuotaCache(env: profiles.env).snapshot()
         let clis = kinds.map { kind -> CLI in
             let activity = CLIUsage.lastActivity(kind, env: profiles.env, now: now)
             let active = profiles.active(kind).path

@@ -58,6 +58,12 @@ public enum CLIKind: String, CaseIterable, Codable, Sendable, Identifiable {
         return prefix + ([command] + loginArguments).joined(separator: " ")
     }
 
+    /// The command to start one session as this profile without changing the global pointer.
+    public func launchCommand(_ profile: CLIProfile) -> String {
+        let prefix = profile.isDefault ? "env -u \(envVar) SWITCHER_BYPASS=1 " : "\(envVar)=\(shellQuote(profile.path)) "
+        return prefix + command
+    }
+
     /// The CLI's own sign-in, run inside the profile's folder: it opens the browser and stores the
     /// sign-in where that folder's sessions look for it.
     public var loginArguments: [String] {
@@ -176,11 +182,13 @@ public final class CLIProfiles {
     }
 
     /// `1` is the default account, `2…` the profiles in name order (account2 before account10);
-    /// or a name, `default`, or the email an account is signed in as (when only one is).
+    /// or a name, `default`, an alias, or the email an account is signed in as (when only one is).
     public func resolve(_ kind: CLIKind, _ query: String) -> CLIProfile? {
         let all = list(kind)
         if let n = Int(query), n >= 1, n <= all.count { return all[n - 1] }
         if let p = all.first(where: { $0.name == query }) ?? all.first(where: { $0.name.lowercased() == query.lowercased() }) { return p }
+        if let name = CLIMeta.load(env).profileName(kind: kind, matchingAlias: query),
+           let p = all.first(where: { $0.name == name }) { return p }
         guard query.contains("@") else { return nil }
         let byEmail = all.filter { identity($0)?.email?.lowercased() == query.lowercased() }
         return byEmail.count == 1 ? byEmail[0] : nil

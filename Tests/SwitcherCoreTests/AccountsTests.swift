@@ -34,6 +34,57 @@ let ORG_TEAM = "00000000-0000-4000-8000-00000000000b"
         // Antigravity's list is separate.
         #expect(r.slots(.antigravity).isEmpty)
     }
+
+    @Test func reorderMovesAtomicallyAndPreservesGaps() throws {
+        var r = Roster()
+        r.join(.claude, account: "a", email: "a@x.com") // 1
+        r.join(.claude, account: "b", email: "b@x.com") // 2
+        r.join(.claude, account: "c", email: "c@x.com") // 3
+        r.join(.claude, account: "d", email: "d@x.com") // 4
+        r.remove(.claude, "b") // numbers are now [1, 3, 4]
+        #expect(r.slots(.claude).map(\.number) == [1, 3, 4])
+
+        try r.reorder(.claude, "d", toIndex: 0)
+        #expect(r.slots(.claude).map(\.account) == ["d", "a", "c"])
+        #expect(r.slots(.claude).map(\.number) == [1, 3, 4])
+
+        try r.reorder(.claude, "d", toIndex: 2)
+        #expect(r.slots(.claude).map(\.account) == ["a", "c", "d"])
+        #expect(r.slots(.claude).map(\.number) == [1, 3, 4])
+
+        // Moving to same index is a no-op; out-of-range or unknown throws.
+        try r.reorder(.claude, "c", toIndex: 1)
+        #expect(r.slots(.claude).map(\.account) == ["a", "c", "d"])
+        #expect(throws: (any Error).self) { try r.reorder(.claude, "a", toIndex: -1) }
+        #expect(throws: (any Error).self) { try r.reorder(.claude, "a", toIndex: 3) }
+        #expect(throws: (any Error).self) { try r.reorder(.claude, "missing", toIndex: 0) }
+    }
+}
+
+@Suite struct PrivacyTests {
+    @Test func masksEmailsAndLeavesNonEmailsAlone() {
+        #expect(Privacy.maskEmail("ada@lovelace.dev") == "a•••@l•••.dev")
+        #expect(Privacy.maskEmail("x@sub.example.co.uk") == "x•••@s•••.uk")
+        #expect(Privacy.maskEmail("a@localhost") == "a•••@l•••")
+        #expect(Privacy.maskEmail("work") == "work")
+        #expect(Privacy.maskEmail("@example.com") == "@example.com")
+        #expect(Privacy.maskEmail("ada@") == "ada@")
+        #expect(Privacy.displayEmail("ada@lovelace.dev", masked: false) == "ada@lovelace.dev")
+        #expect(Privacy.displayEmail("ada@lovelace.dev", masked: true) == "a•••@l•••.dev")
+        #expect(Privacy.displayEmail(nil, masked: true) == nil)
+    }
+}
+
+@Suite(.serialized) struct LocalizationTests {
+    @Test func overrideSwitchesDynamicLocalization() {
+        defer { L10n.override = nil }
+        L10n.override = .en
+        #expect(!L10n.zh)
+        #expect(L10n.t("Hello", "你好") == "Hello")
+        L10n.override = .zhHans
+        #expect(L10n.zh)
+        #expect(L10n.t("Hello", "你好") == "你好")
+    }
 }
 
 @Suite struct UsageTests {

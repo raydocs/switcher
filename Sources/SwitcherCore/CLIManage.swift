@@ -58,6 +58,7 @@ extension CLIProfiles {
         } else {
             try removeFolder(profile)
         }
+        try? CLIMeta.edit(env) { $0.remove(kind: profile.kind, name: profile.name) }
     }
 
     private func removeFolder(_ profile: CLIProfile) throws {

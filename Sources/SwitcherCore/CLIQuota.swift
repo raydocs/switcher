@@ -504,7 +504,7 @@ public enum CodexQuota {
 /// bound to the account it was read for (the opaque account id, never a token or a hash of one):
 /// when a profile is signed in as someone else, the old entry is not returned.
 public struct CLIQuotaCache {
-    struct Entry: Codable {
+    struct Entry: Codable, Sendable {
         var quota: CLIQuota
         var accountKey: String?
     }
@@ -514,16 +514,27 @@ public struct CLIQuotaCache {
         var profiles: [String: Entry] = [:]
     }
 
+    /// One in-memory read of `quota-cache.json`, avoiding repeated disk I/O across profiles.
+    public struct Snapshot: Sendable {
+        let entries: [String: Entry]
+
+        public func quota(for profile: CLIProfile, accountKey: String?) -> CLIQuota? {
+            guard let e = entries[profile.id], e.accountKey == accountKey else { return nil }
+            return e.quota
+        }
+    }
+
     public let url: URL
 
     public init(env: CLIEnv) { url = URL(fileURLWithPath: env.config + "/quota-cache.json") }
 
     public func load() -> [String: CLIQuota] { readFile().profiles.mapValues(\.quota) }
 
+    public func snapshot() -> Snapshot { Snapshot(entries: readFile().profiles) }
+
     /// The cached quota, only when it was read for `accountKey` (the profile's current account).
     public func quota(for profile: CLIProfile, accountKey: String?) -> CLIQuota? {
-        guard let e = readFile().profiles[profile.id], e.accountKey == accountKey else { return nil }
-        return e.quota
+        snapshot().quota(for: profile, accountKey: accountKey)
     }
 
     /// Read, merge and write under one lock (the app reads Claude and Codex at the same time, and

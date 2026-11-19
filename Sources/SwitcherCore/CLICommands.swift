@@ -70,6 +70,7 @@ public enum CLICommands {
     public struct ListEntry: Codable, Equatable, Sendable {
         public var number: Int
         public var name: String
+        public var alias: String?
         public var path: String
         public var isDefault: Bool
         public var active: Bool
@@ -87,7 +88,8 @@ public enum CLICommands {
 
         /// One line for the terminal.
         public func line() -> String {
-            var parts = ["\(active ? "●" : " ") \(number). \(name)"]
+            let title = alias.map { "\($0) (\(name))" } ?? name
+            var parts = ["\(active ? "●" : " ") \(number). \(title)"]
             if let email { parts.append(email) }
             if let plan { parts.append("(\(plan))") }
             switch signIn {
@@ -119,19 +121,20 @@ public enum CLICommands {
 
     /// Every CLI's profiles with who they are signed in as. Never contains a token.
     public static func list(_ profiles: CLIProfiles, keychain: CLIKeychain, kinds: [CLIKind] = CLIKind.allCases) -> [ListGroup] {
-        kinds.map { kind in
+        let meta = CLIMeta.load(profiles.env)
+        return kinds.map { kind in
             let active = profiles.active(kind)
             let entries = profiles.list(kind).enumerated().map { i, p -> ListEntry in
                 let id = profiles.identity(p)
-                let s = profiles.signIn(p, keychain: keychain)
+                let (s, sub) = profiles.signInAndSubscription(p, keychain: keychain)
                 let signIn: String, mode: String?
                 switch s.state {
                 case .signedIn: (signIn, mode) = ("signedIn", nil)
                 case .signedOut: (signIn, mode) = ("signedOut", nil)
                 case .other(let m): (signIn, mode) = ("other", m)
                 }
-                let plan = id?.plan ?? (kind == .claude && s.state == .signedIn ? profiles.claudeSubscription(p, keychain: keychain) : nil)
-                return ListEntry(number: i + 1, name: p.name, path: p.path, isDefault: p.isDefault, active: p.path == active.path,
+                let plan = id?.plan ?? (s.state == .signedIn ? sub : nil)
+                return ListEntry(number: i + 1, name: p.name, alias: meta.alias(for: p), path: p.path, isDefault: p.isDefault, active: p.path == active.path,
                                  email: id?.email, organization: id?.organization, plan: plan,
                                  signIn: signIn, signInMode: mode, signInGoodUntil: s.state == .signedIn ? s.refreshExpiresAt : nil,
                                  loginCommand: s.state == .signedOut ? kind.loginCommand(p) : nil)

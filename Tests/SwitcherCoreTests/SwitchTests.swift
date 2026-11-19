@@ -154,6 +154,29 @@ final class Sandbox {
         let claude = Provider.claude(env: box.env, app: FakeApp(running: true), keychain: MemorySecrets())
         #expect(throws: SwitchRefused.nothingSaved) { try claude.switchTo(GRACE) }
     }
+
+    @Test func switchEmitsRealPhases() throws {
+        let box = Sandbox()
+        box.claudeSignIn(ADA)
+        let running = FakeApp(name: "Claude", running: true)
+        let claude = Provider.claude(env: box.env, app: running, keychain: MemorySecrets())
+
+        var phases: [SwitchStage] = []
+        try claude.switchTo(nil, phase: { phases.append($0) })
+        #expect(phases == [.quitting, .swapping, .opening])
+
+        box.claudeSignIn(GRACE)
+        let stopped = FakeApp(name: "Claude", running: false)
+        let claudeStopped = Provider.claude(env: box.env, app: stopped, keychain: MemorySecrets())
+
+        phases = []
+        try claudeStopped.switchTo(ADA, alwaysLaunch: false, phase: { phases.append($0) })
+        #expect(phases == [.swapping])
+
+        phases = []
+        try claudeStopped.switchTo(GRACE, alwaysLaunch: true, phase: { phases.append($0) })
+        #expect(phases == [.swapping, .opening])
+    }
 }
 
 @Suite struct AntigravitySwitching {

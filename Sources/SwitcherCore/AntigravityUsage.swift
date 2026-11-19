@@ -303,8 +303,3 @@ public final class AntigravityUsage: @unchecked Sendable {
     }
 }
 
-/// English or Simplified Chinese, following the system language.
-public enum L10n {
-    public static let zh = Locale.preferredLanguages.first?.hasPrefix("zh") ?? false
-    public static func t(_ en: String, _ cn: String) -> String { zh ? cn : en }
-}
