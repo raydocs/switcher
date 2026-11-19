@@ -421,7 +421,7 @@ struct GeneralSettings: View {
         label: String,
         selection: Binding<T>,
         cases: [T],
-        title: (T) -> String
+        title: @escaping (T) -> String
     ) -> some View {
         if staticRender {
             HStack(spacing: 4) {
