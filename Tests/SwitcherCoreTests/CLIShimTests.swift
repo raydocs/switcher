@@ -266,6 +266,38 @@ import Testing
         #expect(!FS.exists(URL(fileURLWithPath: env.shim(.claude))))
         #expect(FS.exists(URL(fileURLWithPath: env.shim(.codex))))
     }
+
+    @Test func findsBinariesInUserVersionManagerDirsAndEnrichesPath() {
+        let box = CLIBox()
+        let env = box.env
+        // Codex installed under nvm (picks highest version first).
+        let nvmOld = box.home + "/.nvm/versions/node/v18.0.0/bin/codex"
+        let nvmNew = box.home + "/.nvm/versions/node/v22.12.0/bin/codex"
+        box.fakeBinary(nvmOld)
+        box.fakeBinary(nvmNew)
+        #expect(CLIShim.findRealBinary(.codex, env: env, path: "/nonexistent") == nvmNew)
+
+        // Bun / Volta directories are discovered even with an empty PATH.
+        let box2 = CLIBox()
+        let bunCodex = box2.home + "/.bun/bin/codex"
+        box2.fakeBinary(bunCodex)
+        #expect(CLIShim.findRealBinary(.codex, env: box2.env, path: "") == bunCodex)
+
+        let box3 = CLIBox()
+        let voltaClaude = box3.home + "/.volta/bin/claude"
+        box3.fakeBinary(voltaClaude)
+        #expect(CLIShim.findRealBinary(.claude, env: box3.env, path: "") == voltaClaude)
+
+        // enrichedPath prepends realBinary's parent (unless it's shimDir), includes home bin dirs, and deduplicates.
+        let enriched = CLIShim.enrichedPath(env: env, realBinary: nvmNew, base: "/usr/bin:/usr/bin")
+        let parts = enriched.split(separator: ":").map(String.init)
+        #expect(parts.first == box.home + "/.nvm/versions/node/v22.12.0/bin")
+        #expect(parts.contains(box.home + "/.bun/bin"))
+        #expect(parts.contains("/opt/homebrew/bin"))
+        #expect(parts.filter { $0 == "/usr/bin" }.count == 1)
+        let fromShim = CLIShim.enrichedPath(env: env, realBinary: env.shim(.codex), base: "/usr/bin")
+        #expect(!fromShim.split(separator: ":").contains(Substring(env.shimDir)))
+    }
 }
 
 @Suite struct CLIShimRCTests {

@@ -130,22 +130,30 @@ extension CLIProfiles {
     }
 
     public func signIn(_ profile: CLIProfile, keychain: CLIKeychain) -> CLISignIn {
+        signInAndSubscription(profile, keychain: keychain).signIn
+    }
+
+    /// Reads sign-in state and (for Claude) subscription type in a single keychain lookup.
+    public func signInAndSubscription(_ profile: CLIProfile, keychain: CLIKeychain) -> (signIn: CLISignIn, subscription: String?) {
         func date(_ v: Any?) -> Date? { (v as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) } }
         switch profile.kind {
         case .claude:
-            guard let o = claudeOAuth(profile, keychain: keychain), o["accessToken"] is String else { return CLISignIn(state: .signedOut) }
-            return CLISignIn(state: .signedIn, accessExpiresAt: date(o["expiresAt"]), refreshExpiresAt: date(o["refreshTokenExpiresAt"]))
+            guard let o = claudeOAuth(profile, keychain: keychain), o["accessToken"] is String else {
+                return (CLISignIn(state: .signedOut), nil)
+            }
+            let signIn = CLISignIn(state: .signedIn, accessExpiresAt: date(o["expiresAt"]), refreshExpiresAt: date(o["refreshTokenExpiresAt"]))
+            return (signIn, o["subscriptionType"] as? String)
         case .codex:
-            guard let auth = codexAuth(profile) else { return CLISignIn(state: .signedOut) }
+            guard let auth = codexAuth(profile) else { return (CLISignIn(state: .signedOut), nil) }
             let mode = auth["auth_mode"] as? String ?? (auth["tokens"] != nil ? "chatgpt" : "apikey")
             let last = (auth["last_refresh"] as? String).flatMap { ISO8601DateFormatter.lenient($0) }
             func present(_ v: Any?) -> Bool { (v as? String).map { !$0.isEmpty } ?? false }
             guard present((auth["tokens"] as? [String: Any])?["refresh_token"]) else {
                 // An API-key sign-in with no key (`{}`, a null or empty key) is no sign-in at all.
                 let noKey = mode.lowercased() == "apikey" && !present(auth["OPENAI_API_KEY"])
-                return CLISignIn(state: mode.lowercased().contains("chatgpt") || noKey ? .signedOut : .other(mode), lastRefresh: last)
+                return (CLISignIn(state: mode.lowercased().contains("chatgpt") || noKey ? .signedOut : .other(mode), lastRefresh: last), nil)
             }
-            return CLISignIn(state: mode.lowercased().contains("chatgpt") ? .signedIn : .other(mode), lastRefresh: last)
+            return (CLISignIn(state: mode.lowercased().contains("chatgpt") ? .signedIn : .other(mode), lastRefresh: last), nil)
         }
     }
 

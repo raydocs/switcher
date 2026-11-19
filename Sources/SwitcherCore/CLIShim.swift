@@ -60,14 +60,56 @@ public enum CLIShim {
         return head.contains(marker)
     }
 
+    /// Common user-space bin directories under `env.home` (safe in tests because `env.home` is a temp dir).
+    static func homeBinDirs(env: CLIEnv) -> [String] {
+        var dirs = [
+            env.home + "/.local/bin",
+            env.home + "/.volta/bin",
+            env.home + "/.bun/bin",
+            env.home + "/.npm-global/bin",
+            env.home + "/.local/share/mise/shims",
+            env.home + "/.asdf/shims",
+            env.home + "/.fnm/current/bin",
+        ]
+        let nvmRoot = env.home + "/.nvm/versions/node"
+        if let versions = try? FileManager.default.contentsOfDirectory(atPath: nvmRoot) {
+            let sorted = versions.filter { !$0.hasPrefix(".") }
+                .sorted { $0.localizedStandardCompare($1) == .orderedDescending }
+            dirs += sorted.prefix(3).map { "\(nvmRoot)/\($0)/bin" }
+        }
+        return dirs
+    }
+
+    /// A PATH suitable for spawning real CLIs even when Switcher.app is launched from Finder with a bare PATH.
+    public static func enrichedPath(env: CLIEnv, realBinary: String? = nil, base: String? = ProcessInfo.processInfo.environment["PATH"]) -> String {
+        var dirs: [String] = []
+        if let realBinary {
+            let parent = (realBinary as NSString).deletingLastPathComponent
+            if !parent.isEmpty, parent != env.shimDir { dirs.append(parent) }
+        }
+        if let base {
+            dirs += base.split(separator: ":").map { CLIPath.trimmed(String($0)) }.filter { !$0.isEmpty }
+        }
+        dirs += homeBinDirs(env: env)
+        dirs += ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        var seen = Set<String>()
+        return dirs.filter { seen.insert($0).inserted }.joined(separator: ":")
+    }
+
     /// The real binary: Claude's own launcher (its updater keeps `~/.local/bin/claude` current),
-    /// else the first executable on `PATH` that is not a Switcher shim.
-    public static func findRealBinary(_ kind: CLIKind, env: CLIEnv, path: String = ProcessInfo.processInfo.environment["PATH"] ?? "") -> String? {
+    /// else the first executable on `PATH` (or common user/Homebrew dirs when `path` is omitted)
+    /// that is not a Switcher shim.
+    public static func findRealBinary(_ kind: CLIKind, env: CLIEnv, path: String? = nil) -> String? {
         if let given = env.realBinaries[kind] { return given }
+        let effectivePath = path ?? (ProcessInfo.processInfo.environment["PATH"] ?? "")
         var candidates: [String] = []
         if kind == .claude { candidates.append(env.home + "/.local/bin/claude") }
-        candidates += path.split(separator: ":").map { CLIPath.trimmed(String($0)) + "/" + kind.command }
-        if kind == .codex { candidates += ["/opt/homebrew/bin/codex", "/usr/local/bin/codex"] }
+        candidates += effectivePath.split(separator: ":").map { CLIPath.trimmed(String($0)) + "/" + kind.command }
+        candidates += homeBinDirs(env: env).map { $0 + "/" + kind.command }
+        // Only probe host-wide Homebrew/local bins when no explicit PATH was supplied (keeps tests hermetic).
+        if path == nil {
+            candidates += ["/opt/homebrew/bin/" + kind.command, "/usr/local/bin/" + kind.command]
+        }
         return candidates.first { c in
             !c.hasPrefix(env.shimDir + "/") && FileManager.default.isExecutableFile(atPath: c) && !isShim(c)
         }
@@ -75,7 +117,7 @@ public enum CLIShim {
 
     /// Write both shims (0755, atomically). Returns the real binary each one runs.
     @discardableResult
-    public static func installShims(env: CLIEnv, path: String = ProcessInfo.processInfo.environment["PATH"] ?? "") throws -> [CLIKind: String] {
+    public static func installShims(env: CLIEnv, path: String? = nil) throws -> [CLIKind: String] {
         var out: [CLIKind: String] = [:]
         try FileManager.default.createDirectory(atPath: env.shimDir, withIntermediateDirectories: true)
         for kind in CLIKind.allCases {

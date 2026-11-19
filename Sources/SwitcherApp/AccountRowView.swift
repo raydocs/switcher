@@ -50,23 +50,29 @@ struct AccountRowView: View {
     let row: AccountRow
     let index: Int
     @Binding var removing: String?
+    @Binding var renaming: String?
     var forcedHover = false
 
     @State private var hovering = false
+    @State private var draftAlias = ""
     @FocusState private var focused: Bool
+    @FocusState private var aliasFocused: Bool
     @Environment(\.staticRender) private var staticRender
 
     private var app: String { provider.displayName }
+    private var display: (title: String, subtitle: String?) { model.displayLabel(row.slot) }
     private var switchable: Bool { row.canSwitch && !row.isCurrent }
     private var highlighted: Bool { hovering || forcedHover || focused }
     private var isTarget: Bool { model.job?.provider == provider && model.job?.target == row.id }
     private var sitsOut: Bool { row.slot.disabled }
-    private var hasDetail: Bool { row.quota != nil || !row.canSwitch || row.probablyExpired }
+    private var hasDetail: Bool { display.subtitle != nil || row.quota != nil || !row.canSwitch || row.probablyExpired }
 
     var body: some View {
         Group {
             if removing == row.id {
                 removeConfirm
+            } else if renaming == row.id {
+                renameForm
             } else {
                 normal
             }
@@ -81,9 +87,18 @@ struct AccountRowView: View {
             model.switchTo(provider, row)
         } label: {
             HStack(alignment: hasDetail ? .top : .center, spacing: Metrics.avatarGap) {
-                Avatar(label: row.slot.label, seed: row.id)
+                Avatar(label: display.title, seed: row.id)
                 VStack(alignment: .leading, spacing: 5) {
-                    titleLine
+                    VStack(alignment: .leading, spacing: 1) {
+                        titleLine
+                        if let subtitle = display.subtitle {
+                            Text(subtitle)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
                     if provider == .antigravity, let quota = row.quota { AntigravityQuotaLines(quota: quota) }
                     if !row.canSwitch && !row.isCurrent {
                         Note(symbol: "info.circle", text: L.t(
@@ -114,14 +129,14 @@ struct AccountRowView: View {
             }
         }
         .contextMenu { if !model.isBusy { menuItems } }
-        .help(switchable ? L.t("Switch \(app) to \(row.slot.label)", "将 \(app) 切换到 \(row.slot.label)") : "")
-        .accessibilityLabel(row.slot.label)
+        .help(switchable ? L.t("Switch \(app) to \(display.title)", "将 \(app) 切换到 \(display.title)") : "")
+        .accessibilityLabel(display.title)
         .accessibilityValue(row.isCurrent ? L.t("Current account", "当前账号") : "")
     }
 
     private var titleLine: some View {
         HStack(spacing: 6) {
-            Text(row.slot.label)
+            Text(display.title)
                 .font(.body.weight(row.isCurrent ? .semibold : .medium))
                 .foregroundStyle(row.canSwitch || row.isCurrent ? .primary : .secondary)
                 .lineLimit(1)
@@ -190,22 +205,92 @@ struct AccountRowView: View {
     }
 
     @ViewBuilder private var menuItems: some View {
+        Button(L.t("Rename…", "设别名…")) {
+            draftAlias = row.slot.alias ?? ""
+            removing = nil
+            renaming = row.id
+        }
         Button(sitsOut ? L.t("Include in Next Account", "恢复参与“下一个账号”") : L.t("Sit Out of Next Account", "不参与“下一个账号”")) {
             model.setDisabled(provider, row.id, !sitsOut)
         }
         Divider()
         Button(L.t("Remove…", "移除…"), role: .destructive) {
+            renaming = nil
             removing = row.id
         }
         .disabled(row.isCurrent)
     }
 
+    private var renameForm: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: Metrics.avatarGap) {
+                Avatar(label: display.title, seed: row.id)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(L.t("Set alias", "设置别名"))
+                        .font(.body.weight(.semibold))
+                    if let email = model.displayEmail(row.slot.email) {
+                        Text(email)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+            }
+            if staticRender {
+                let shown = draftAlias.isEmpty ? (row.slot.alias ?? "") : draftAlias
+                Text(shown.isEmpty ? L.t("e.g. work, personal", "例如：工作、个人") : shown)
+                    .font(.body)
+                    .foregroundStyle(shown.isEmpty ? .tertiary : .primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Fill.hover, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            } else {
+                TextField(L.t("e.g. work, personal", "例如：工作、个人"), text: $draftAlias)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($aliasFocused)
+                    .onSubmit { saveAlias() }
+            }
+            HStack(spacing: 6) {
+                if row.slot.alias != nil {
+                    Button(L.t("Clear", "清除")) {
+                        model.setAlias(provider, row.id, nil)
+                        renaming = nil
+                    }
+                    .buttonStyle(QuietButtonStyle())
+                    .font(.subheadline)
+                }
+                Spacer()
+                Button(L.t("Cancel", "取消")) { renaming = nil }
+                    .buttonStyle(SoftButtonStyle(compact: true))
+                    .keyboardShortcut(.cancelAction)
+                Button(L.t("Save", "保存")) { saveAlias() }
+                    .buttonStyle(SoftButtonStyle(kind: .tinted, compact: true))
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(.horizontal, Metrics.rowH)
+        .padding(.vertical, Metrics.rowV)
+        .background(Fill.card, in: RoundedRectangle(cornerRadius: Metrics.radius, style: .continuous))
+        .onAppear {
+            if draftAlias.isEmpty { draftAlias = row.slot.alias ?? "" }
+            if !staticRender { aliasFocused = true }
+        }
+    }
+
+    private func saveAlias() {
+        let trimmed = draftAlias.trimmingCharacters(in: .whitespacesAndNewlines)
+        model.setAlias(provider, row.id, trimmed.isEmpty ? nil : trimmed)
+        renaming = nil
+    }
+
     private var removeConfirm: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top, spacing: Metrics.avatarGap) {
-                Avatar(label: row.slot.label, seed: row.id)
+                Avatar(label: display.title, seed: row.id)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(L.t("Remove \(row.slot.label)?", "移除 \(row.slot.label)？"))
+                    Text(L.t("Remove \(display.title)?", "移除 \(display.title)？"))
                         .font(.body.weight(.semibold))
                         .lineLimit(2)
                     Text(L.removeExplained)

@@ -542,6 +542,21 @@ final class QuotaBox {
         #expect(cache.quota(for: p, accountKey: nil) == q)
         #expect(cache.quota(for: p, accountKey: "A") == nil)
     }
+
+    @Test func snapshotServesMultipleProfilesFromOneRead() throws {
+        let b = QuotaBox(), p1 = b.claude("a"), p2 = b.codex("b")
+        let q1 = CLIQuota(windows: [CLIQuotaWindow(label: "5h", usedPercent: 10, resetsAt: nil)], source: "statusline", observedAt: b.now)
+        let q2 = CLIQuota(windows: [CLIQuotaWindow(label: "week", usedPercent: 20, resetsAt: nil)], source: "codex app-server", observedAt: b.now)
+        let cache = CLIQuotaCache(env: b.env)
+        try cache.store(q1, for: p1, accountKey: "acc-1")
+        try cache.store(q2, for: p2, accountKey: "acc-2")
+
+        let snap = cache.snapshot()
+        #expect(snap.quota(for: p1, accountKey: "acc-1") == q1)
+        #expect(snap.quota(for: p1, accountKey: "other") == nil)
+        #expect(snap.quota(for: p2, accountKey: "acc-2") == q2)
+        #expect(snap.quota(for: b.claude("missing"), accountKey: nil) == nil)
+    }
 }
 
 private extension Date {

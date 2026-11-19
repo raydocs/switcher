@@ -125,4 +125,66 @@ import Testing
         #expect(!run.isRunning)
         #expect(Date().timeIntervalSince(started) < 10)
     }
+
+    @Test func cliMetaAliasesValidateResolveAndCleanUpOnRemove() throws {
+        let box = CLIBox()
+        let profiles = CLIProfiles(env: box.env)
+        let work = try profiles.add(.claude, name: "work")
+        let side = try profiles.add(.claude, name: "side")
+        let codexWork = try profiles.add(.codex, name: "work")
+
+        // Validation: length, control chars, digits-only, duplicates per kind (case-insensitive).
+        try CLIMeta.edit(box.env) { meta in
+            try meta.setAlias(kind: .claude, name: "work", "Work Main")
+            #expect(throws: (any Error).self) { try meta.setAlias(kind: .claude, name: "side", "work main") }
+            #expect(throws: (any Error).self) { try meta.setAlias(kind: .claude, name: "side", "12345") }
+            #expect(throws: (any Error).self) { try meta.setAlias(kind: .claude, name: "side", String(repeating: "a", count: 33)) }
+            #expect(throws: (any Error).self) { try meta.setAlias(kind: .claude, name: "side", "bad\nname") }
+            // Different CLI kind can use the same alias.
+            try meta.setAlias(kind: .codex, name: "work", "Work Main")
+            try meta.setAlias(kind: .claude, name: "side", "个人")
+        }
+
+        // File is private (0600) and survives reload.
+        var st = stat()
+        #expect(stat(CLIMeta.url(box.env).path, &st) == 0 && (st.st_mode & 0o777) == 0o600)
+        let loaded = CLIMeta.load(box.env)
+        #expect(loaded.alias(for: work) == "Work Main")
+        #expect(loaded.alias(for: side) == "个人")
+        #expect(loaded.alias(for: codexWork) == "Work Main")
+
+        // CLIProfiles.resolve matches aliases case-insensitively without renaming folders.
+        #expect(profiles.resolve(.claude, "work main")?.path == work.path)
+        #expect(profiles.resolve(.claude, "个人")?.path == side.path)
+        #expect(profiles.resolve(.codex, "Work Main")?.path == codexWork.path)
+
+        // CLICommands.list populates alias and renders it in line().
+        let groups = CLICommands.list(profiles, keychain: MemoryCLIKeychain())
+        let workEntry = groups.first { $0.cli == "claude" }?.profiles.first { $0.name == "work" }
+        #expect(workEntry?.alias == "Work Main")
+        #expect(workEntry?.line().contains("Work Main (work)") == true)
+
+        // Clearing an alias with empty string or nil removes it.
+        try CLIMeta.edit(box.env) { try $0.setAlias(kind: .claude, name: "side", "   ") }
+        #expect(CLIMeta.load(box.env).alias(for: side) == nil)
+
+        // Removing a profile clears its alias too.
+        try profiles.remove(work, toTrash: false)
+        #expect(CLIMeta.load(box.env).alias(for: work) == nil)
+        #expect(CLIMeta.load(box.env).alias(for: codexWork) == "Work Main")
+    }
+
+    @Test func launchCommandMatchesProfileType() throws {
+        let box = CLIBox()
+        let profiles = CLIProfiles(env: box.env)
+        let defClaude = profiles.defaultProfile(.claude)
+        let workClaude = try profiles.add(.claude, name: "work")
+        let defCodex = profiles.defaultProfile(.codex)
+        let altCodex = try profiles.add(.codex, name: "alt")
+
+        #expect(CLIKind.claude.launchCommand(defClaude) == "env -u CLAUDE_CONFIG_DIR SWITCHER_BYPASS=1 claude")
+        #expect(CLIKind.claude.launchCommand(workClaude) == "CLAUDE_CONFIG_DIR='\(workClaude.path)' claude")
+        #expect(CLIKind.codex.launchCommand(defCodex) == "env -u CODEX_HOME SWITCHER_BYPASS=1 codex")
+        #expect(CLIKind.codex.launchCommand(altCodex) == "CODEX_HOME='\(altCodex.path)' codex")
+    }
 }

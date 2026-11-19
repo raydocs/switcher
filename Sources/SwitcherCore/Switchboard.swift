@@ -158,8 +158,10 @@ public final class Switchboard {
 
     /// Switch an app to `account` (nil: signed out, to add another account).
     @discardableResult
-    public func switchTo(_ p: ProviderID, account: String?, alwaysLaunch: Bool = true, cancel: CancelToken? = nil, waiting: ((TimeInterval) -> Void)? = nil) throws -> SwitchResult {
-        let result = try provider(p).switchTo(account, alwaysLaunch: alwaysLaunch, cancel: cancel, waiting: waiting)
+    public func switchTo(_ p: ProviderID, account: String?, alwaysLaunch: Bool = true, cancel: CancelToken? = nil,
+                         phase: ((SwitchStage) -> Void)? = nil,
+                         waiting: ((TimeInterval) -> Void)? = nil) throws -> SwitchResult {
+        let result = try provider(p).switchTo(account, alwaysLaunch: alwaysLaunch, cancel: cancel, phase: phase, waiting: waiting)
         noteSignedIn()
         return result
     }
@@ -174,7 +176,7 @@ public final class Switchboard {
     /// Take an account off the list and forget its saved sign-in. Not the one in use: it would
     /// join again at once.
     public func remove(_ p: ProviderID, account: String, lockTimeout: TimeInterval = 30) throws {
-        let lock = try FileLock(claude.lockURL, timeout: lockTimeout)
+        let lock = try FileLock(provider(p).lockURL, timeout: lockTimeout)
         defer { withExtendedLifetime(lock) {} }
         if provider(p).vault.hasInterruptedSwap {
             throw SwitcherError.message(L10n.t("A switch was cut short. Quit the app once so it is finished, then remove the account.", "有一次切换被中断。先退出该应用一次让它完成，再删除账号。"))

@@ -19,6 +19,8 @@ enum Snapshot {
     }
 
     static func run(into dir: String) -> Int32 {
+        // Ignore any saved UserDefaults language so `-AppleLanguages` always drives snapshot language.
+        L10n.override = (Locale.preferredLanguages.first?.hasPrefix("zh") ?? false) ? .zhHans : .en
         let out = URL(fileURLWithPath: dir, isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
@@ -193,8 +195,8 @@ enum Snapshot {
         foundRunning.running = true
 
         func model(_ boards: [AppBoard], ccSame: CCSameImport.Found? = nil, job: SwitchJob? = nil, banner: Banner? = nil,
-                   selected: ProviderID = .claude, cli: [CLIBoard] = [], cliJustInstalled: Bool = false) -> AppModel {
-            let m = AppModel(preview: boards, ccSame: ccSame, job: job, banner: banner, cli: cli, cliJustInstalled: cliJustInstalled)
+                   selected: ProviderID = .claude, cli: [CLIBoard] = [], cliJustInstalled: Bool = false, hideEmails: Bool = false) -> AppModel {
+            let m = AppModel(preview: boards, ccSame: ccSame, job: job, banner: banner, cli: cli, cliJustInstalled: cliJustInstalled, hideEmails: hideEmails)
             m.selected = selected
             return m
         }
@@ -206,7 +208,7 @@ enum Snapshot {
                 CLIBoard(kind: .claude, shimInstalled: installed, commandFound: true, rows: [
                     s.cli(.claude, 1, "default", "ada@lovelace.dev", plan: "max", active: true, goodDays: 24,
                           usage: (42, 18, 2.4, 3), error: renew ? .signInExpired : nil),
-                    s.cli(.claude, 2, "work", "ada@orbital.dev", plan: "pro", goodDays: 2.6, usage: (91, 64, 0.7, 48)),
+                    s.cli(.claude, 2, "work", "ada@orbital.dev", alias: "team", plan: "pro", goodDays: 2.6, usage: (91, 64, 0.7, 48)),
                 ]),
                 CLIBoard(kind: .codex, shimInstalled: installed, commandFound: true, rows: [
                     s.cli(.codex, 1, "default", "ada@lovelace.dev", plan: "plus", active: true, usage: (12, 37, 3.1, 1)),
@@ -248,6 +250,7 @@ enum Snapshot {
             Fixture(name: "10-states-hover", model: model(boards(claude: edgeRows, claudeRunning: false, interrupted: true)),
                     staged: MenuView.Staged(hover: grace)),
             Fixture(name: "11-remove-confirm", model: model(boards()), staged: MenuView.Staged(confirmRemove: kat)),
+            Fixture(name: "11b-rename", model: model(boards()), staged: MenuView.Staged(rename: grace)),
             Fixture(name: "12-add-confirm", model: model(boards()), staged: MenuView.Staged(confirmAdd: true)),
             Fixture(name: "13-not-installed", model: model(boards(antigravityInstalled: false), selected: .antigravity)),
 
@@ -256,7 +259,12 @@ enum Snapshot {
             Fixture(name: "16-cli-collapsed", model: model(boards(), cli: cli()), staged: MenuView.Staged(cli: .init(expanded: []))),
             Fixture(name: "17-cli-add", model: model(boards(claude: short), cli: cli(renew: true), cliJustInstalled: true),
                     staged: MenuView.Staged(cli: .init(expanded: [.claude], adding: .claude, hover: "claude:work"))),
+            Fixture(name: "17b-cli-rename", model: model(boards(claude: short), cli: cli()),
+                    staged: MenuView.Staged(cli: .init(expanded: [.claude], rename: "claude:work"))),
+            Fixture(name: "17c-cli-remove", model: model(boards(claude: short), cli: cli()),
+                    staged: MenuView.Staged(cli: .init(expanded: [.claude], confirmRemove: "claude:work"))),
             Fixture(name: "18-cli-headroom", model: model(boards(claude: short), cli: tight), staged: both),
+            Fixture(name: "19-privacy", model: model(boards(claude: short), cli: cli(), hideEmails: true), staged: both),
 
             Fixture(name: "20-settings-general", model: model(boards()), settings: .general, page: .init(openAtLogin: true)),
             Fixture(name: "20-settings-general-meter", model: model(boards(), cli: tight), settings: .general, page: .init(openAtLogin: true)),
@@ -265,6 +273,8 @@ enum Snapshot {
             Fixture(name: "22-settings-accounts-ccsame", model: model(boards(), ccSame: found), settings: .accounts),
             Fixture(name: "23-settings-accounts-remove", model: model(boards(antigravityInstalled: false)), settings: .accounts,
                     page: .init(confirmRemove: AccountsSettings.key(.claude, kat))),
+            Fixture(name: "23b-settings-accounts-rename", model: model(boards()), settings: .accounts,
+                    page: .init(rename: AccountsSettings.key(.claude, grace))),
             Fixture(name: "27-settings-about", model: model(boards()), settings: .about),
         ]
     }
@@ -332,12 +342,13 @@ struct Make {
             setAsideAt: current ? nil : Date().addingTimeInterval(-9 * 86400), quota: quota)
     }
 
-    func cli(_ kind: CLIKind, _ number: Int, _ name: String, _ email: String?, plan: String? = nil, active: Bool = false,
+    func cli(_ kind: CLIKind, _ number: Int, _ name: String, _ email: String?, alias: String? = nil, plan: String? = nil, active: Bool = false,
              signedIn: Bool = true, goodDays: Double? = nil,
              usage: (five: Double, week: Double, resetHours: Double, minutesAgo: Double)?, error: CLIQuotaError? = nil,
              scoped: (String, Double)? = nil, weekResetHours: Double = 90) -> CLIRow {
         let folder = "/Users/ada/" + (kind == .claude ? ".claude" : ".codex")
         let path = name == "default" ? "" : "\(kind.envVar)='\(folder)-profiles/\(name)' "
+        let launch = name == "default" ? "env -u \(kind.envVar) SWITCHER_BYPASS=1 \(kind.command)" : "\(path)\(kind.command)"
         let quota = usage.map { u in
             CLIQuota(windows: [
                 CLIQuotaWindow(label: "5h", usedPercent: u.five, resetsAt: Date().addingTimeInterval(u.resetHours * 3600)),
@@ -346,9 +357,10 @@ struct Make {
             source: "fixture", observedAt: Date().addingTimeInterval(-u.minutesAgo * 60), plan: plan)
         }
         return CLIRow(
-            kind: kind, number: number, name: name, isDefault: name == "default", isActive: active, email: email, plan: plan,
+            kind: kind, number: number, name: name, alias: alias, isDefault: name == "default", isActive: active, email: email, plan: plan,
             signIn: signedIn ? .good(until: goodDays.map { Date().addingTimeInterval($0 * 86400) }) : .out,
             loginCommand: path + (kind == .claude ? "claude auth login" : "codex login"),
+            launchCommand: launch,
             quota: quota,
             quotaError: error,
             headroom: CLIUsage.headroom(quota, signedIn: signedIn, now: Date(), lastActivity: nil))

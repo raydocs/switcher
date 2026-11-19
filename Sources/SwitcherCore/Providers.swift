@@ -1,5 +1,11 @@
 import Foundation
 
+public enum SwitchStage: Equatable, Sendable {
+    case quitting
+    case swapping
+    case opening
+}
+
 public struct SwitchResult: Equatable {
     public var from: Identity?
     public var to: String?
@@ -48,7 +54,9 @@ public final class Provider {
     /// sign-in page), and start it again when it was running, when `alwaysLaunch`, or to sign in.
     /// If anything fails after the app quit, it starts again as it was.
     @discardableResult
-    public func switchTo(_ target: String?, alwaysLaunch: Bool = false, cancel: CancelToken? = nil, waiting: ((TimeInterval) -> Void)? = nil) throws -> SwitchResult {
+    public func switchTo(_ target: String?, alwaysLaunch: Bool = false, cancel: CancelToken? = nil,
+                         phase: ((SwitchStage) -> Void)? = nil,
+                         waiting: ((TimeInterval) -> Void)? = nil) throws -> SwitchResult {
         guard app.isInstalled else { throw SwitchRefused.notInstalled(app.name) }
         let lock = try FileLock(lockURL, timeout: 30)
         defer { withExtendedLifetime(lock) {} }
@@ -56,7 +64,11 @@ public final class Provider {
         let wasRunning = app.isRunning
         let from: Identity?
         do {
-            if wasRunning { try app.quit(timeout: quitTimeout, cancel: cancel, waiting: waiting) }
+            if wasRunning {
+                phase?(.quitting)
+                try app.quit(timeout: quitTimeout, cancel: cancel, waiting: waiting)
+            }
+            phase?(.swapping)
             try vault.recover()
             from = current()
             if let from, from.id == target {
@@ -71,7 +83,10 @@ public final class Provider {
             throw error
         }
         let launch = wasRunning || alwaysLaunch || target == nil
-        if launch { try app.launch() }
+        if launch {
+            phase?(.opening)
+            try app.launch()
+        }
         return SwitchResult(from: from, to: target, launched: launch)
     }
 

@@ -45,11 +45,13 @@ struct MenuBarLabel: View {
     @AppStorage(settingKey) private var showMeter = true
 
     var body: some View {
+        let _ = model.language
         if showMeter, let (row, _, _) = Self.tightest(model.cliBoards) {
+            let label = model.displayCLIActiveLabel(row)
             Self.icon(model.cliBoards, meter: true)
                 .accessibilityLabel("Switcher")
-                .accessibilityValue(L.t("\(row.label): \(Int(row.headroom.percentLeft ?? 0))% left",
-                                        "\(row.label)：剩余 \(Int(row.headroom.percentLeft ?? 0))%"))
+                .accessibilityValue(L.t("\(label): \(Int(row.headroom.percentLeft ?? 0))% left",
+                                        "\(label)：剩余 \(Int(row.headroom.percentLeft ?? 0))%"))
         } else {
             Image(systemName: "person.2.circle")
         }

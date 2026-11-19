@@ -64,12 +64,18 @@ private func writeDB(_ dir: URL, _ name: String, _ data: Data) {
 }
 
 @Suite struct SlotLabelTests {
-    @Test func theEmailIsTheNameAnAliasOnlyStandsIn() {
+    @Test func aliasWinsAsPrimaryLabelAndEmailMovesToSecondary() {
         var slot = Slot(number: 1, account: ADA, email: nil, addedAt: 0)
         #expect(slot.label == "Account \(ADA.prefix(8))")
-        slot.alias = "home"
-        #expect(slot.label == "home")
+        #expect(slot.secondaryLabel == nil)
         slot.email = "ada@x.com"
         #expect(slot.label == "ada@x.com")
+        #expect(slot.secondaryLabel == nil)
+        slot.alias = "home"
+        #expect(slot.label == "home")
+        #expect(slot.secondaryLabel == "ada@x.com")
+        slot.email = nil
+        #expect(slot.label == "home")
+        #expect(slot.secondaryLabel == nil)
     }
 }

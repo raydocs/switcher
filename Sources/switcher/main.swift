@@ -51,6 +51,8 @@ switcher cli: Claude Code and Codex accounts, chosen per new terminal session.
   switcher cli login <cli> [<who>]     sign an account in again (default: the active one)
   switcher cli remove <cli> <who> [--yes]
                                        sign an account out and move its folder to the Trash
+  switcher cli alias <cli> <who> <name>
+                                       give an account a display name ("-" clears it; never renames its folder)
   switcher cli link [<cli>]            link shared settings into every profile
   switcher cli exec <cli> <who> [-- <command> [args]]
                                        run a command (default: the real CLI) as one account
@@ -61,7 +63,7 @@ switcher cli: Claude Code and Codex accounts, chosen per new terminal session.
   switcher cli usage [<cli>] --json    the same, as JSON (schema switcher.usage.v1), with headroom and the best account
   switcher cli usage [<cli>] --cached  the last readings as JSON: no request, no process, no keychain
 
-<cli> is claude or codex (cc / co). <who> is a number (1 = the default account), a name, an email or default.
+<cli> is claude or codex (cc / co). <who> is a number (1 = the default account), a name, an alias, an email or default.
 """
 
 /// A line from the terminal, trimmed; nil at end of input.
@@ -217,6 +219,12 @@ func runCLI(_ args: [String]) -> Never {
             }
             try profiles.remove(p)
             print("Removed \(label). New \(kind.command) sessions use \(profiles.active(kind).name).")
+        case "alias":
+            let kind = cli(args.first)
+            guard args.count > 1 else { fail("say which account: a number, a name, an alias or an email") }
+            let p = try CLICommands.profile(profiles, kind, args[1])
+            guard args.count > 2 else { fail("say the alias, or - to clear it") }
+            try CLIMeta.edit(env) { try $0.setAlias(kind: kind, name: p.name, args[2] == "-" ? nil : args[2]) }
         case "link":
             let kinds = args.isEmpty ? CLIKind.allCases : [cli(args.first)]
             var any = false
@@ -314,8 +322,12 @@ func runCLIUsage(_ args: [String]) async -> Never {
             let head = "  \(p.name)\(profiles.identity(p)?.email.map { " (\($0))" } ?? "")"
             func read() async throws -> CLIQuota {
                 switch kind {
-                case .claude: try await ClaudeCodeQuota.read(profile: p, profiles: profiles, keychain: keychain, http: URLSessionHTTPGetter())
-                case .codex: try await CodexQuota.read(profile: p, codexBinary: real)
+                case .claude:
+                    return try await ClaudeCodeQuota.read(profile: p, profiles: profiles, keychain: keychain, http: URLSessionHTTPGetter())
+                case .codex:
+                    var processEnv = ProcessInfo.processInfo.environment
+                    processEnv["PATH"] = CLIShim.enrichedPath(env: env, realBinary: real, base: processEnv["PATH"])
+                    return try await CodexQuota.read(profile: p, codexBinary: real, environment: processEnv)
                 }
             }
             do {
@@ -397,6 +409,7 @@ do {
                 if b.rows.isEmpty { print("  no accounts yet: sign in once in the app") }
                 for r in b.rows {
                     var line = "  \(r.isCurrent ? "●" : " ") \(r.slot.number). \(r.slot.label)"
+                    if let secondary = r.slot.secondaryLabel { line += " (\(secondary))" }
                     if !r.isCurrent && !r.canSwitch { line += "  [sign in once to switch]" }
                     if r.probablyExpired { line += "  [may need signing in again]" }
                     if r.slot.disabled { line += "  [left out of Next]" }

@@ -29,6 +29,7 @@ struct SettingsView: View {
     let model: AppModel
 
     var body: some View {
+        let _ = model.language
         TabView {
             ForEach(SettingsTab.allCases) { tab in
                 SettingsPage(model: model, tab: tab)
@@ -48,6 +49,7 @@ struct SettingsPage: View {
     struct Staged {
         var hover: String?
         var confirmRemove: String?
+        var rename: String?
         var openAtLogin: Bool?
     }
 
@@ -56,6 +58,7 @@ struct SettingsPage: View {
     @Environment(\.staticRender) private var staticRender
 
     var body: some View {
+        let _ = model.language
         Group {
             if staticRender {
                 content
@@ -256,12 +259,53 @@ struct GeneralSettings: View {
                             openAtLogin = model.openAtLogin
                         }), label: L.t("Open at login", "登录时打开"))
                 }
+                RowDivider()
                 SettingRow(
                     title: L.t("Usage in the menu bar", "在菜单栏显示用量"),
                     detail: L.t("Shows the terminal account nearest its limit as two bars: 5-hour over weekly.",
                                 "图标换成上下两根小条：最接近上限的终端账号的 5 小时和每周用量。")
                 ) {
                     SwitchControl(isOn: $menuBarMeter, label: L.t("Usage in the menu bar", "在菜单栏显示用量"))
+                }
+                RowDivider()
+                SettingRow(
+                    title: L.t("Hide email addresses", "隐藏邮箱地址"),
+                    detail: L.t("Masks emails like a•••@l•••.dev for screenshots or screen sharing.",
+                                "将邮箱显示为 a•••@l•••.dev，便于录屏或共享屏幕。")
+                ) {
+                    SwitchControl(isOn: Binding(
+                        get: { model.hideEmails },
+                        set: { model.hideEmails = $0 }),
+                        label: L.t("Hide email addresses", "隐藏邮箱地址"))
+                }
+                RowDivider()
+                SettingRow(
+                    title: L.t("Language", "界面语言"),
+                    detail: L.t("Choose Switcher's display language or follow macOS.",
+                                "选择 Switcher 的界面语言，或跟随 macOS 系统设置。")
+                ) {
+                    if staticRender {
+                        HStack(spacing: 4) {
+                            Text(languageName(model.language))
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.callout)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Fill.hover, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    } else {
+                        Picker(L.t("Language", "界面语言"), selection: Binding(
+                            get: { model.language },
+                            set: { model.language = $0 })) {
+                            ForEach(AppLanguage.allCases) { lang in
+                                Text(languageName(lang)).tag(lang)
+                            }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
                 }
             }
             SettingsCard {
@@ -283,6 +327,14 @@ struct GeneralSettings: View {
             }
         }
         .onAppear { if !staticRender { openAtLogin = model.openAtLogin } }
+    }
+
+    private func languageName(_ lang: AppLanguage) -> String {
+        switch lang {
+        case .system: L.t("System", "跟随系统")
+        case .en: "English"
+        case .zhHans: "简体中文"
+        }
     }
 }
 
@@ -339,8 +391,8 @@ struct AboutSettings: View {
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
                     }
-                    Text(L.t("Switches the official sign-ins of Claude and Antigravity on this Mac.",
-                             "在这台 Mac 上切换 Claude 和 Antigravity 的官方登录。"))
+                    Text(L.t("Switches the official sign-ins of Claude, Antigravity, Claude Code and Codex on this Mac.",
+                             "在这台 Mac 上切换 Claude、Antigravity、Claude Code 和 Codex 的官方登录。"))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -352,12 +404,15 @@ struct AboutSettings: View {
                 SectionHeader(title: L.t("Privacy", "隐私"))
                 SettingsCard {
                     VStack(alignment: .leading, spacing: 10) {
-                        Point(symbol: "arrow.left.arrow.right", lead: L.t("Sign-ins are moved, never sent. ", "登录只在本机移动，从不外传。"),
-                              text: L.t("Switching moves them between the app and Switcher's storage on this Mac.", "切换时，它们只在应用和 Switcher 在这台 Mac 上的存储之间移动。"))
-                        Point(symbol: "gauge.with.dots.needle.33percent", lead: L.t("Antigravity quota comes from Google. ", "Antigravity 配额来自 Google。"),
-                              text: L.t("Each account's own sign-in asks for its own numbers.", "每个账号用自己的登录读取自己的数字。"))
-                        Point(symbol: "doc.text", lead: L.t("Claude usage comes from Claude's own files. ", "Claude 用量来自 Claude 自己的文件。"),
-                              text: L.t("Switcher reads what Claude last saved on this Mac and asks no server.", "Switcher 只读取 Claude 上次保存在这台 Mac 上的数据，不请求任何服务器。"))
+                        Point(symbol: "arrow.left.arrow.right", lead: L.t("Desktop sign-ins stay on this Mac. ", "桌面应用登录只在本机移动。"),
+                              text: L.t("Switching moves them between Claude or Antigravity and Switcher's local storage; credentials are never copied or sent elsewhere.",
+                                        "切换只在应用与 Switcher 的本地存储之间移动文件与钥匙串项，不复制、不上传。"))
+                        Point(symbol: "terminal", lead: L.t("CLI accounts never move credentials. ", "终端账号不移动任何凭据。"),
+                              text: L.t("Claude Code and Codex each keep their own profile folder; switching only rewrites a local pointer for new terminal sessions.",
+                                        "Claude Code 和 Codex 各自保留独立配置文件夹，切换只改写本地指针，只对新终端会话生效。"))
+                        Point(symbol: "gauge.with.dots.needle.33percent", lead: L.t("Quotas come directly from each provider. ", "配额直接向各官方服务读取。"),
+                              text: L.t("Antigravity asks Google, Claude Code asks Anthropic's usage endpoint using its own token, and Codex reads through codex app-server. Switcher never refreshes tokens on its own.",
+                                        "Antigravity 向 Google 查询，Claude Code 用自身令牌请求官方用量接口，Codex 通过本地 codex app-server 读取。Switcher 从不擅自刷新令牌。"))
                     }
                     .padding(Metrics.cardPad)
                 }

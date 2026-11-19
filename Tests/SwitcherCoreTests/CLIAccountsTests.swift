@@ -184,6 +184,35 @@ import Testing
             #expect(profiles.signIn(p, keychain: MemoryCLIKeychain()).state == .signedOut)
         }
     }
+
+    @Test func listReadsEachClaudeKeychainItemAtMostOnce() throws {
+        final class CountingKeychain: CLIKeychain {
+            var items: [String: String] = [:]
+            var reads: [String: Int] = [:]
+            func read(service: String) -> String? {
+                reads[service, default: 0] += 1
+                return items[service]
+            }
+            func exists(service: String) -> Bool { items[service] != nil }
+            func claudeServices() -> [String] { Array(items.keys).sorted() }
+        }
+        let box = CLIBox()
+        let profiles = CLIProfiles(env: box.env)
+        let work = try profiles.add(.claude, name: "work")
+        let kc = CountingKeychain()
+        let defService = claudeKeychainService(configDir: nil)
+        let workService = claudeKeychainService(configDir: work.path)
+        kc.items[defService] = claudeJSON(expires: ms, sub: "max")
+        kc.items[workService] = claudeJSON(expires: ms, sub: "pro")
+
+        let groups = CLICommands.list(profiles, keychain: kc)
+        let claude = groups.first { $0.cli == "claude" }?.profiles ?? []
+        #expect(claude.count == 2)
+        #expect(claude[0].plan == "max" && claude[0].signIn == "signedIn")
+        #expect(claude[1].plan == "pro" && claude[1].signIn == "signedIn")
+        #expect(kc.reads[defService] == 1)
+        #expect(kc.reads[workService] == 1)
+    }
 }
 
 @Suite struct CLIDoctorTests {
