@@ -406,6 +406,25 @@ import Testing
             #expect(!finding.message.contains(secret))
         }
     }
+
+    @Test func formattedReportRedactsHomeAndEmails() {
+        let findings = [
+            DoctorFinding(level: .ok, message: "no problems found"),
+            DoctorFinding(level: .warn, message: "/Users/ada/.zshrc: check ada@lovelace.dev"),
+            DoctorFinding(level: .problem, message: "/Users/ada/.claude-profiles/work: expired"),
+            DoctorFinding(level: .note, message: "ok note"),
+        ]
+        let redacted = CLIDoctor.formattedReport(findings, home: "/Users/ada", redacted: true)
+        #expect(redacted.contains("[OK] no problems found"))
+        #expect(redacted.contains("[WARN] ~/.zshrc: check a•••@l•••.dev"))
+        #expect(redacted.contains("[PROBLEM] ~/.claude-profiles/work: expired"))
+        #expect(redacted.contains("[NOTE] ok note"))
+        #expect(!redacted.contains("/Users/ada"))
+        #expect(!redacted.contains("ada@lovelace.dev"))
+
+        let raw = CLIDoctor.formattedReport(findings, home: "/Users/ada", redacted: false)
+        #expect(raw.contains("/Users/ada/.zshrc: check ada@lovelace.dev"))
+    }
 }
 
 /// Real child processes (`/bin/sh` only), never the user's shell or rc files.

@@ -26,12 +26,141 @@ struct Banner: Equatable, Identifiable {
     var text: String
 }
 
+/// The 4 managed tools (2 desktop apps + 2 terminal CLIs).
+enum ToolID: String, CaseIterable, Identifiable, Hashable, Sendable {
+    case claude
+    case antigravity
+    case claudeCode
+    case codex
+
+    var id: String { rawValue }
+
+    var desktopProvider: ProviderID? {
+        switch self {
+        case .claude: .claude
+        case .antigravity: .antigravity
+        case .claudeCode, .codex: nil
+        }
+    }
+
+    var cliKind: CLIKind? {
+        switch self {
+        case .claudeCode: .claude
+        case .codex: .codex
+        case .claude, .antigravity: nil
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .claude: ProviderID.claude.displayName
+        case .antigravity: ProviderID.antigravity.displayName
+        case .claudeCode: CLIKind.claude.displayName
+        case .codex: CLIKind.codex.displayName
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .claude: ProviderID.claude.symbol
+        case .antigravity: ProviderID.antigravity.symbol
+        case .claudeCode: "terminal"
+        case .codex: "chevron.right.square"
+        }
+    }
+}
+
+/// Unified top tabs in the popover: Overview plus each visible desktop or CLI tool.
+enum MenuTab: String, CaseIterable, Identifiable, Hashable, Sendable {
+    case overview
+    case claude
+    case antigravity
+    case claudeCode
+    case codex
+
+    var id: String { rawValue }
+
+    var tool: ToolID? {
+        switch self {
+        case .overview: nil
+        case .claude: .claude
+        case .antigravity: .antigravity
+        case .claudeCode: .claudeCode
+        case .codex: .codex
+        }
+    }
+
+    init(_ tool: ToolID) {
+        switch tool {
+        case .claude: self = .claude
+        case .antigravity: self = .antigravity
+        case .claudeCode: self = .claudeCode
+        case .codex: self = .codex
+        }
+    }
+
+    init(_ provider: ProviderID) {
+        switch provider {
+        case .claude: self = .claude
+        case .antigravity: self = .antigravity
+        }
+    }
+
+    init(_ kind: CLIKind) {
+        switch kind {
+        case .claude: self = .claudeCode
+        case .codex: self = .codex
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .overview: L.t("Overview", "概览")
+        case .claude: "Claude"
+        case .antigravity: "Antigravity"
+        case .claudeCode: "Claude Code"
+        case .codex: "Codex"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .overview: "square.grid.2x2"
+        case .claude: ToolID.claude.symbol
+        case .antigravity: ToolID.antigravity.symbol
+        case .claudeCode: ToolID.claudeCode.symbol
+        case .codex: ToolID.codex.symbol
+        }
+    }
+}
+
+/// Snapshot of shell shims and rc files for Settings → Terminal & Doctor.
+struct TerminalSetupStatus: Equatable, Sendable {
+    struct ShimInfo: Equatable, Sendable, Identifiable {
+        var kind: CLIKind
+        var shimInstalled: Bool
+        var realBinary: String?
+        var id: String { kind.rawValue }
+    }
+
+    struct RCInfo: Equatable, Sendable, Identifiable {
+        var path: String
+        var state: CLIShim.RCState
+        var id: String { path }
+    }
+
+    var shims: [ShimInfo]
+    var rcFiles: [RCInfo]
+}
+
 /// The app's state over SwitcherCore. Every call into the core that can block (quitting an app,
 /// moving files, the keychain) runs off the main thread; results come back here.
 @MainActor
 @Observable
 final class AppModel {
     static let hideEmailsKey = "hideEmails"
+    static let selectedTabKey = "selectedMenuTab"
+    static let hiddenToolsKey = "hiddenTools"
 
     private(set) var boards: [AppBoard] = []
     private(set) var job: SwitchJob?
@@ -46,9 +175,22 @@ final class AppModel {
     /// True once "Install" has run here: what is left is to open a new terminal.
     private(set) var cliJustInstalled = false
     private(set) var readingQuotas = false
+    /// Terminal setup and Doctor results for Settings → Terminal & Doctor.
+    private(set) var terminalStatus: TerminalSetupStatus?
+    private(set) var doctorFindings: [DoctorFinding] = []
+    private(set) var runningDoctor = false
+    private(set) var doctorLastRun: Date?
     var banner: Banner?
-    /// The app section the popover shows first.
-    var selected: ProviderID = .claude
+    /// The active tab in the unified popover switcher.
+    var selectedTab: MenuTab = .claude {
+        didSet {
+            guard oldValue != selectedTab, !isPreview else { return }
+            UserDefaults.standard.set(selectedTab.rawValue, forKey: Self.selectedTabKey)
+            if let kind = selectedTab.tool?.cliKind {
+                loadCLIQuota(kind)
+            }
+        }
+    }
     /// Display language preference, synced with `UserDefaults.standard` and observed by views.
     var language: AppLanguage = .system {
         didSet {
@@ -61,6 +203,21 @@ final class AppModel {
         didSet {
             guard oldValue != hideEmails, !isPreview else { return }
             UserDefaults.standard.set(hideEmails, forKey: Self.hideEmailsKey)
+        }
+    }
+    /// Whether quota meters display used % or remaining %.
+    var quotaDisplayMode: QuotaDisplayMode = .used {
+        didSet {
+            guard oldValue != quotaDisplayMode, !isPreview else { return }
+            UserDefaults.standard.set(quotaDisplayMode.rawValue, forKey: QuotaDisplayMode.settingKey)
+        }
+    }
+    /// Tools explicitly hidden from the popover tab bar by the user.
+    var hiddenTools: Set<ToolID> = [] {
+        didSet {
+            guard oldValue != hiddenTools, !isPreview else { return }
+            let raw = ToolID.allCases.filter(hiddenTools.contains).map(\.rawValue).joined(separator: ",")
+            UserDefaults.standard.set(raw, forKey: Self.hiddenToolsKey)
         }
     }
 
@@ -85,7 +242,10 @@ final class AppModel {
 
     /// Fixed data for previews and screenshots: touches nothing on disk.
     init(preview boards: [AppBoard], ccSame: CCSameImport.Found? = nil, job: SwitchJob? = nil, banner: Banner? = nil,
-         cli cliBoards: [CLIBoard] = [], cliJustInstalled: Bool = false, hideEmails: Bool = false) {
+         cli cliBoards: [CLIBoard] = [], cliJustInstalled: Bool = false, hideEmails: Bool = false,
+         selectedTab: MenuTab = .claude, quotaDisplayMode: QuotaDisplayMode = .used,
+         hiddenTools: Set<ToolID> = [], terminalStatus: TerminalSetupStatus? = nil,
+         doctorFindings: [DoctorFinding] = []) {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent("switcher-preview", isDirectory: true)
         let env = Env(home: home)
         self.cli = CLIProfiles(env: CLIEnv(home: home.path))
@@ -100,6 +260,12 @@ final class AppModel {
         self.isPreview = true
         self.language = L10n.language
         self.hideEmails = hideEmails
+        self.quotaDisplayMode = quotaDisplayMode
+        self.hiddenTools = hiddenTools
+        self.selectedTab = selectedTab
+        self.terminalStatus = terminalStatus
+        self.doctorFindings = doctorFindings
+        if !doctorFindings.isEmpty { self.doctorLastRun = Date() }
     }
 
     init(board: Switchboard = Switchboard()) {
@@ -108,6 +274,17 @@ final class AppModel {
         self.cliKeychain = LiveCLIKeychain()
         self.language = L10n.language
         self.hideEmails = UserDefaults.standard.bool(forKey: Self.hideEmailsKey)
+        if let raw = UserDefaults.standard.string(forKey: QuotaDisplayMode.settingKey),
+           let mode = QuotaDisplayMode(rawValue: raw) {
+            self.quotaDisplayMode = mode
+        }
+        if let raw = UserDefaults.standard.string(forKey: Self.hiddenToolsKey) {
+            self.hiddenTools = Set(raw.split(separator: ",").compactMap { ToolID(rawValue: String($0)) })
+        }
+        if let raw = UserDefaults.standard.string(forKey: Self.selectedTabKey),
+           let tab = MenuTab(rawValue: raw) {
+            self.selectedTab = tab
+        }
         queue.async { board.recoverIfIdle() }
         refresh()
         refreshCLI()
@@ -187,6 +364,78 @@ final class AppModel {
 
     var isBusy: Bool { job != nil }
     var isRefreshing: Bool { readingQuotas || !cliReading.isEmpty }
+
+    // MARK: Visible tools & unified tab navigation
+
+    func isToolVisible(_ tool: ToolID) -> Bool {
+        if hiddenTools.contains(tool) { return false }
+        if let kind = tool.cliKind {
+            return cliBoard(kind).map { !$0.isAbsent } ?? false
+        }
+        return true
+    }
+
+    var visibleTools: [ToolID] {
+        let shown = ToolID.allCases.filter(isToolVisible)
+        return shown.isEmpty ? [.claude] : shown
+    }
+
+    var visibleTabs: [MenuTab] {
+        let tools = visibleTools
+        return tools.count > 1 ? ([.overview] + tools.map(MenuTab.init)) : tools.map(MenuTab.init)
+    }
+
+    /// Ensures `selectedTab` always refers to a currently visible tab.
+    var activeTab: MenuTab {
+        let tabs = visibleTabs
+        if tabs.contains(selectedTab) { return selectedTab }
+        return tabs.first ?? .claude
+    }
+
+    func toggleToolVisibility(_ tool: ToolID, visible: Bool) {
+        if visible {
+            hiddenTools.remove(tool)
+        } else {
+            let currentlyVisible = ToolID.allCases.filter { !hiddenTools.contains($0) && ($0.cliKind == nil || (cliBoard($0.cliKind!).map { !$0.isAbsent } ?? false)) }
+            guard currentlyVisible.count > 1 else { return }
+            hiddenTools.insert(tool)
+            if selectedTab.tool == tool {
+                selectedTab = visibleTabs.first ?? .claude
+            }
+        }
+    }
+
+    func stepTab(delta: Int) {
+        let tabs = visibleTabs
+        guard tabs.count > 1, let idx = tabs.firstIndex(of: activeTab) else { return }
+        let next = (idx + delta % tabs.count + tabs.count) % tabs.count
+        selectedTab = tabs[next]
+    }
+
+    /// The Antigravity account with the most remaining room when the active account is low or exhausted.
+    var bestAntigravityAccount: String? {
+        guard let board = board(.antigravity),
+              let current = board.currentRow?.quota else { return nil }
+        let status = current.status()
+        guard status == .low || status == .out else { return nil }
+        let others = board.rows.filter { !$0.isCurrent && $0.canSwitch && !$0.slot.disabled }
+        return AntigravityQuota.bestAccount(others.map { ($0.id, $0.quota) })
+    }
+
+    /// Reference usage from a signed-in Claude Code CLI account sharing the exact same email (within 2h).
+    func matchingCLIQuota(forDesktopEmail email: String?) -> CLIQuota? {
+        guard let email = email?.lowercased(), !email.isEmpty,
+              let claudeCLI = cliBoard(.claude) else { return nil }
+        let now = Date()
+        for row in claudeCLI.rows where row.signIn.isGood {
+            guard row.email?.lowercased() == email,
+                  let quota = row.quota,
+                  !quota.windows.isEmpty,
+                  now.timeIntervalSince(quota.observedAt) < 2 * 3600 else { continue }
+            return quota
+        }
+        return nil
+    }
 
     // MARK: Display helpers (aliases & privacy mode)
 
@@ -658,6 +907,77 @@ final class AppModel {
         }
     }
 
+    /// Switch new CLI sessions to the account with the most room (when active is low/out), else next signed-in account.
+    func nextCLI(_ kind: CLIKind) {
+        guard !isPreview, let board = cliBoard(kind) else { return }
+        if let best = board.rows.first(where: { $0.isBest && !$0.isActive && $0.signIn.isGood }) {
+            useCLI(best)
+            return
+        }
+        let usable = board.rows.filter { $0.signIn.isGood }
+        guard usable.count > 1 || (usable.count == 1 && !usable[0].isActive) else {
+            banner = Banner(kind: .info, text: L.noOtherAccount(kind.displayName))
+            return
+        }
+        if let activeIdx = board.rows.firstIndex(where: \.isActive) {
+            let ordered = Array(board.rows[(activeIdx + 1)...]) + Array(board.rows[..<activeIdx])
+            if let target = ordered.first(where: { !$0.isActive && $0.signIn.isGood }) {
+                useCLI(target)
+                return
+            }
+        }
+        if let target = usable.first(where: { !$0.isActive }) {
+            useCLI(target)
+        }
+    }
+
+    private nonisolated static func readTerminalStatus(_ env: CLIEnv) -> TerminalSetupStatus {
+        let shims = CLIKind.allCases.map { kind in
+            let shimPath = env.shim(kind)
+            let installed = CLIShim.isShim(shimPath)
+            let real = installed ? CLIShim.realBinary(ofShim: shimPath) : CLIShim.findRealBinary(kind, env: env)
+            return TerminalSetupStatus.ShimInfo(kind: kind, shimInstalled: installed, realBinary: real)
+        }
+        let rcFiles = CLICommands.rcFiles(env).map { rc in
+            let text = (try? String(contentsOfFile: rc, encoding: .utf8)) ?? ""
+            return TerminalSetupStatus.RCInfo(path: rc, state: CLIShim.rcState(text))
+        }
+        return TerminalSetupStatus(shims: shims, rcFiles: rcFiles)
+    }
+
+    func refreshTerminalStatus() {
+        if isPreview { return }
+        let env = cli.env
+        queue.async {
+            let status = Self.readTerminalStatus(env)
+            Task { @MainActor in
+                if self.terminalStatus != status { self.terminalStatus = status }
+            }
+        }
+    }
+
+    /// Run `CLIDoctor` off the main thread and populate Settings → Terminal & Doctor.
+    func runDoctor() {
+        if isPreview || runningDoctor { return }
+        runningDoctor = true
+        let cli = self.cli, keychain = self.cliKeychain
+        Task.detached(priority: .userInitiated) {
+            let status = Self.readTerminalStatus(cli.env)
+            let findings = CLIDoctor(
+                profiles: cli,
+                keychain: keychain,
+                rcFiles: CLICommands.rcFiles(cli.env),
+                resolve: CLIDoctor.zshResolve
+            ).run()
+            await MainActor.run {
+                self.terminalStatus = status
+                self.doctorFindings = findings
+                self.doctorLastRun = Date()
+                self.runningDoctor = false
+            }
+        }
+    }
+
     /// Install the PATH shims and the line in the shell's rc files. Only ever on the user's click.
     func installCLIShims() {
         if isPreview { return }
@@ -668,14 +988,81 @@ final class AppModel {
                 for rc in CLICommands.rcFiles(cli.env) { try CLIShim.installRC(rc, env: cli.env) }
             }
             let boards = Self.readCLI(cli, keychain)
+            let status = Self.readTerminalStatus(cli.env)
             Task { @MainActor in
                 self.setCLI(boards)
+                self.terminalStatus = status
                 switch result {
-                case .success: self.cliJustInstalled = true
-                case .failure(let error): self.banner = Banner(kind: .error, text: error.localizedDescription)
+                case .success:
+                    self.cliJustInstalled = true
+                    self.banner = Banner(kind: .success, text: L.shimsInstalled)
+                case .failure(let error):
+                    self.banner = Banner(kind: .error, text: error.localizedDescription)
                 }
             }
         }
+    }
+
+    /// Uninstall the PATH shims and rc blocks safely without touching any account folders or credentials.
+    func uninstallCLIShims() {
+        if isPreview { return }
+        let cli = self.cli, keychain = self.cliKeychain
+        queue.async {
+            let result = Result {
+                CLIShim.uninstallShims(env: cli.env)
+                for rc in CLICommands.rcFiles(cli.env) { try CLIShim.uninstallRC(rc) }
+            }
+            let boards = Self.readCLI(cli, keychain)
+            let status = Self.readTerminalStatus(cli.env)
+            Task { @MainActor in
+                self.setCLI(boards)
+                self.terminalStatus = status
+                self.cliJustInstalled = false
+                switch result {
+                case .success:
+                    self.banner = Banner(kind: .success, text: L.shimsUninstalled)
+                case .failure(let error):
+                    self.banner = Banner(kind: .error, text: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// Re-create missing shared configuration symlinks across every non-default CLI profile.
+    func repairCLILinks() {
+        if isPreview { return }
+        let cli = self.cli, keychain = self.cliKeychain
+        queue.async {
+            let result = Result<Int, Error> {
+                var linked = 0
+                for kind in CLIKind.allCases {
+                    for p in cli.list(kind) where !p.isDefault {
+                        linked += try cli.applyLinks(p).count
+                    }
+                }
+                return linked
+            }
+            let boards = Self.readCLI(cli, keychain)
+            Task { @MainActor in
+                self.setCLI(boards)
+                switch result {
+                case .success(let count):
+                    self.banner = count > 0
+                        ? Banner(kind: .success, text: L.linksRepaired(count))
+                        : Banner(kind: .info, text: L.linksAlreadyGood)
+                case .failure(let error):
+                    self.banner = Banner(kind: .error, text: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// Copy a privacy-redacted Doctor report (home path -> `~`, emails masked) to the clipboard.
+    func copyDoctorReport() {
+        guard !doctorFindings.isEmpty else { return }
+        let report = CLIDoctor.formattedReport(doctorFindings, home: cli.env.home, redacted: true)
+        copy(report)
+        banner = Banner(kind: .success, text: L.doctorReportCopied)
     }
 
     private nonisolated static func readOneCLIQuota(
@@ -916,5 +1303,29 @@ enum L {
     static func cliRemoveExplained(_ kind: CLIKind) -> String {
         t("Signs this \(kind.displayName) account out and moves its folder to the Trash. Shared sessions and settings stay.",
           "会先退出这个 \(kind.displayName) 账号的登录，再把它的配置文件夹移入废纸篓。共享的会话和设置保持不变。")
+    }
+
+    static var shimsInstalled: String {
+        t("Terminal shims installed. Open a new terminal for them to take effect.",
+          "终端启动器已安装，打开新终端窗口即可生效。")
+    }
+
+    static var shimsUninstalled: String {
+        t("Terminal shims removed. Your accounts and settings were not touched.",
+          "已移除终端启动器，账号与设置均未受影响。")
+    }
+
+    static func linksRepaired(_ count: Int) -> String {
+        count == 1
+            ? t("Restored 1 missing shared link.", "已修复 1 个缺失的共享软链。")
+            : t("Restored \(count) missing shared links.", "已修复 \(count) 个缺失的共享软链。")
+    }
+
+    static var linksAlreadyGood: String {
+        t("All shared configuration links are already in place.", "所有共享配置软链都已就绪，无需修复。")
+    }
+
+    static var doctorReportCopied: String {
+        t("Copied redacted diagnostic report to clipboard.", "已复制脱敏诊断报告到剪贴板。")
     }
 }

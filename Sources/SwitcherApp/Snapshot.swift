@@ -195,14 +195,15 @@ enum Snapshot {
         foundRunning.running = true
 
         func model(_ boards: [AppBoard], ccSame: CCSameImport.Found? = nil, job: SwitchJob? = nil, banner: Banner? = nil,
-                   selected: ProviderID = .claude, cli: [CLIBoard] = [], cliJustInstalled: Bool = false, hideEmails: Bool = false) -> AppModel {
-            let m = AppModel(preview: boards, ccSame: ccSame, job: job, banner: banner, cli: cli, cliJustInstalled: cliJustInstalled, hideEmails: hideEmails)
-            m.selected = selected
-            return m
+                   selected: MenuTab = .claude, cli: [CLIBoard] = [], cliJustInstalled: Bool = false, hideEmails: Bool = false,
+                   quotaMode: QuotaDisplayMode = .used, terminalStatus: TerminalSetupStatus? = nil,
+                   doctorFindings: [DoctorFinding] = []) -> AppModel {
+            AppModel(preview: boards, ccSame: ccSame, job: job, banner: banner, cli: cli,
+                     cliJustInstalled: cliJustInstalled, hideEmails: hideEmails, selectedTab: selected,
+                     quotaDisplayMode: quotaMode, terminalStatus: terminalStatus, doctorFindings: doctorFindings)
         }
 
         // The terminal accounts: two of each CLI, one sign-in about to run out, one not signed in.
-        let short = Array(claudeRows.prefix(2))
         func cli(installed: Bool = true, renew: Bool = false) -> [CLIBoard] {
             [
                 CLIBoard(kind: .claude, shimInstalled: installed, commandFound: true, rows: [
@@ -216,7 +217,6 @@ enum Snapshot {
                 ]),
             ]
         }
-        let both = MenuView.Staged(cli: .init(expanded: [.claude, .codex]))
         // The active accounts nearly out: the one with the most room is marked; a model's own limit warns.
         let tight = [
             CLIBoard(kind: .claude, shimInstalled: true, commandFound: true, rows: CLIBoard.markingBest([
@@ -231,10 +231,26 @@ enum Snapshot {
                 s.cli(.codex, 2, "account2", "ada@orbital.dev", plan: "pro", usage: (5, 9, 4, 12)),
             ])),
         ]
+        let sampleTerminal = TerminalSetupStatus(
+            shims: [
+                .init(kind: .claude, shimInstalled: true, realBinary: "/Users/ada/.local/bin/claude"),
+                .init(kind: .codex, shimInstalled: true, realBinary: "/opt/homebrew/bin/codex"),
+            ],
+            rcFiles: [
+                .init(path: "/Users/ada/.zshrc", state: .last),
+                .init(path: "/Users/ada/.bashrc", state: .absent),
+            ]
+        )
+        let sampleDoctor: [DoctorFinding] = [
+            DoctorFinding(level: .ok, message: "no problems found"),
+            DoctorFinding(level: .warn, message: "Claude Code work: the sign-in runs out in 3 day(s) unless it is used"),
+            DoctorFinding(level: .note, message: "/Users/ada/.bashrc: no Switcher PATH line"),
+        ]
 
         return [
-            Fixture(name: "01-claude", model: model(boards())),
-            Fixture(name: "02-antigravity", model: model(boards(), selected: .antigravity)),
+            Fixture(name: "00-overview", model: model(boards(), selected: .overview, cli: tight)),
+            Fixture(name: "01-claude", model: model(boards(), cli: cli())),
+            Fixture(name: "02-antigravity", model: model(boards(), selected: .antigravity, cli: cli())),
             Fixture(name: "03-ccsame-offer", model: model(boards(), ccSame: found)),
             Fixture(name: "04-ccsame-running", model: model(boards(), ccSame: foundRunning)),
             Fixture(name: "05-switching-asked", model: model(boards(), job: SwitchJob(
@@ -254,27 +270,31 @@ enum Snapshot {
             Fixture(name: "12-add-confirm", model: model(boards()), staged: MenuView.Staged(confirmAdd: true)),
             Fixture(name: "13-not-installed", model: model(boards(antigravityInstalled: false), selected: .antigravity)),
 
-            Fixture(name: "14-cli", model: model(boards(claude: short), cli: cli()), staged: both),
-            Fixture(name: "15-cli-not-installed", model: model(boards(claude: short), cli: cli(installed: false)), staged: both),
-            Fixture(name: "16-cli-collapsed", model: model(boards(), cli: cli()), staged: MenuView.Staged(cli: .init(expanded: []))),
-            Fixture(name: "17-cli-add", model: model(boards(claude: short), cli: cli(renew: true), cliJustInstalled: true),
-                    staged: MenuView.Staged(cli: .init(expanded: [.claude], adding: .claude, hover: "claude:work"))),
-            Fixture(name: "17b-cli-rename", model: model(boards(claude: short), cli: cli()),
-                    staged: MenuView.Staged(cli: .init(expanded: [.claude], rename: "claude:work"))),
-            Fixture(name: "17c-cli-remove", model: model(boards(claude: short), cli: cli()),
-                    staged: MenuView.Staged(cli: .init(expanded: [.claude], confirmRemove: "claude:work"))),
-            Fixture(name: "18-cli-headroom", model: model(boards(claude: short), cli: tight), staged: both),
-            Fixture(name: "19-privacy", model: model(boards(claude: short), cli: cli(), hideEmails: true), staged: both),
+            Fixture(name: "14-cli-claude", model: model(boards(), selected: .claudeCode, cli: cli())),
+            Fixture(name: "15-cli-not-installed", model: model(boards(), selected: .claudeCode, cli: cli(installed: false))),
+            Fixture(name: "16-cli-codex", model: model(boards(), selected: .codex, cli: cli())),
+            Fixture(name: "17-cli-add", model: model(boards(), selected: .claudeCode, cli: cli(renew: true), cliJustInstalled: true),
+                    staged: MenuView.Staged(hover: "claude:work", addingCLI: .claude)),
+            Fixture(name: "17b-cli-rename", model: model(boards(), selected: .claudeCode, cli: cli()),
+                    staged: MenuView.Staged(rename: "claude:work")),
+            Fixture(name: "17c-cli-remove", model: model(boards(), selected: .claudeCode, cli: cli()),
+                    staged: MenuView.Staged(confirmRemove: "claude:work")),
+            Fixture(name: "18-cli-headroom", model: model(boards(), selected: .claudeCode, cli: tight)),
+            Fixture(name: "18b-remaining-mode", model: model(boards(), selected: .claudeCode, cli: tight, quotaMode: .remaining)),
+            Fixture(name: "19-privacy", model: model(boards(), selected: .overview, cli: cli(), hideEmails: true)),
 
-            Fixture(name: "20-settings-general", model: model(boards()), settings: .general, page: .init(openAtLogin: true)),
+            Fixture(name: "20-settings-general", model: model(boards(), cli: cli()), settings: .general, page: .init(openAtLogin: true)),
             Fixture(name: "20-settings-general-meter", model: model(boards(), cli: tight), settings: .general, page: .init(openAtLogin: true)),
-            Fixture(name: "21-settings-accounts", model: model(boards(claude: edgeRows)), settings: .accounts,
+            Fixture(name: "21-settings-accounts", model: model(boards(claude: edgeRows), cli: cli()), settings: .accounts,
                     page: .init(hover: AccountsSettings.key(.claude, grace))),
             Fixture(name: "22-settings-accounts-ccsame", model: model(boards(), ccSame: found), settings: .accounts),
             Fixture(name: "23-settings-accounts-remove", model: model(boards(antigravityInstalled: false)), settings: .accounts,
                     page: .init(confirmRemove: AccountsSettings.key(.claude, kat))),
             Fixture(name: "23b-settings-accounts-rename", model: model(boards()), settings: .accounts,
                     page: .init(rename: AccountsSettings.key(.claude, grace))),
+            Fixture(name: "24-settings-terminal-doctor",
+                    model: model(boards(), cli: cli(), terminalStatus: sampleTerminal, doctorFindings: sampleDoctor),
+                    settings: .terminal),
             Fixture(name: "27-settings-about", model: model(boards()), settings: .about),
         ]
     }

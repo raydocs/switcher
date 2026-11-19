@@ -75,4 +75,43 @@ import Testing
         #expect(q.buckets == old.buckets)
         #expect(q.problem != nil)
     }
+
+    @Test func weeklyPaceHeadroomAndBestAccount() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let weekLen: TimeInterval = 7 * 86400
+        // 30% of the week elapsed -> 70% of week left until reset.
+        let weeklyBucket = QuotaBucket(pool: .geminiWeekly, used: 45, resetsAt: now.addingTimeInterval(weekLen * 0.7))
+        let fiveHourBucket = QuotaBucket(pool: .gemini5h, used: 20, resetsAt: now.addingTimeInterval(3600))
+        let expiredBucket = QuotaBucket(pool: .claude5h, used: 99, resetsAt: now.addingTimeInterval(-60))
+        let argonBucket = QuotaBucket(pool: .argonWeekly, used: 100, resetsAt: now.addingTimeInterval(weekLen * 0.5))
+
+        #expect(Int((weeklyBucket.pace(now: now) ?? -1).rounded()) == 30)
+        #expect(fiveHourBucket.pace(now: now) == nil)
+        #expect(expiredBucket.pace(now: now) == nil)
+
+        let q1 = AntigravityQuota(plan: "Pro", buckets: [fiveHourBucket, weeklyBucket, expiredBucket, argonBucket], fetchedAt: now)
+        // Expired Claude 5h and Argon are excluded from tightest core bucket.
+        #expect(q1.tightest(now: now)?.pool == .geminiWeekly)
+        #expect(q1.percentLeft(now: now) == 55)
+        #expect(q1.status(now: now) == .ok)
+
+        let qLow = AntigravityQuota(plan: "Pro", buckets: [QuotaBucket(pool: .claude5h, used: 85, resetsAt: now.addingTimeInterval(3600))], fetchedAt: now)
+        #expect(qLow.status(now: now) == .low)
+        #expect(qLow.percentLeft(now: now) == 15)
+
+        let qOut = AntigravityQuota(plan: "Pro", buckets: [QuotaBucket(pool: .gemini5h, used: 100, resetsAt: now.addingTimeInterval(3600))], fetchedAt: now)
+        #expect(qOut.status(now: now) == .out)
+        #expect(qOut.percentLeft(now: now) == 0)
+
+        let qRoomy = AntigravityQuota(plan: "Ultra", buckets: [QuotaBucket(pool: .gemini5h, used: 12, resetsAt: now.addingTimeInterval(3600))], fetchedAt: now)
+        let best = AntigravityQuota.bestAccount([
+            ("out", qOut),
+            ("nil", nil),
+            ("low", qLow),
+            ("roomy", qRoomy),
+            ("tie", qRoomy),
+        ], now: now)
+        #expect(best == "roomy")
+        #expect(AntigravityQuota.bestAccount([("out", qOut), ("nil", nil)], now: now) == nil)
+    }
 }

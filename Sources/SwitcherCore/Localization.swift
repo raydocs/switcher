@@ -64,4 +64,59 @@ public enum Privacy {
         guard let email else { return nil }
         return masked ? maskEmail(email) : email
     }
+
+    /// Redacts the user's home directory path (to `~`) and any email addresses in diagnostic output.
+    public static func redactDiagnostic(_ text: String, home: String) -> String {
+        var out = text
+        let trimmedHome = home.hasSuffix("/") && home.count > 1 ? String(home.dropLast()) : home
+        if !trimmedHome.isEmpty, trimmedHome != "/" {
+            out = out.replacingOccurrences(of: trimmedHome, with: "~")
+        }
+        guard let regex = try? NSRegularExpression(pattern: #"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#) else {
+            return out
+        }
+        let ns = out as NSString
+        let matches = regex.matches(in: out, range: NSRange(location: 0, length: ns.length))
+        for match in matches.reversed() {
+            let email = ns.substring(with: match.range)
+            if let range = Range(match.range, in: out) {
+                out.replaceSubrange(range, with: maskEmail(email))
+            }
+        }
+        return out
+    }
+}
+
+/// Whether quota meters and numbers show percentage used or percentage remaining.
+public enum QuotaDisplayMode: String, CaseIterable, Codable, Sendable, Identifiable {
+    case used
+    case remaining
+
+    public static let settingKey = "quotaDisplayMode"
+
+    public var id: String { rawValue }
+
+    /// The number displayed beside a meter (`used` in 0...100).
+    public func shownPercent(used: Int) -> Int {
+        let clamped = min(100, max(0, used))
+        switch self {
+        case .used: return clamped
+        case .remaining: return 100 - clamped
+        }
+    }
+
+    /// The bar fill fraction (`0.0...1.0`) for a given `used` percentage.
+    public func barFraction(used: Int) -> Double {
+        Double(shownPercent(used: used)) / 100.0
+    }
+
+    /// Position (`0...100`) of the even-pace marker along the meter bar.
+    public func pacePosition(usedPace: Int?) -> Int? {
+        guard let usedPace else { return nil }
+        let clamped = min(100, max(0, usedPace))
+        switch self {
+        case .used: return clamped
+        case .remaining: return 100 - clamped
+        }
+    }
 }

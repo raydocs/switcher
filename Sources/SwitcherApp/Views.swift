@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 import SwitcherCore
 
-/// The menu bar popover: both apps as tabs, the selected app's accounts, and its actions.
+/// The menu bar popover: unified top tool switcher, a single scrolling list, and unified actions.
 struct MenuView: View {
     let model: AppModel
 
@@ -12,7 +12,7 @@ struct MenuView: View {
         var confirmRemove: String?
         var rename: String?
         var confirmAdd = false
-        var cli = CLISection.Staged()
+        var addingCLI: CLIKind?
     }
 
     private let staged: Staged
@@ -20,7 +20,6 @@ struct MenuView: View {
     @State private var renaming: String?
     @State private var confirmingAdd: Bool
     @State private var listHeight: CGFloat = 0
-    @State private var cliHeight: CGFloat = 0
     @AppStorage("ccSameOfferDismissed") private var ccSameDismissed = false
     @Environment(\.staticRender) private var staticRender
 
@@ -33,13 +32,13 @@ struct MenuView: View {
     }
 
     private var busy: Bool { model.isBusy }
-    private var board: AppBoard? { model.board(model.selected) }
+    private var tab: MenuTab { model.activeTab }
 
     var body: some View {
         let _ = model.language
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: Metrics.gap) {
-                AppTabs(model: model)
+                ToolTabs(model: model)
                     .inert(busy)
                 if let job = model.job {
                     SwitchProgress(job: job, cancel: model.cancelSwitch)
@@ -48,22 +47,11 @@ struct MenuView: View {
                     BannerView(banner: banner) { model.banner = nil }
                         .allowsHitTesting(!busy)
                 }
-                if let found = model.ccSame, model.selected == .claude, !ccSameDismissed || staticRender {
+                if let found = model.ccSame, tab == .claude || tab == .overview, !ccSameDismissed || staticRender {
                     CCSameOffer(found: found, importNow: model.importCCSame) { ccSameDismissed = true }
                         .inert(busy)
                 }
-                if let board {
-                    section(board)
-                } else {
-                    Note(symbol: "ellipsis", text: L.t("Reading your accounts…", "正在读取账号…"))
-                        .padding(.vertical, Metrics.rowV)
-                }
-                if model.cliBoards.contains(where: { !$0.isAbsent }) {
-                    Divider()
-                        .padding(.horizontal, Metrics.rowH)
-                    CLISection(model: model, height: $cliHeight, staged: staged.cli)
-                        .inert(busy)
-                }
+                activeContent
             }
             .padding(Metrics.pad)
             Divider()
@@ -74,15 +62,24 @@ struct MenuView: View {
         .background { if !staticRender { shortcuts } }
         .onDisappear { if !staticRender { model.surfaceDisappeared() } }
         .onAppear {
-            if !staticRender { model.surfaceAppeared() }
-            // The CLI section refreshes itself once shown; while hidden (no CLI found yet), look
-            // again here so a CLI installed later appears without restarting Switcher.
-            if !model.cliBoards.contains(where: { !$0.isAbsent }) { model.refreshCLI() }
+            if !staticRender {
+                model.surfaceAppeared()
+                let quotaKinds: Set<CLIKind>
+                if let kind = tab.tool?.cliKind {
+                    quotaKinds = [kind]
+                } else if tab == .overview {
+                    quotaKinds = Set(CLIKind.allCases)
+                } else {
+                    quotaKinds = []
+                }
+                model.refreshCLI(quotaFor: quotaKinds)
+            }
         }
-        .onChange(of: model.selected) {
+        .onChange(of: model.selectedTab) {
             removing = nil
             renaming = nil
             confirmingAdd = false
+            listHeight = 0
         }
         .task(id: model.banner?.id) {
             // A success message leaves by itself; errors and notes stay until dismissed.
@@ -92,9 +89,34 @@ struct MenuView: View {
         }
     }
 
-    // MARK: The selected app
+    // MARK: Active tab content
 
-    @ViewBuilder private func section(_ board: AppBoard) -> some View {
+    @ViewBuilder private var activeContent: some View {
+        switch tab {
+        case .overview:
+            singleScroll { OverviewSection(model: model) }
+                .inert(busy)
+        case .claude:
+            desktopContent(.claude)
+        case .antigravity:
+            desktopContent(.antigravity)
+        case .claudeCode:
+            cliContent(.claude)
+        case .codex:
+            cliContent(.codex)
+        }
+    }
+
+    @ViewBuilder private func desktopContent(_ provider: ProviderID) -> some View {
+        if let board = model.board(provider) {
+            desktopSection(board)
+        } else {
+            Note(symbol: "ellipsis", text: L.t("Reading your accounts…", "正在读取账号…"))
+                .padding(.vertical, Metrics.rowV)
+        }
+    }
+
+    @ViewBuilder private func desktopSection(_ board: AppBoard) -> some View {
         let app = board.provider.displayName
         if !board.installed {
             EmptyState(
@@ -107,6 +129,12 @@ struct MenuView: View {
                     Text(L.t("Accounts", "账号"))
                         .font(.subheadline.weight(.medium))
                         .foregroundStyle(.secondary)
+                    if board.provider == .antigravity,
+                       let latest = board.rows.compactMap({ $0.quota?.fetchedAt }).max() {
+                        Text("· \(L.ago(latest))")
+                            .font(.subheadline)
+                            .foregroundStyle(.tertiary)
+                    }
                     Spacer()
                     StatusDot(running: board.running)
                     Text(board.running ? L.t("\(app) is running", "\(app) 运行中") : L.t("\(app) is not running", "\(app) 未运行"))
@@ -127,37 +155,30 @@ struct MenuView: View {
                         title: L.t("No accounts yet", "还没有账号"),
                         text: L.t("Sign in to \(app). The account appears here, and Add Account brings in the next one.",
                                   "登录 \(app) 后账号会出现在这里，再用“添加账号…”加入下一个。"))
-                } else if staticRender {
-                    rows(board)
                 } else {
-                    // A menu-bar window gives a ScrollView no height of its own, so it shrank to a
-                    // couple of rows: measure the rows and ask for exactly that, up to the cap.
-                    ScrollView {
-                        rows(board)
-                            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { listHeight = $0 }
-                    }
-                    // The terminal accounts below take their share of the screen first.
-                    .frame(height: listHeight > 0 ? min(listHeight, max(Metrics.listMinHeight, Metrics.listMaxHeight - cliHeight)) : nil)
-                    .scrollBounceBehavior(.basedOnSize)
+                    singleScroll { desktopRows(board) }
                 }
             }
-            actions(board)
+            desktopActions(board)
         }
     }
 
-    private func rows(_ board: AppBoard) -> some View {
-        VStack(spacing: Metrics.rowGap) {
+    private func desktopRows(_ board: AppBoard) -> some View {
+        let bestAG = board.provider == .antigravity ? model.bestAntigravityAccount : nil
+        return VStack(spacing: Metrics.rowGap) {
             ForEach(Array(board.rows.enumerated()), id: \.element.id) { index, row in
                 AccountRowView(
                     model: model, provider: board.provider, row: row, index: index,
-                    removing: $removing, renaming: $renaming, forcedHover: staged.hover == row.id)
+                    removing: $removing, renaming: $renaming,
+                    isBest: bestAG == row.id,
+                    forcedHover: staged.hover == row.id)
             }
         }
         .disabled(busy)
         .allowsHitTesting(!busy)
     }
 
-    @ViewBuilder private func actions(_ board: AppBoard) -> some View {
+    @ViewBuilder private func desktopActions(_ board: AppBoard) -> some View {
         let app = board.provider.displayName
         if confirmingAdd && !busy {
             VStack(alignment: .leading, spacing: 8) {
@@ -208,26 +229,161 @@ struct MenuView: View {
         }
     }
 
+    // MARK: CLI tab
+
+    @ViewBuilder private func cliContent(_ kind: CLIKind) -> some View {
+        if let board = model.cliBoard(kind) {
+            cliSection(board)
+        } else {
+            Note(symbol: "ellipsis", text: L.t("Reading terminal accounts…", "正在读取终端账号…"))
+                .padding(.vertical, Metrics.rowV)
+        }
+    }
+
+    @ViewBuilder private func cliSection(_ board: CLIBoard) -> some View {
+        let reading = model.cliReading.contains(board.kind)
+        let signingIn = model.cliSigningIn[board.kind] != nil || staged.addingCLI == board.kind
+        let latest = board.rows.compactMap { $0.quota?.observedAt }.max()
+        let hasOtherUsable = board.rows.contains { !$0.isActive && $0.signIn.isGood }
+        let hasBest = board.rows.contains { $0.isBest && !$0.isActive && $0.signIn.isGood }
+
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 5) {
+                Text(L.t("Accounts", "账号"))
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.secondary)
+                if let latest {
+                    Text("· \(L.ago(latest))")
+                        .font(.subheadline)
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer()
+                if reading {
+                    Spinner(size: 10)
+                }
+                Text(L.t("Applies to new sessions", "只对新会话生效"))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, Metrics.rowH)
+            .help(L.t(
+                "Chosen account applies to new \(board.kind.command) sessions. Running sessions keep theirs and nothing quits.",
+                "选用的账号只对之后启动的 \(board.kind.command) 会话生效；正在运行的会话保持不变，不会退出任何程序。"))
+
+            if !board.commandFound {
+                Note(symbol: "info.circle", text: L.cliNotFound(board.kind))
+                    .padding(.horizontal, Metrics.rowH)
+            } else if !board.shimInstalled {
+                CLIShimInstallNotice(model: model)
+            } else if model.cliJustInstalled {
+                Note(symbol: "checkmark.circle", text: L.t(
+                    "Installed. Open a new terminal for it to take effect.", "已安装。打开新的终端窗口后生效。"), tint: .green)
+                    .padding(.horizontal, Metrics.rowH)
+            }
+
+            singleScroll {
+                VStack(spacing: Metrics.rowGap) {
+                    ForEach(Array(board.rows.enumerated()), id: \.element.id) { index, row in
+                        CLIRowView(
+                            model: model, row: row, index: index,
+                            removing: $removing, renaming: $renaming,
+                            forcedHover: staged.hover == row.id)
+                    }
+                    if signingIn {
+                        CLISigningInCard(model: model, kind: board.kind)
+                            .padding(.top, 4)
+                    }
+                }
+            }
+        }
+        .inert(busy)
+
+        HStack(spacing: 8) {
+            Button {
+                model.nextCLI(board.kind)
+            } label: {
+                Label(hasBest ? L.t("Best Account", "切到余量最多") : L.t("Next Account", "下一个账号"), systemImage: "arrow.right")
+            }
+            .buttonStyle(SoftButtonStyle(kind: .tinted))
+            .disabled(!hasOtherUsable || signingIn)
+            .help(hasBest
+                ? L.t("Switch new \(board.kind.command) sessions to the account with the most room (⌘↩)",
+                      "让新的 \(board.kind.command) 会话切到余量最多的账号（⌘↩）")
+                : L.t("Switch new \(board.kind.command) sessions to the next signed-in account (⌘↩)",
+                      "让新的 \(board.kind.command) 会话切到下一个已登录账号（⌘↩）"))
+            Button {
+                model.addCLIAccount(board.kind)
+            } label: {
+                Label(L.t("Add Account…", "添加账号…"), systemImage: "plus")
+            }
+            .buttonStyle(SoftButtonStyle())
+            .disabled(!board.commandFound || signingIn)
+            .help(L.t("Sign in to another \(board.kind.displayName) account in your browser (⌘N)",
+                      "在浏览器里登录另一个 \(board.kind.displayName) 账号（⌘N）"))
+        }
+        .inert(busy)
+    }
+
+    @ViewBuilder private func singleScroll<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        if staticRender {
+            content()
+        } else {
+            ScrollView {
+                content()
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { listHeight = $0 }
+            }
+            .frame(height: listHeight > 0 ? min(listHeight, Metrics.listMaxHeight) : nil)
+            .scrollBounceBehavior(.basedOnSize)
+        }
+    }
+
     // MARK: Keyboard
 
-    /// ⌘1…⌘9 pick a row, ⌘↩ is Next Account, ⌘N adds, ⌘R refreshes, ⌃Tab changes app.
+    /// ⌘1…⌘9 pick a row (or jump to a tool from Overview), ⌘↩ Next, ⌘N Add, ⌘R Refresh, ⌃Tab / ⌘[ / ⌘] switch tabs.
     private var shortcuts: some View {
         ZStack {
-            if let board, board.installed, !busy {
-                ForEach(Array(board.rows.prefix(9).enumerated()), id: \.element.id) { index, row in
-                    Button("") { model.switchTo(board.provider, row) }
-                        .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
-                }
-                Button("") { model.next(board.provider) }
-                    .keyboardShortcut(.return, modifiers: .command)
-                Button("") { confirmingAdd = true }
-                    .keyboardShortcut("n", modifiers: .command)
-            }
             if !busy {
+                switch tab {
+                case .overview:
+                    ForEach(Array(model.visibleTools.prefix(9).enumerated()), id: \.element.id) { index, tool in
+                        Button("") { model.selectedTab = MenuTab(tool) }
+                            .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
+                    }
+                case .claude, .antigravity:
+                    if let provider = tab.tool?.desktopProvider, let board = model.board(provider), board.installed {
+                        ForEach(Array(board.rows.prefix(9).enumerated()), id: \.element.id) { index, row in
+                            Button("") { model.switchTo(board.provider, row) }
+                                .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
+                        }
+                        Button("") { model.next(board.provider) }
+                            .keyboardShortcut(.return, modifiers: .command)
+                        Button("") { confirmingAdd = true }
+                            .keyboardShortcut("n", modifiers: .command)
+                    }
+                case .claudeCode, .codex:
+                    if let kind = tab.tool?.cliKind, let board = model.cliBoard(kind) {
+                        ForEach(Array(board.rows.prefix(9).enumerated()), id: \.element.id) { index, row in
+                            Button("") {
+                                if !row.isActive && row.signIn.isGood { model.useCLI(row) }
+                            }
+                            .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
+                        }
+                        Button("") { model.nextCLI(kind) }
+                            .keyboardShortcut(.return, modifiers: .command)
+                        Button("") { if board.commandFound { model.addCLIAccount(kind) } }
+                            .keyboardShortcut("n", modifiers: .command)
+                    }
+                }
                 Button("") { model.refreshAllNow() }
                     .keyboardShortcut("r", modifiers: .command)
-                Button("") { model.selected = model.selected == .claude ? .antigravity : .claude }
+                Button("") { model.stepTab(delta: 1) }
                     .keyboardShortcut(.tab, modifiers: .control)
+                Button("") { model.stepTab(delta: -1) }
+                    .keyboardShortcut(.tab, modifiers: [.control, .shift])
+                Button("") { model.stepTab(delta: 1) }
+                    .keyboardShortcut("]", modifiers: .command)
+                Button("") { model.stepTab(delta: -1) }
+                    .keyboardShortcut("[", modifiers: .command)
             }
         }
         .buttonStyle(.plain)
@@ -247,64 +403,112 @@ extension ProviderID {
     }
 }
 
-// MARK: Tabs
+// MARK: Unified top tabs
 
-/// Both apps at a glance: the name, whether it runs, and who is signed in. Click one to see its accounts.
-struct AppTabs: View {
+/// Compact icon-over-label segmented bar covering Overview + all visible desktop and CLI tools.
+struct ToolTabs: View {
     let model: AppModel
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
+        let tabs = model.visibleTabs
         HStack(spacing: 2) {
-            ForEach(ProviderID.allCases) { p in
-                tab(p)
+            ForEach(tabs) { tab in
+                tabButton(tab)
             }
         }
         .padding(3)
         .background(Fill.card, in: RoundedRectangle(cornerRadius: Metrics.radius + 3, style: .continuous))
     }
 
-    private func tab(_ p: ProviderID) -> some View {
-        let board = model.board(p)
-        let selected = model.selected == p
-        let installed = board?.installed ?? true
-        let who: String = {
-            guard let board else { return " " }
-            if !board.installed { return L.t("Not installed", "未安装") }
-            if let row = board.currentRow { return model.displayTabLabel(row.slot) }
-            return board.current == nil ? L.t("Signed out", "未登录") : L.t("Signed in", "已登录")
-        }()
-        let state: String = {
-            guard let board, board.installed else { return L.t("Not installed", "未安装") }
-            return board.running ? L.t("Running", "运行中") : L.t("Not running", "未运行")
+    private func indicatorColor(for tab: MenuTab) -> Color? {
+        switch tab {
+        case .overview:
+            let statuses: [CLIHeadroom.Status] = [
+                model.board(.antigravity)?.currentRow?.quota?.status() ?? .unknown,
+                model.cliBoard(.claude)?.active?.headroom.status ?? .unknown,
+                model.cliBoard(.codex)?.active?.headroom.status ?? .unknown,
+            ]
+            if statuses.contains(.out) { return .red }
+            if statuses.contains(.low) { return .orange }
+            return nil
+        case .claude:
+            return model.board(.claude)?.running == true ? .green : nil
+        case .antigravity:
+            if let st = model.board(.antigravity)?.currentRow?.quota?.status() {
+                if st == .out { return .red }
+                if st == .low { return .orange }
+            }
+            return model.board(.antigravity)?.running == true ? .green : nil
+        case .claudeCode:
+            return cliDot(.claude)
+        case .codex:
+            return cliDot(.codex)
+        }
+    }
+
+    private func cliDot(_ kind: CLIKind) -> Color? {
+        guard let board = model.cliBoard(kind) else { return nil }
+        if !board.shimInstalled && board.commandFound { return .orange }
+        guard let active = board.active else { return nil }
+        switch active.headroom.status {
+        case .out: return .red
+        case .low: return .orange
+        case .ok, .unknown: return nil
+        }
+    }
+
+    private func tabHelp(_ tab: MenuTab) -> String {
+        switch tab {
+        case .overview:
+            return L.t("Overview of all tools and current accounts", "所有工具与当前账号总览")
+        case .claude, .antigravity:
+            guard let p = tab.tool?.desktopProvider, let b = model.board(p) else { return tab.title }
+            if !b.installed { return "\(tab.title): \(L.t("Not installed", "未安装"))" }
+            let who = b.currentRow.map { model.displayTabLabel($0.slot) } ?? L.t("Signed out", "未登录")
+            let st = b.running ? L.t("Running", "运行中") : L.t("Not running", "未运行")
+            return "\(tab.title) · \(st) · \(who)"
+        case .claudeCode, .codex:
+            guard let k = tab.tool?.cliKind, let b = model.cliBoard(k) else { return tab.title }
+            let who = b.active.map { model.displayCLIActiveLabel($0) } ?? L.t("Signed out", "未登录")
+            return "\(tab.title) · \(who)"
+        }
+    }
+
+    private func tabButton(_ tab: MenuTab) -> some View {
+        let selected = model.activeTab == tab
+        let dot = indicatorColor(for: tab)
+        let installed: Bool = {
+            if let p = tab.tool?.desktopProvider { return model.board(p)?.installed ?? true }
+            if let k = tab.tool?.cliKind { return model.cliBoard(k)?.commandFound ?? true }
+            return true
         }()
         return Button {
-            model.selected = p
+            model.selectedTab = tab
         } label: {
-            HStack(spacing: 8) {
-                Image(systemName: p.symbol)
-                    .font(.body.weight(.medium))
-                    .foregroundStyle(selected ? .primary : .secondary)
-                    .frame(width: 20)
-                VStack(alignment: .leading, spacing: 1) {
-                    HStack(spacing: 5) {
-                        Text(p.displayName)
-                            .font(.body.weight(.semibold))
-                            .foregroundStyle(selected ? .primary : .secondary)
-                        if let board, board.installed { StatusDot(running: board.running) }
+            VStack(spacing: 3) {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: tab.symbol)
+                        .font(.system(size: 13, weight: selected ? .semibold : .medium))
+                        .foregroundStyle(selected ? .primary : .secondary)
+                        .frame(height: 16)
+                    if let dot {
+                        Circle()
+                            .fill(dot)
+                            .frame(width: 5.5, height: 5.5)
+                            .offset(x: 6, y: -1)
                     }
-                    Text(who)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
                 }
-                Spacer(minLength: 0)
+                Text(tab.title)
+                    .font(.caption.weight(selected ? .semibold : .medium))
+                    .foregroundStyle(selected ? .primary : .secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
             }
-            .opacity(installed ? 1 : 0.6)
-            .padding(.horizontal, 8)
+            .opacity(installed ? 1 : 0.55)
+            .padding(.horizontal, 4)
             .padding(.vertical, 6)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity)
             .background {
                 if selected {
                     RoundedRectangle(cornerRadius: Metrics.radius, style: .continuous)
@@ -315,9 +519,208 @@ struct AppTabs: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("\(p.displayName): \(state)")
-        .accessibilityLabel("\(p.displayName), \(state), \(who)")
+        .help(tabHelp(tab))
+        .accessibilityLabel(tabHelp(tab))
         .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+// MARK: Overview tab
+
+/// At-a-glance summary of every visible tool: active account, running/shim state, and tightest quota.
+struct OverviewSection: View {
+    let model: AppModel
+
+    private var needsInstall: Bool {
+        model.cliBoards.contains { !$0.isAbsent && !$0.shimInstalled && $0.commandFound }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 5) {
+                Text(L.t("All tools", "全部工具"))
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(L.t("Click a tool to switch", "点击进入切换"))
+                    .font(.subheadline)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, Metrics.rowH)
+
+            if needsInstall {
+                CLIShimInstallNotice(model: model)
+            }
+
+            VStack(spacing: 4) {
+                ForEach(Array(model.visibleTools.enumerated()), id: \.element.id) { index, tool in
+                    OverviewToolCard(model: model, tool: tool, index: index)
+                }
+            }
+        }
+    }
+}
+
+private struct OverviewToolCard: View {
+    let model: AppModel
+    let tool: ToolID
+    let index: Int
+    @State private var hovering = false
+
+    var body: some View {
+        Button {
+            model.selectedTab = MenuTab(tool)
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 8) {
+                    Image(systemName: tool.symbol)
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 22)
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 5) {
+                            Text(tool.displayName)
+                                .font(.body.weight(.semibold))
+                            statusTag
+                        }
+                        Text(activeAccountLine)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 4)
+                    if let bestHint {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.right.circle.fill").foregroundStyle(.green)
+                            Text(bestHint)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                        .font(.caption.weight(.medium))
+                        .frame(maxWidth: 96, alignment: .trailing)
+                    } else if index < 9 {
+                        Text("⌘\(index + 1)")
+                            .font(.caption)
+                            .monospacedDigit()
+                            .foregroundStyle(.tertiary)
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                if let meter = summaryMeters {
+                    meter
+                        .padding(.leading, 30)
+                }
+            }
+            .padding(.horizontal, Metrics.rowH)
+            .padding(.vertical, Metrics.rowV)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(hovering ? Fill.hover : Fill.card, in: RoundedRectangle(cornerRadius: Metrics.radius, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+
+    @ViewBuilder private var statusTag: some View {
+        if let p = tool.desktopProvider, let b = model.board(p) {
+            if !b.installed {
+                Tag(text: L.t("Not installed", "未安装"))
+            } else {
+                StatusDot(running: b.running)
+            }
+        } else if let k = tool.cliKind, let b = model.cliBoard(k) {
+            if !b.shimInstalled && b.commandFound {
+                Tag(text: L.t("Setup needed", "未设置"))
+            } else if let plan = b.active?.plan, !plan.isEmpty {
+                Tag(text: plan.prefix(1).uppercased() + plan.dropFirst())
+            }
+        }
+    }
+
+    private var activeAccountLine: String {
+        if let p = tool.desktopProvider {
+            guard let b = model.board(p) else { return L.t("Reading…", "读取中…") }
+            if !b.installed { return L.t("Not installed", "未安装") }
+            guard let row = b.currentRow else { return L.t("Signed out", "未登录") }
+            let d = model.displayLabel(row.slot)
+            return d.subtitle.map { "\(d.title) · \($0)" } ?? d.title
+        }
+        if let k = tool.cliKind {
+            guard let b = model.cliBoard(k), let active = b.active else { return L.t("Signed out", "未登录") }
+            if active.signIn == .out { return L.t("Not signed in", "未登录") }
+            let d = model.displayCLILabel(active)
+            return d.subtitle.map { "\(d.title) · \($0)" } ?? d.title
+        }
+        return ""
+    }
+
+    /// Name of the recommended fallback account when the active account is tight.
+    private var bestHint: String? {
+        if tool == .antigravity,
+           let bestID = model.bestAntigravityAccount,
+           let row = model.board(.antigravity)?.rows.first(where: { $0.id == bestID }) {
+            return model.displayTabLabel(row.slot)
+        }
+        if let k = tool.cliKind,
+           let best = model.cliBoard(k)?.rows.first(where: \.isBest) {
+            return model.displayCLIActiveLabel(best)
+        }
+        return nil
+    }
+
+    private var summaryMeters: AnyView? {
+        let mode = model.quotaDisplayMode
+        if tool == .antigravity, let q = model.board(.antigravity)?.currentRow?.quota {
+            let g5 = q.bucket(.gemini5h), gw = q.bucket(.geminiWeekly)
+            let c5 = q.bucket(.claude5h), cw = q.bucket(.claudeWeekly)
+            let tightestPair: (String, QuotaBucket?, QuotaBucket?) = {
+                let gMax = max(g5?.used ?? -1, gw?.used ?? -1)
+                let cMax = max(c5?.used ?? -1, cw?.used ?? -1)
+                return cMax > gMax ? ("Claude", c5, cw) : ("Gemini", g5, gw)
+            }()
+            return AnyView(
+                HStack(spacing: 8) {
+                    Text(tightestPair.0)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 38, alignment: .leading)
+                        .padding(.trailing, -4)
+                    UsageMeter(title: L.fiveHour, name: "\(tightestPair.0) \(L.fiveHour)", percent: tightestPair.1?.used, mode: mode)
+                    UsageMeter(title: L.week, name: "\(tightestPair.0) \(L.week)", percent: tightestPair.2?.used,
+                               pace: tightestPair.2?.pace().map { Int($0.rounded()) }, mode: mode)
+                    Spacer(minLength: 0)
+                }
+            )
+        }
+        if tool == .claude,
+           let email = model.board(.claude)?.currentRow?.slot.email,
+           let q = model.matchingCLIQuota(forDesktopEmail: email) {
+            return AnyView(ClaudeCLIReferenceLine(quota: q, mode: mode))
+        }
+        if let k = tool.cliKind,
+           let active = model.cliBoard(k)?.active,
+           active.signIn.isGood,
+           let q = active.quota {
+            let main = ["5h", "week"].compactMap { lbl in q.windows.first { $0.label == lbl } }
+            let shown = main.isEmpty ? Array(q.windows.prefix(2)) : main
+            guard !shown.isEmpty else { return nil }
+            return AnyView(
+                HStack(spacing: 8) {
+                    ForEach(shown, id: \.label) { w in
+                        let pace = (w.label == "week" || CLIUsage.duration(w) == 7 * 86400)
+                            ? CLIUsage.pace(w, now: Date()).map { Int($0.rounded()) } : nil
+                        UsageMeter(title: L.cliWindow(w.label), name: "\(k.displayName) \(L.cliWindow(w.label))",
+                                   percent: Int(w.usedPercent.rounded()), pace: pace, mode: mode)
+                    }
+                    Spacer(minLength: 0)
+                }
+            )
+        }
+        return nil
     }
 }
 

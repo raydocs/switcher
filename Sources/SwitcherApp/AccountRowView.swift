@@ -51,6 +51,7 @@ struct AccountRowView: View {
     let index: Int
     @Binding var removing: String?
     @Binding var renaming: String?
+    var isBest = false
     var forcedHover = false
 
     @State private var hovering = false
@@ -65,7 +66,15 @@ struct AccountRowView: View {
     private var highlighted: Bool { hovering || forcedHover || focused }
     private var isTarget: Bool { model.job?.provider == provider && model.job?.target == row.id }
     private var sitsOut: Bool { row.slot.disabled }
-    private var hasDetail: Bool { display.subtitle != nil || row.quota != nil || !row.canSwitch || row.probablyExpired }
+    private var matchingCLIQuota: CLIQuota? {
+        provider == .claude ? model.matchingCLIQuota(forDesktopEmail: row.slot.email) : nil
+    }
+    private var showSavedAge: Bool {
+        provider == .claude && !row.isCurrent && row.canSwitch && !row.probablyExpired && row.setAsideAt != nil
+    }
+    private var hasDetail: Bool {
+        display.subtitle != nil || row.quota != nil || matchingCLIQuota != nil || showSavedAge || !row.canSwitch || row.probablyExpired
+    }
 
     var body: some View {
         Group {
@@ -99,7 +108,11 @@ struct AccountRowView: View {
                                 .truncationMode(.middle)
                         }
                     }
-                    if provider == .antigravity, let quota = row.quota { AntigravityQuotaLines(quota: quota) }
+                    if provider == .antigravity, let quota = row.quota {
+                        AntigravityQuotaLines(quota: quota, mode: model.quotaDisplayMode)
+                    } else if let cliQuota = matchingCLIQuota {
+                        ClaudeCLIReferenceLine(quota: cliQuota, mode: model.quotaDisplayMode)
+                    }
                     if !row.canSwitch && !row.isCurrent {
                         Note(symbol: "info.circle", text: L.t(
                             "No saved sign-in yet. Choose Add Account and sign in to it once.",
@@ -108,6 +121,21 @@ struct AccountRowView: View {
                         Note(symbol: "exclamationmark.circle", text: L.t(
                             "This sign-in may have expired. \(app) may ask you to sign in again.",
                             "这个登录可能已过期，切换后 \(app) 可能要求重新登录。"), tint: .orange)
+                    } else if showSavedAge, let savedAt = row.setAsideAt {
+                        let ageDays = Date().timeIntervalSince(savedAt) / 86400
+                        let nearExpiry = ageDays >= 24
+                        HStack(spacing: 4) {
+                            if nearExpiry {
+                                Image(systemName: "exclamationmark.circle").foregroundStyle(.orange)
+                            }
+                            Text(L.t("Saved \(L.ago(savedAt))", "保存于\(L.ago(savedAt))"))
+                                .foregroundStyle(nearExpiry ? .secondary : .tertiary)
+                        }
+                        .font(.subheadline)
+                        .lineLimit(1)
+                        .help(nearExpiry
+                            ? L.t("Saved sign-ins usually expire after ~28 days without use.", "长期未使用的保存登录通常在约 28 天后过期。")
+                            : "")
                     }
                 }
                 .opacity(sitsOut && !row.isCurrent ? 0.55 : 1)
@@ -180,6 +208,15 @@ struct AccountRowView: View {
             .font(.subheadline.weight(.medium))
             .foregroundStyle(Color.accentColor)
             .fixedSize()
+        } else if isBest && switchable {
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.right.circle.fill").foregroundStyle(.green)
+                Text(L.t("Most room", "余量最多")).foregroundStyle(.secondary)
+            }
+            .font(.subheadline.weight(.medium))
+            .fixedSize()
+            .help(L.t("The current account is nearly out; this one has the most quota left.",
+                      "当前账号配额快用完了，这个账号余量最多。"))
         } else if switchable && index < 9 {
             Text("⌘\(index + 1)")
                 .font(.subheadline)
@@ -333,10 +370,12 @@ struct Tag: View {
     }
 }
 
-/// An Antigravity account's quota, in the same meters as Claude's usage: Gemini as the main pair,
-/// Claude-in-Antigravity dimmer under it, then Argon and the next reset as one quiet line.
+/// An Antigravity account's quota, in the same meters as CLI usage: Gemini as the main pair,
+/// Claude-in-Antigravity dimmer under it (both with weekly pace marks), then Argon (when used > 0)
+/// and the next reset as one quiet line.
 struct AntigravityQuotaLines: View {
     let quota: AntigravityQuota
+    var mode: QuotaDisplayMode = .used
 
     private static let labelWidth: CGFloat = 38
 
@@ -347,9 +386,22 @@ struct AntigravityQuotaLines: View {
 
     private var isStale: Bool { Date().timeIntervalSince(quota.fetchedAt) > 30 * 60 }
 
+    private var hasWeeklyPace: Bool {
+        [quota.bucket(.geminiWeekly), quota.bucket(.claudeWeekly)].contains { $0?.pace() != nil }
+    }
+
     private var detail: String {
+        let suffix = mode == .used ? L.t(" used", " 已用") : L.t(" left", " 剩余")
         var lines = quota.buckets.map { b in
-            "\(L.poolName(b.pool)): \(b.used)%" + (b.resetsAt.map { ", " + L.resets($0) } ?? "")
+            let shown = mode.shownPercent(used: b.used)
+            return "\(L.poolName(b.pool)): \(shown)%\(suffix)" + (b.resetsAt.map { ", " + L.resets($0) } ?? "")
+        }
+        if hasWeeklyPace {
+            lines.append(mode == .used
+                ? L.t("The mark on \(L.week) is an even pace: use past it runs out before the reset.",
+                      "“\(L.week)”上的刻度是匀速使用的位置：超过它，会在重置前用完。")
+                : L.t("The mark on \(L.week) is an even pace: remaining below it runs out before the reset.",
+                      "“\(L.week)”上的刻度是匀速使用的余量基准：低于它，会在重置前用完。"))
         }
         lines.append(L.t("Read \(L.ago(quota.fetchedAt))", "读取于\(L.ago(quota.fetchedAt))"))
         return lines.joined(separator: "\n")
@@ -369,14 +421,15 @@ struct AntigravityQuotaLines: View {
     }
 
     private func pair(_ name: String, _ five: QuotaBucket?, _ weekly: QuotaBucket?, warning: String?) -> some View {
-        HStack(spacing: 8) {
+        let weeklyPace = weekly?.pace().map { Int($0.rounded()) }
+        return HStack(spacing: 8) {
             Text(name)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .frame(width: Self.labelWidth, alignment: .leading)
                 .padding(.trailing, -4)
-            UsageMeter(title: L.fiveHour, name: name + " " + L.fiveHour, percent: five?.used)
-            UsageMeter(title: L.week, name: name + " " + L.week, percent: weekly?.used)
+            UsageMeter(title: L.fiveHour, name: name + " " + L.fiveHour, percent: five?.used, mode: mode)
+            UsageMeter(title: L.week, name: name + " " + L.week, percent: weekly?.used, pace: weeklyPace, mode: mode)
             Spacer(minLength: 0)
             if let warning {
                 Image(systemName: "exclamationmark.triangle")
@@ -390,15 +443,16 @@ struct AntigravityQuotaLines: View {
     }
 
     @ViewBuilder private var footnote: some View {
-        let argon = quota.bucket(.argonWeekly)
+        let argon = quota.bucket(.argonWeekly).flatMap { $0.used > 0 ? $0 : nil }
         let reset = nextReset
         if argon != nil || reset != nil || isStale {
             HStack(spacing: 10) {
                 if let argon {
+                    let shown = mode.shownPercent(used: argon.used)
                     HStack(spacing: 4) {
                         Text("Argon").frame(width: Self.labelWidth, alignment: .leading)
                         Text(L.week)
-                        Text("\(argon.used)%")
+                        Text("\(shown)%")
                             .monospacedDigit()
                             .foregroundStyle(argon.used >= 90 ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary))
                     }
@@ -415,5 +469,41 @@ struct AntigravityQuotaLines: View {
             .foregroundStyle(.secondary)
             .lineLimit(1)
         }
+    }
+}
+
+/// Quiet reference usage bar on a Claude Desktop row when a Claude Code CLI account shares the same email.
+struct ClaudeCLIReferenceLine: View {
+    let quota: CLIQuota
+    var mode: QuotaDisplayMode = .used
+
+    private var windows: [CLIQuotaWindow] {
+        let main = ["5h", "week"].compactMap { label in quota.windows.first { $0.label == label } }
+        return main.isEmpty ? Array(quota.windows.prefix(2)) : main
+    }
+
+    private func pace(_ w: CLIQuotaWindow) -> Int? {
+        guard w.label == "week" || CLIUsage.duration(w) == 7 * 86400 else { return nil }
+        return CLIUsage.pace(w, now: Date()).map { Int($0.rounded()) }
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(windows, id: \.label) { w in
+                UsageMeter(
+                    title: L.cliWindow(w.label),
+                    name: "Claude " + L.cliWindow(w.label),
+                    percent: Int(w.usedPercent.rounded()),
+                    pace: pace(w),
+                    mode: mode
+                )
+            }
+            Spacer(minLength: 0)
+            Tag(text: "CLI")
+        }
+        .opacity(0.85)
+        .help(L.t(
+            "Reference usage from the Claude Code account with the same email (read \(L.ago(quota.observedAt))).",
+            "参考用量：来自同邮箱的 Claude Code 账号（读取于\(L.ago(quota.observedAt))）。"))
     }
 }
