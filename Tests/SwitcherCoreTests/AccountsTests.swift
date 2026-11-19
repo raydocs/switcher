@@ -73,6 +73,32 @@ let ORG_TEAM = "00000000-0000-4000-8000-00000000000b"
         #expect(Privacy.displayEmail("ada@lovelace.dev", masked: true) == "a•••@l•••.dev")
         #expect(Privacy.displayEmail(nil, masked: true) == nil)
     }
+
+    @Test func redactsHomePathAndEmailsInDiagnostics() {
+        let raw = "/Users/ada/.zshrc: line for ada@lovelace.dev and backup grace@hopper.work under /Users/ada/.claude"
+        let redacted = Privacy.redactDiagnostic(raw, home: "/Users/ada/")
+        #expect(redacted == "~/.zshrc: line for a•••@l•••.dev and backup g•••@h•••.work under ~/.claude")
+        #expect(!redacted.contains("/Users/ada"))
+        #expect(!redacted.contains("lovelace"))
+    }
+}
+
+@Suite struct QuotaDisplayModeTests {
+    @Test func convertsUsedAndRemainingSymmetrically() {
+        #expect(QuotaDisplayMode.used.shownPercent(used: 42) == 42)
+        #expect(QuotaDisplayMode.remaining.shownPercent(used: 42) == 58)
+        #expect(QuotaDisplayMode.remaining.shownPercent(used: 0) == 100)
+        #expect(QuotaDisplayMode.remaining.shownPercent(used: 100) == 0)
+        #expect(QuotaDisplayMode.used.shownPercent(used: 130) == 100)
+        #expect(QuotaDisplayMode.remaining.shownPercent(used: -5) == 100)
+
+        #expect(QuotaDisplayMode.used.barFraction(used: 25) == 0.25)
+        #expect(QuotaDisplayMode.remaining.barFraction(used: 25) == 0.75)
+
+        #expect(QuotaDisplayMode.used.pacePosition(usedPace: 40) == 40)
+        #expect(QuotaDisplayMode.remaining.pacePosition(usedPace: 40) == 60)
+        #expect(QuotaDisplayMode.remaining.pacePosition(usedPace: nil) == nil)
+    }
 }
 
 @Suite(.serialized) struct LocalizationTests {

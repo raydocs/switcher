@@ -3,7 +3,7 @@ import SwitcherCore
 
 /// The Settings window's tabs, in toolbar order.
 enum SettingsTab: String, CaseIterable, Identifiable {
-    case general, accounts, about
+    case general, accounts, terminal, about
 
     var id: String { rawValue }
 
@@ -11,6 +11,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         switch self {
         case .general: L.t("General", "通用")
         case .accounts: L.t("Accounts", "账号")
+        case .terminal: L.t("Terminal", "终端诊断")
         case .about: L.t("About", "关于")
         }
     }
@@ -19,6 +20,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         switch self {
         case .general: "gearshape"
         case .accounts: "person.2"
+        case .terminal: "stethoscope"
         case .about: "info.circle"
         }
     }
@@ -51,6 +53,7 @@ struct SettingsPage: View {
         var confirmRemove: String?
         var rename: String?
         var openAtLogin: Bool?
+        var confirmUninstallShims = false
     }
 
     /// The page's own height, measured: the window follows it up to the limit.
@@ -87,6 +90,7 @@ struct SettingsPage: View {
             switch tab {
             case .general: GeneralSettings(model: model, staged: staged)
             case .accounts: AccountsSettings(model: model, staged: staged)
+            case .terminal: TerminalDoctorSettings(model: model, staged: staged)
             case .about: AboutSettings()
             }
         }
@@ -269,6 +273,35 @@ struct GeneralSettings: View {
                 }
                 RowDivider()
                 SettingRow(
+                    title: L.t("Quota display", "配额显示方式"),
+                    detail: L.t("Show meters as percent used or percent remaining.",
+                                "将用量条与百分比显示为“已用”或“剩余”。")
+                ) {
+                    if staticRender {
+                        HStack(spacing: 4) {
+                            Text(quotaModeName(model.quotaDisplayMode))
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.callout)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Fill.hover, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    } else {
+                        Picker(L.t("Quota display", "配额显示方式"), selection: Binding(
+                            get: { model.quotaDisplayMode },
+                            set: { model.quotaDisplayMode = $0 })) {
+                            ForEach(QuotaDisplayMode.allCases) { mode in
+                                Text(quotaModeName(mode)).tag(mode)
+                            }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+                }
+                RowDivider()
+                SettingRow(
                     title: L.t("Hide email addresses", "隐藏邮箱地址"),
                     detail: L.t("Masks emails like a•••@l•••.dev for screenshots or screen sharing.",
                                 "将邮箱显示为 a•••@l•••.dev，便于录屏或共享屏幕。")
@@ -308,6 +341,20 @@ struct GeneralSettings: View {
                     }
                 }
             }
+
+            VStack(alignment: .leading, spacing: 6) {
+                SectionHeader(
+                    title: L.t("Tools in the menu", "菜单中显示的工具"),
+                    detail: L.t("Hide tools you don't use", "隐藏不使用的工具")
+                )
+                SettingsCard {
+                    ForEach(Array(ToolID.allCases.enumerated()), id: \.element.id) { index, tool in
+                        if index > 0 { RowDivider() }
+                        toolVisibilityRow(tool)
+                    }
+                }
+            }
+
             SettingsCard {
                 VStack(alignment: .leading, spacing: 10) {
                     MenuBarSketch(icon: MenuBarLabel.icon(model.cliBoards, meter: menuBarMeter))
@@ -327,6 +374,46 @@ struct GeneralSettings: View {
             }
         }
         .onAppear { if !staticRender { openAtLogin = model.openAtLogin } }
+    }
+
+    private func toolVisibilityRow(_ tool: ToolID) -> some View {
+        let enabled = !model.hiddenTools.contains(tool)
+        let isAbsentCLI = tool.cliKind.map { kind in model.cliBoard(kind)?.isAbsent ?? true } ?? false
+        let isOnlyVisible = enabled && model.visibleTools.count <= 1 && model.visibleTools.contains(tool)
+        return HStack(alignment: .center, spacing: 10) {
+            Image(systemName: tool.symbol)
+                .font(.callout.weight(.medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(tool.displayName)
+                    .font(.body.weight(.medium))
+                if isAbsentCLI {
+                    Text(L.t("Not detected on this Mac", "此 Mac 上未检测到"))
+                        .font(.subheadline)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            Spacer(minLength: 8)
+            SwitchControl(
+                isOn: Binding(
+                    get: { enabled },
+                    set: { model.toggleToolVisibility(tool, visible: $0) }
+                ),
+                label: tool.displayName,
+                small: true
+            )
+            .disabled(isOnlyVisible)
+        }
+        .padding(.horizontal, Metrics.cardPad)
+        .padding(.vertical, 9)
+    }
+
+    private func quotaModeName(_ mode: QuotaDisplayMode) -> String {
+        switch mode {
+        case .used: L.t("Used %", "已用百分比")
+        case .remaining: L.t("Remaining %", "剩余百分比")
+        }
     }
 
     private func languageName(_ lang: AppLanguage) -> String {

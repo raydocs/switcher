@@ -18,6 +18,8 @@ struct AccountsSettings: View {
         _renaming = State(initialValue: staged.rename)
     }
 
+    private var visibleCLIBoards: [CLIBoard] { model.cliBoards.filter { !$0.isAbsent } }
+
     var body: some View {
         VStack(alignment: .leading, spacing: Metrics.settingsGap) {
             if let found = model.ccSame {
@@ -32,15 +34,58 @@ struct AccountsSettings: View {
             }
             if model.boards.contains(where: { $0.rows.count > 1 }) {
                 Note(symbol: "line.3.horizontal", text: L.t(
-                    "Drag an account to reorder it. The order here is the order in the menu, and the order Next Account follows.",
-                    "拖动账号可以调整顺序。这里的顺序就是菜单里的顺序，也是“下一个账号”依次切换的顺序。"))
+                    "Drag a desktop account to reorder it. The order here is the order in the menu, and the order Next Account follows.",
+                    "拖动桌面应用账号可以调整顺序。这里的顺序就是菜单里的顺序，也是“下一个账号”依次切换的顺序。"))
                     .padding(.horizontal, Metrics.cardPad)
+            }
+            ForEach(visibleCLIBoards) { board in
+                cliSection(board)
             }
         }
         .inert(model.isBusy)
-        .onAppear { model.surfaceAppeared() }
+        .onAppear {
+            model.surfaceAppeared()
+            model.refreshCLI()
+        }
         .onDisappear { model.surfaceDisappeared() }
     }
+
+    @ViewBuilder private func cliSection(_ board: CLIBoard) -> some View {
+        let n = board.rows.count
+        VStack(alignment: .leading, spacing: 6) {
+            SectionHeader(
+                symbol: board.kind == .claude ? ToolID.claudeCode.symbol : ToolID.codex.symbol,
+                title: board.kind.displayName,
+                detail: n == 1 ? L.t("1 account", "1 个账号") : L.t("\(n) accounts", "\(n) 个账号")
+            ) {
+                HStack(spacing: 8) {
+                    if !board.shimInstalled && board.commandFound {
+                        Tag(text: L.t("Setup needed", "未设置"))
+                    }
+                    Button {
+                        model.addCLIAccount(board.kind)
+                    } label: {
+                        Label(L.t("Add…", "添加…"), systemImage: "plus")
+                    }
+                    .buttonStyle(QuietButtonStyle())
+                    .font(.subheadline)
+                    .disabled(!board.commandFound || model.cliSigningIn[board.kind] != nil)
+                }
+            }
+            SettingsCard {
+                ForEach(Array(board.rows.enumerated()), id: \.element.id) { index, row in
+                    let key = Self.cliKey(row)
+                    if index > 0 { RowDivider() }
+                    CLIAccountSettingsRow(
+                        model: model, row: row, key: key,
+                        removing: $removing, renaming: $renaming,
+                        forcedHover: staged.hover == key)
+                }
+            }
+        }
+    }
+
+    static func cliKey(_ row: CLIRow) -> String { "cli/\(row.id)" }
 
     @ViewBuilder private func section(_ board: AppBoard) -> some View {
         let app = board.provider.displayName
@@ -424,5 +469,280 @@ private struct RowDrop: DropDelegate {
         dragging = nil
         target = nil
         return true
+    }
+}
+
+/// One terminal CLI account in Settings → Accounts.
+struct CLIAccountSettingsRow: View {
+    let model: AppModel
+    let row: CLIRow
+    let key: String
+    @Binding var removing: String?
+    @Binding var renaming: String?
+    var forcedHover = false
+
+    @State private var hovering = false
+    @State private var draftAlias = ""
+    @FocusState private var aliasFocused: Bool
+    @Environment(\.staticRender) private var staticRender
+
+    private var display: (title: String, subtitle: String?) { model.displayCLILabel(row) }
+    private var showActions: Bool { (hovering || forcedHover) && removing == nil && renaming == nil }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(verbatim: "\(row.number)")
+                .font(.subheadline.weight(.medium))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 14, minHeight: Metrics.avatar)
+                .accessibilityLabel(L.t("Number \(row.number)", "编号 \(row.number)"))
+            Avatar(label: "\(row.number)", seed: row.email ?? row.id)
+            Group {
+                if removing == key {
+                    removeConfirm
+                } else if renaming == key {
+                    renameForm
+                } else {
+                    normal
+                }
+            }
+            .frame(minHeight: Metrics.avatar)
+        }
+        .padding(.horizontal, Metrics.cardPad)
+        .padding(.vertical, 9)
+        .background(hovering || forcedHover ? Fill.hover.opacity(0.6) : .clear)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .contextMenu { menuItems }
+    }
+
+    private var normal: some View {
+        HStack(alignment: .center, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(display.title)
+                        .font(.body.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .layoutPriority(1)
+                    if let plan = row.plan, !plan.isEmpty {
+                        Tag(text: plan.prefix(1).uppercased() + plan.dropFirst())
+                    }
+                    if row.isDefault {
+                        Tag(text: L.t("Default", "默认"))
+                    }
+                }
+                if let subtitle = display.subtitle {
+                    Text(subtitle)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                status
+            }
+            Spacer(minLength: 8)
+            if showActions {
+                actions
+            }
+            if row.isActive {
+                HStack(spacing: 3) {
+                    Image(systemName: "checkmark").font(.caption2.weight(.bold))
+                    Text(L.t("Active", "使用中")).font(.subheadline.weight(.medium))
+                }
+                .foregroundStyle(Color.accentColor)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(Fill.tint, in: Capsule())
+                .fixedSize()
+            } else if row.signIn.isGood {
+                Button(L.t("Use", "选用")) { model.useCLI(row) }
+                    .buttonStyle(SoftButtonStyle(compact: true))
+                    .fixedSize()
+            } else {
+                Button(L.t("Sign In…", "登录…")) { model.signInCLI(row) }
+                    .buttonStyle(SoftButtonStyle(kind: .tinted, compact: true))
+                    .fixedSize()
+            }
+        }
+    }
+
+    @ViewBuilder private var status: some View {
+        switch row.signIn {
+        case .good(let until):
+            if let until {
+                let days = Int((until.timeIntervalSinceNow / 86400).rounded(.up))
+                if days <= 0 {
+                    Label(L.t("Sign-in expired", "登录已失效"), systemImage: "exclamationmark.circle")
+                        .font(.subheadline)
+                        .foregroundStyle(.orange)
+                } else if days < 5 {
+                    Label(days == 1 ? L.t("Runs out in 1 day", "1 天后失效") : L.t("Runs out in \(days) days", "\(days) 天后失效"),
+                          systemImage: "exclamationmark.circle")
+                        .font(.subheadline)
+                        .foregroundStyle(.orange)
+                } else {
+                    Text(L.t("Sign-in good until \(L.day(until))", "登录有效至 \(L.day(until))"))
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Text(L.t("Signed in", "已登录"))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+        case .other(let mode):
+            Text(L.t("Signed in with \(mode)", "通过 \(mode) 登录"))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        case .out:
+            Text(L.t("Not signed in", "未登录"))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var actions: some View {
+        HStack(spacing: 0) {
+            icon("pencil", L.t("Rename…", "设别名…")) {
+                draftAlias = row.alias ?? ""
+                removing = nil
+                renaming = key
+            }
+            if row.signIn.isGood {
+                icon("terminal", L.t("Open Terminal as This Account", "用此账号打开终端")) {
+                    model.openTerminalForCLI(row)
+                }
+            }
+            icon("trash", row.isDefault
+                ? L.t("The default folder stays. Sign out inside the CLI itself.", "默认文件夹无法移除，可在 CLI 内自行退出登录。")
+                : L.t("Remove…", "移除…"), disabled: row.isDefault) {
+                renaming = nil
+                removing = key
+            }
+        }
+    }
+
+    private func icon(_ symbol: String, _ help: String, disabled: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.callout)
+                .frame(width: 24, height: 24)
+        }
+        .buttonStyle(QuietButtonStyle())
+        .disabled(disabled)
+        .help(help)
+        .accessibilityLabel(help)
+    }
+
+    @ViewBuilder private var menuItems: some View {
+        Button(L.t("Rename…", "设别名…")) {
+            draftAlias = row.alias ?? ""
+            removing = nil
+            renaming = key
+        }
+        if row.signIn.isGood {
+            Button(L.t("Open Terminal as This Account", "用此账号打开终端")) {
+                model.openTerminalForCLI(row)
+            }
+        }
+        if !row.launchCommand.isEmpty {
+            Button(L.t("Copy Launch Command", "复制启动命令")) {
+                model.copy(row.launchCommand)
+            }
+        }
+        Button(L.t("Sign In Again…", "重新登录…")) {
+            model.signInCLI(row)
+        }
+        Divider()
+        Button(L.t("Remove…", "移除…"), role: .destructive) {
+            renaming = nil
+            removing = key
+        }
+        .disabled(row.isDefault)
+    }
+
+    private var renameForm: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(L.t("Set alias", "设置别名"))
+                    .font(.body.weight(.semibold))
+                Text(model.displayEmail(row.email) ?? (row.isDefault ? L.t("default", "默认") : row.name))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            if staticRender {
+                let shown = draftAlias.isEmpty ? (row.alias ?? "") : draftAlias
+                Text(shown.isEmpty ? L.t("e.g. Work, Personal", "例如：工作号、主力") : shown)
+                    .font(.body)
+                    .foregroundStyle(shown.isEmpty ? .tertiary : .primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Fill.hover, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            } else {
+                TextField(L.t("e.g. Work, Personal", "例如：工作号、主力"), text: $draftAlias)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($aliasFocused)
+                    .onSubmit { saveAlias() }
+            }
+            HStack(spacing: 6) {
+                if row.alias != nil {
+                    Button(L.t("Clear", "清除")) {
+                        model.setCLIAlias(row, nil)
+                        renaming = nil
+                    }
+                    .buttonStyle(QuietButtonStyle())
+                    .font(.subheadline)
+                }
+                Spacer()
+                Button(L.t("Cancel", "取消")) { renaming = nil }
+                    .buttonStyle(SoftButtonStyle(compact: true))
+                    .keyboardShortcut(.cancelAction)
+                Button(L.t("Save", "保存")) { saveAlias() }
+                    .buttonStyle(SoftButtonStyle(kind: .tinted, compact: true))
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(.top, 4)
+        .onAppear {
+            if draftAlias.isEmpty { draftAlias = row.alias ?? "" }
+            if !staticRender { aliasFocused = true }
+        }
+    }
+
+    private func saveAlias() {
+        let trimmed = draftAlias.trimmingCharacters(in: .whitespacesAndNewlines)
+        model.setCLIAlias(row, trimmed.isEmpty ? nil : trimmed)
+        renaming = nil
+    }
+
+    private var removeConfirm: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(L.t("Remove \(display.title)?", "移除 \(display.title)？"))
+                    .font(.body.weight(.semibold))
+                    .lineLimit(2)
+                Text(L.cliRemoveExplained(row.kind))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 6) {
+                Spacer()
+                Button(L.t("Cancel", "取消")) { removing = nil }
+                    .buttonStyle(SoftButtonStyle(compact: true))
+                    .keyboardShortcut(.cancelAction)
+                Button(L.t("Remove", "移除")) {
+                    model.removeCLI(row)
+                    removing = nil
+                }
+                .buttonStyle(SoftButtonStyle(kind: .destructive, compact: true))
+            }
+        }
+        .padding(.top, 4)
     }
 }

@@ -150,12 +150,15 @@ extension L {
     }
 
     /// The tooltip of a separate limit, with its whole name.
-    static func cliScopeHelp(_ parts: (name: String, window: String?), percent: Int) -> String {
+    static func cliScopeHelp(_ parts: (name: String, window: String?), percent: Int, mode: QuotaDisplayMode = .used) -> String {
+        let shown = mode.shownPercent(used: percent)
+        let suffixEn = mode == .used ? "used" : "left"
+        let suffixCn = mode == .used ? "已用 \(shown)%" : "剩余 \(shown)%"
         guard let window = parts.window else {
-            return t("\(parts.name)'s own weekly limit is \(percent)% used.", "\(parts.name) 单独的每周额度已用 \(percent)%。")
+            return t("\(parts.name)'s own weekly limit is \(shown)% \(suffixEn).", "\(parts.name) 单独的每周额度\(suffixCn)。")
         }
-        return t("The separate limit “\(parts.name)” (\(cliWindow(window))) is \(percent)% used.",
-                 "单独的额度「\(parts.name)」（\(cliWindow(window))）已用 \(percent)%。")
+        return t("The separate limit “\(parts.name)” (\(cliWindow(window))) is \(shown)% \(suffixEn).",
+                 "单独的额度「\(parts.name)」（\(cliWindow(window))）\(suffixCn)。")
     }
 
     /// Any window's full name, for tooltips and VoiceOver: "Spark (45m)", "Opus (Week)".
@@ -166,87 +169,13 @@ extension L {
     }
 }
 
-// MARK: The section
+// MARK: Shared CLI notices
 
-struct CLISection: View {
+/// Without the shims the pointer changes nothing: say so, and offer the one click that fixes it.
+struct CLIShimInstallNotice: View {
     let model: AppModel
-    /// Its height, so the popover can share the screen between the app's accounts and these.
-    @Binding var height: CGFloat
-
-    /// States a still image cannot reach by itself, for captures.
-    struct Staged {
-        var expanded: Set<CLIKind>?
-        var adding: CLIKind?
-        var hover: String?
-        var confirmRemove: String?
-        var rename: String?
-    }
-
-    private let staged: Staged
-    @AppStorage("cliExpanded") private var stored = ""
-    @State private var adding: CLIKind?
-    @State private var removing: String?
-    @State private var renaming: String?
-    @State private var groupsHeight: CGFloat = 0
-    @Environment(\.staticRender) private var staticRender
-
-    init(model: AppModel, height: Binding<CGFloat>, staged: Staged = Staged()) {
-        self.model = model
-        self.staged = staged
-        _height = height
-        _adding = State(initialValue: staged.adding)
-        _removing = State(initialValue: staged.confirmRemove)
-        _renaming = State(initialValue: staged.rename)
-    }
-
-    private var boards: [CLIBoard] { model.cliBoards.filter { !$0.isAbsent } }
-
-    private var expanded: Set<CLIKind> {
-        staged.expanded ?? Set(stored.split(separator: ",").compactMap { CLIKind(rawValue: String($0)) })
-    }
-
-    private var needsInstall: Bool { boards.contains { !$0.shimInstalled && $0.commandFound } }
 
     var body: some View {
-        if !boards.isEmpty {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 5) {
-                    Text(L.t("Terminal", "终端"))
-                        .font(.subheadline.weight(.medium))
-                    Spacer()
-                    Text(L.t("Applies to new sessions", "只对新会话生效"))
-                        .font(.subheadline)
-                }
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, Metrics.rowH)
-                .help(L.t(
-                    "Accounts for the claude and codex commands, apart from the desktop apps. The one you choose is used by sessions you start afterwards: running sessions keep theirs and nothing quits.",
-                    "claude 和 codex 命令使用的账号，与桌面应用无关。选用的账号只用于之后启动的会话：正在运行的会话保持不变，也不会退出任何程序。"))
-                if needsInstall {
-                    installNotice
-                } else if model.cliJustInstalled {
-                    Note(symbol: "checkmark.circle", text: L.t(
-                        "Installed. Open a new terminal for it to take effect.", "已安装。打开新的终端窗口后生效。"), tint: .green)
-                        .padding(.horizontal, Metrics.rowH)
-                }
-                if staticRender {
-                    groups
-                } else {
-                    ScrollView {
-                        groups
-                            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { groupsHeight = $0 }
-                    }
-                    .frame(height: groupsHeight > 0 ? min(groupsHeight, Metrics.cliMaxHeight) : nil)
-                    .scrollBounceBehavior(.basedOnSize)
-                }
-            }
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height = $0 }
-            .onAppear { model.refreshCLI(quotaFor: expanded) }
-        }
-    }
-
-    /// Without the shims the choice below changes nothing: say so, and offer the one click that fixes it.
-    private var installNotice: some View {
         HStack(alignment: .center, spacing: 8) {
             Note(symbol: "info.circle", text: L.t(
                 "Not set up yet, so choosing here has no effect. Install adds one line to ~/.zshrc.",
@@ -260,123 +189,8 @@ struct CLISection: View {
                     "加入 Switcher 的 claude 和 codex 启动器，并在 ~/.zshrc（以及已有的 ~/.bashrc）末尾加入一行。打开新的终端窗口后生效。"))
         }
         .padding(.horizontal, Metrics.rowH)
-    }
-
-    private var groups: some View {
-        VStack(alignment: .leading, spacing: Metrics.rowGap) {
-            ForEach(boards) { board in
-                group(board)
-            }
-        }
-    }
-
-    @ViewBuilder private func group(_ board: CLIBoard) -> some View {
-        let open = expanded.contains(board.kind)
-        CLIGroupHeader(model: model, board: board, expanded: open, reading: model.cliReading.contains(board.kind)) { toggle(board.kind) }
-        if open {
-            if !board.commandFound {
-                Note(symbol: "info.circle", text: L.cliNotFound(board.kind))
-                    .padding(.leading, Metrics.rowH + Metrics.avatar + Metrics.avatarGap)
-                    .padding(.vertical, 2)
-            }
-            ForEach(board.rows) { row in
-                CLIRowView(model: model, row: row, removing: $removing, renaming: $renaming, forcedHover: staged.hover == row.id)
-            }
-            if model.cliSigningIn[board.kind] != nil || adding == board.kind {
-                CLISigningInCard(model: model, kind: board.kind)
-                    .padding(.vertical, 4)
-            } else {
-                Button {
-                    model.addCLIAccount(board.kind)
-                } label: {
-                    // A last, quiet line of the list: the plus under the numbers, the words under the names.
-                    HStack(spacing: Metrics.avatarGap) {
-                        Image(systemName: "plus")
-                            .frame(width: Metrics.avatar)
-                        Text(L.t("Add Account…", "添加账号…"))
-                    }
-                    .padding(.horizontal, Metrics.rowH)
-                    .padding(.vertical, 4)
-                }
-                .buttonStyle(QuietButtonStyle())
-                .font(.callout)
-                .help(L.t("Sign in to another \(board.kind.displayName) account in your browser",
-                          "在浏览器里登录另一个 \(board.kind.displayName) 账号"))
-                .padding(.bottom, 4)
-            }
-        }
-    }
-
-    private func toggle(_ kind: CLIKind) {
-        var now = expanded
-        if now.contains(kind) {
-            now.remove(kind)
-            removing = nil
-            renaming = nil
-        } else {
-            now.insert(kind)
-            model.loadCLIQuota(kind)
-        }
-        stored = CLIKind.allCases.filter(now.contains).map(\.rawValue).joined(separator: ",")
-    }
-}
-
-/// "Claude Code" with the account new sessions get: click to show or hide its accounts.
-struct CLIGroupHeader: View {
-    let model: AppModel
-    let board: CLIBoard
-    let expanded: Bool
-    let reading: Bool
-    let toggle: () -> Void
-
-    @State private var hovering = false
-    @FocusState private var focused: Bool
-
-    var body: some View {
-        Button(action: toggle) {
-            HStack(spacing: Metrics.avatarGap) {
-                Image(systemName: "terminal")
-                    .font(.body.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .frame(width: Metrics.avatar)
-                Text(board.kind.displayName)
-                    .font(.body.weight(.semibold))
-                    .fixedSize()
-                Spacer(minLength: 4)
-                if reading {
-                    Spinner(size: 10)
-                } else if !expanded, let active = board.active {
-                    if active.signIn == .out {
-                        Image(systemName: "exclamationmark.circle")
-                            .font(.subheadline)
-                            .foregroundStyle(.orange)
-                            .help(L.t("Not signed in", "未登录"))
-                    }
-                    Text(model.displayCLIActiveLabel(active))
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .padding(.leading, -4)
-                }
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.tertiary)
-                    .rotationEffect(.degrees(expanded ? 90 : 0))
-                    .frame(width: 12)
-                    .padding(.leading, -2)
-            }
-            .padding(.horizontal, Metrics.rowH)
-            .padding(.vertical, Metrics.rowV)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .buttonStyle(RowButtonStyle(highlighted: hovering || focused, current: false, focused: focused))
-        .focused($focused)
-        .focusEffectDisabled()
-        .onHover { hovering = $0 }
-        .accessibilityLabel(board.kind.displayName)
-        .accessibilityValue(board.active.map { model.displayCLIActiveLabel($0) } ?? "")
-        .accessibilityHint(expanded ? L.t("Hide accounts", "收起账号") : L.t("Show accounts", "展开账号"))
+        .padding(.vertical, 6)
+        .background(Fill.card, in: RoundedRectangle(cornerRadius: Metrics.radius, style: .continuous))
     }
 }
 
@@ -387,6 +201,7 @@ struct CLIGroupHeader: View {
 struct CLIRowView: View {
     let model: AppModel
     let row: CLIRow
+    var index: Int = 0
     @Binding var removing: String?
     @Binding var renaming: String?
     var forcedHover = false
@@ -533,6 +348,12 @@ struct CLIRowView: View {
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(Color.accentColor)
                 .fixedSize()
+            } else if usable && !row.isBest && index < 9 {
+                Text("⌘\(index + 1)")
+                    .font(.subheadline)
+                    .monospacedDigit()
+                    .foregroundStyle(.tertiary)
+                    .fixedSize()
             }
             if showMenu {
                 // Room for the ellipsis menu laid over the row.
@@ -705,6 +526,7 @@ struct CLIRowView: View {
                 ForEach(windows, id: \.label) { window in
                     UsageMeter(title: L.cliWindow(window.label), name: row.kind.displayName + " " + L.cliWindow(window.label),
                                percent: Int(window.usedPercent.rounded()), pace: pace(window),
+                               mode: model.quotaDisplayMode,
                                hugsPercent: beside != nil && window.label == windows.last?.label)
                 }
             }
@@ -725,7 +547,8 @@ struct CLIRowView: View {
     /// A third window without a bar: its name (and window, for a Codex limit), then the percent as
     /// the meters colour it.
     private func scopedLabel(_ scoped: CLIQuotaWindow, wraps: Bool) -> some View {
-        let percent = Int(scoped.usedPercent.rounded())
+        let usedPercent = Int(scoped.usedPercent.rounded())
+        let shown = model.quotaDisplayMode.shownPercent(used: usedPercent)
         let parts = L.cliScopeParts(scoped.label)
         return HStack(alignment: .firstTextBaseline, spacing: 4) {
             Text(verbatim: parts.name)
@@ -737,16 +560,18 @@ struct CLIRowView: View {
                     .foregroundStyle(.tertiary)
                     .fixedSize()
             }
-            Text(verbatim: "\(percent)%")
+            Text(verbatim: "\(shown)%")
                 .monospacedDigit()
-                .foregroundStyle(Fill.usage(percent))
+                .foregroundStyle(Fill.usage(usedPercent))
                 .fixedSize()
         }
         .font(.subheadline)
-        .help(L.cliScopeHelp(parts, percent: percent))
+        .help(L.cliScopeHelp(parts, percent: usedPercent, mode: model.quotaDisplayMode))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(row.kind.displayName + " " + L.cliWindowFull(scoped.label))
-        .accessibilityValue("\(percent)%")
+        .accessibilityValue(model.quotaDisplayMode == .used
+            ? L.t("\(shown)% used", "已用 \(shown)%")
+            : L.t("\(shown)% left", "剩余 \(shown)%"))
     }
 
     /// The even-pace mark: on the weekly meter only (a 5-hour window is spent in bursts).
@@ -765,12 +590,18 @@ struct CLIRowView: View {
 
     private var usageDetail: String {
         guard let quota = row.quota else { return "" }
+        let mode = model.quotaDisplayMode
+        let suffix = mode == .used ? L.t(" used", " 已用") : L.t(" left", " 剩余")
         var lines = quota.windows.map { w in
-            "\(L.cliWindowFull(w.label)): \(Int(w.usedPercent.rounded()))%" + (w.resetsAt.map { ", " + L.resets($0) } ?? "")
+            let shown = mode.shownPercent(used: Int(w.usedPercent.rounded()))
+            return "\(L.cliWindowFull(w.label)): \(shown)%\(suffix)" + (w.resetsAt.map { ", " + L.resets($0) } ?? "")
         }
         if windows.contains(where: { pace($0) != nil }) {
-            lines.append(L.t("The mark on \(L.week) is an even pace: use past it runs out before the reset.",
-                             "“\(L.week)”上的刻度是匀速使用的位置：超过它，会在重置前用完。"))
+            lines.append(mode == .used
+                ? L.t("The mark on \(L.week) is an even pace: use past it runs out before the reset.",
+                      "“\(L.week)”上的刻度是匀速使用的位置：超过它，会在重置前用完。")
+                : L.t("The mark on \(L.week) is an even pace: remaining below it runs out before the reset.",
+                      "“\(L.week)”上的刻度是匀速使用的余量基准：低于它，会在重置前用完。"))
         }
         lines.append(L.t("Read \(L.ago(quota.observedAt))", "读取于\(L.ago(quota.observedAt))"))
         return lines.joined(separator: "\n")

@@ -313,4 +313,20 @@ public struct CLIDoctor {
         if f.allSatisfy({ $0.level == .note }) { add(.ok, "no problems found") }
         return f
     }
+
+    /// Formats findings as a plain-text report, optionally redacting home paths and email addresses.
+    public static func formattedReport(_ findings: [DoctorFinding], home: String, redacted: Bool = true) -> String {
+        let lines = findings.map { finding -> String in
+            let tag: String
+            switch finding.level {
+            case .ok: tag = "OK"
+            case .note: tag = "NOTE"
+            case .warn: tag = "WARN"
+            case .problem: tag = "PROBLEM"
+            }
+            let body = redacted ? Privacy.redactDiagnostic(finding.message, home: home) : finding.message
+            return "[\(tag)] \(body)"
+        }
+        return (["Switcher CLI Doctor"] + lines).joined(separator: "\n")
+    }
 }

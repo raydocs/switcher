@@ -4,6 +4,23 @@ import Foundation
 public struct QuotaBucket: Codable, Equatable, Sendable, Identifiable {
     public enum Pool: String, Codable, CaseIterable, Sendable {
         case gemini5h, geminiWeekly, argonWeekly, claude5h, claudeWeekly
+
+        /// Window length in seconds (5 hours or 7 days).
+        public var duration: TimeInterval {
+            switch self {
+            case .gemini5h, .claude5h: 5 * 3600
+            case .geminiWeekly, .claudeWeekly, .argonWeekly: 7 * 86400
+            }
+        }
+
+        public var isWeekly: Bool {
+            switch self {
+            case .geminiWeekly, .claudeWeekly, .argonWeekly: true
+            case .gemini5h, .claude5h: false
+            }
+        }
+
+        public var isCore: Bool { self != .argonWeekly }
     }
 
     public var pool: Pool
@@ -17,6 +34,14 @@ public struct QuotaBucket: Codable, Equatable, Sendable, Identifiable {
         self.pool = pool
         self.used = used
         self.resetsAt = resetsAt
+    }
+
+    /// Even-pace mark (0–100% used) for weekly pools when `resetsAt` is in the future.
+    public func pace(now: Date = Date()) -> Double? {
+        guard pool.isWeekly, let reset = resetsAt, reset > now else { return nil }
+        let length = pool.duration
+        let gone = length - reset.timeIntervalSince(now)
+        return min(100, max(0, gone / length * 100))
     }
 }
 
@@ -36,6 +61,41 @@ public struct AntigravityQuota: Codable, Equatable, Sendable {
     }
 
     public func bucket(_ pool: QuotaBucket.Pool) -> QuotaBucket? { buckets.first { $0.pool == pool } }
+
+    /// The core bucket (Gemini or Claude 5h/weekly) closest to its limit, ignoring windows past reset.
+    public func tightest(now: Date = Date()) -> QuotaBucket? {
+        let active = buckets.filter { b in
+            guard b.pool.isCore else { return false }
+            if let reset = b.resetsAt, reset <= now { return false }
+            return true
+        }
+        return active.max { $0.used < $1.used }
+    }
+
+    /// Remaining room (0–100) in the tightest active core bucket, or nil when unknown.
+    public func percentLeft(now: Date = Date()) -> Int? {
+        tightest(now: now).map { max(0, 100 - $0.used) }
+    }
+
+    /// Overall headroom status matching `CLIHeadroom.Status` thresholds (80% low, 100% out).
+    public func status(now: Date = Date()) -> CLIHeadroom.Status {
+        guard let tight = tightest(now: now) else { return .unknown }
+        if tight.used >= 100 { return .out }
+        if Double(tight.used) >= CLIUsage.lowAt { return .low }
+        return .ok
+    }
+
+    /// The account with the most remaining room among `candidates`, skipping unknown or exhausted accounts.
+    public static func bestAccount<ID>(_ candidates: [(id: ID, quota: AntigravityQuota?)], now: Date = Date()) -> ID? {
+        var pick: (id: ID, left: Int)?
+        for c in candidates {
+            guard let quota = c.quota else { continue }
+            let st = quota.status(now: now)
+            guard (st == .ok || st == .low), let left = quota.percentLeft(now: now) else { continue }
+            if pick == nil || left > pick!.left { pick = (c.id, left) }
+        }
+        return pick?.id
+    }
 }
 
 /// Reads each Antigravity account's quota the way the Antigravity app does (`loadCodeAssist`, then

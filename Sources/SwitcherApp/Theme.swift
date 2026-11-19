@@ -1,8 +1,9 @@
 import SwiftUI
+import SwitcherCore
 
 /// The popover's sizes. Every view takes its spacing, radii and control sizes from here.
 enum Metrics {
-    static let width: CGFloat = 360
+    static let width: CGFloat = 380
     static let pad: CGFloat = 12
     static let gap: CGFloat = 10
     static let rowH: CGFloat = 8
@@ -22,12 +23,8 @@ enum Metrics {
     /// the rest of the popover on the screen it opens on.
     static var listMaxHeight: CGFloat {
         let screen = NSScreen.main?.visibleFrame.height ?? 900
-        return max(300, min(680, screen - 320))
+        return max(300, min(680, screen - 300))
     }
-    /// With the terminal accounts open under it, the app's list gives way down to this.
-    static let listMinHeight: CGFloat = 150
-    /// The terminal accounts scroll past this.
-    static var cliMaxHeight: CGFloat { max(listMinHeight, listMaxHeight - listMinHeight) }
 
     // The Settings window.
     static let settingsWidth: CGFloat = 560
@@ -144,20 +141,34 @@ struct Spinner: View {
 }
 
 /// One plan window: its name, a small meter and the percent ("–" when unknown).
+/// `percent` and `pace` are always canonical used-percentages (0…100); `mode` controls whether the
+/// bar and number render as used or remaining.
 struct UsageMeter: View {
     let title: String
     let name: String
     let percent: Int?
-    /// Where an even pace would be now (0…100): a thin mark across the track. Use past it runs out early.
+    /// Where an even pace would be now (0…100 used): a thin mark across the track.
     var pace: Int? = nil
+    /// Whether to display used % or remaining %.
+    var mode: QuotaDisplayMode = .used
     /// The last meter on a line gives up the percent's fixed column when something follows it.
     var hugsPercent = false
 
+    private var shown: Int? { percent.map { mode.shownPercent(used: $0) } }
+
     /// The mark's centre, kept clear of the rounded ends and on the half-point grid (whole pixels at 2x).
     private var paceX: CGFloat? {
-        guard let pace, pace > 2, pace < 98 else { return nil }
-        let x = min(max(Metrics.meterWidth * CGFloat(pace) / 100, 3), Metrics.meterWidth - 3)
+        guard let pos = mode.pacePosition(usedPace: pace), pos > 2, pos < 98 else { return nil }
+        let x = min(max(Metrics.meterWidth * CGFloat(pos) / 100, 3), Metrics.meterWidth - 3)
         return ((x - 0.25) * 2).rounded() / 2 + 0.25
+    }
+
+    private var a11yValue: String {
+        guard let shown else { return L.t("unknown", "未知") }
+        switch mode {
+        case .used: return L.t("\(shown)% used", "已用 \(shown)%")
+        case .remaining: return L.t("\(shown)% left", "剩余 \(shown)%")
+        }
     }
 
     var body: some View {
@@ -168,10 +179,10 @@ struct UsageMeter: View {
             Capsule()
                 .fill(Fill.track)
                 .overlay(alignment: .leading) {
-                    if let percent, percent > 0 {
+                    if let percent, let shown, shown > 0 {
                         Capsule()
                             .fill(Fill.usage(percent))
-                            .frame(width: max(Metrics.meterHeight, Metrics.meterWidth * CGFloat(min(percent, 100)) / 100))
+                            .frame(width: max(Metrics.meterHeight, Metrics.meterWidth * CGFloat(mode.barFraction(used: percent))))
                     }
                 }
                 .overlay(alignment: .leading) {
@@ -193,7 +204,7 @@ struct UsageMeter: View {
                     }
                 }
                 .frame(width: Metrics.meterWidth, height: Metrics.meterHeight)
-            Text(percent.map { "\($0)%" } ?? "–")
+            Text(shown.map { "\($0)%" } ?? "–")
                 .monospacedDigit()
                 .lineLimit(1)
                 .foregroundStyle(percent.map { $0 >= 90 ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary) } ?? AnyShapeStyle(.tertiary))
@@ -203,7 +214,7 @@ struct UsageMeter: View {
         .font(.subheadline)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(name)
-        .accessibilityValue(percent.map { "\($0)%" } ?? L.t("unknown", "未知"))
+        .accessibilityValue(a11yValue)
     }
 }
 
