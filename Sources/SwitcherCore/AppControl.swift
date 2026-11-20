@@ -52,21 +52,41 @@ public final class MacApp: AppController {
     private let fallbackURL: URL
     /// Helpers that may outlive the app and do not count (Electron's crash reporter).
     private let ignored: Set<String>
+    /// Optional predicate for processes that belong to a parallel sandbox and must not be counted
+    /// or stopped when switching the main app instance.
+    private let excludePID: ((pid_t) -> Bool)?
 
-    public init(name: String, bundleID: String, fallbackPath: String, ignored: Set<String> = ["chrome_crashpad_handler"]) {
+    public init(name: String, bundleID: String, fallbackPath: String,
+                ignored: Set<String> = ["chrome_crashpad_handler"],
+                excludePID: ((pid_t) -> Bool)? = nil) {
         self.name = name
         self.bundleID = bundleID
         self.fallbackURL = URL(fileURLWithPath: fallbackPath)
         self.ignored = ignored
+        self.excludePID = excludePID
     }
 
     /// Claude's `chrome-native-host` is started by Chrome for its extension and outlives Claude: it doesn't count.
     public static let claude = MacApp(name: "Claude", bundleID: "com.anthropic.claudefordesktop", fallbackPath: "/Applications/Claude.app", ignored: ["chrome_crashpad_handler", "chrome-native-host"])
-    public static let antigravity = MacApp(name: "Antigravity", bundleID: "com.google.antigravity", fallbackPath: "/Applications/Antigravity.app")
+    public static let antigravity = MacApp(
+        name: "Antigravity",
+        bundleID: "com.google.antigravity",
+        fallbackPath: "/Applications/Antigravity.app",
+        excludePID: Proc.isAntigravitySandbox
+    )
 
     public var bundleURL: URL? {
         if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) { return url }
         return FS.exists(fallbackURL) ? fallbackURL : nil
+    }
+
+    public var executableURL: URL? {
+        bundleURL.flatMap { Bundle(url: $0)?.executableURL }
+    }
+
+    public var bundleVersion: String? {
+        guard let url = bundleURL, let info = Bundle(url: url)?.infoDictionary else { return nil }
+        return (info["CFBundleShortVersionString"] as? String) ?? (info["CFBundleVersion"] as? String)
     }
 
     public var isInstalled: Bool { bundleURL != nil }
@@ -85,7 +105,9 @@ public final class MacApp: AppController {
         let prefix = bundle.hasSuffix("/") ? bundle : bundle + "/"
         guard let list = Proc.list() else { return nil }
         let mine = list.resolved.filter { proc in
-            proc.path.hasPrefix(prefix) && !ignored.contains((proc.path as NSString).lastPathComponent)
+            proc.path.hasPrefix(prefix)
+                && !ignored.contains((proc.path as NSString).lastPathComponent)
+                && !(excludePID?(proc.pid) ?? false)
         }
         // A process whose program can't be looked up but whose name looks like one of ours counts:
         // never move a sign-in while something of the app may still be running.
@@ -96,6 +118,15 @@ public final class MacApp: AppController {
         }
         // Something we can't see into at all might be ours: count it, so nothing moves under it.
         return mine + unknown.map { ($0.pid, "?\($0.name)") } + list.unknown.map { ($0, "?") }
+    }
+
+    /// True if any excluded (parallel sandbox) process of this app bundle is currently running.
+    private var hasExcludedRunningProcess: Bool {
+        guard let excludePID, let bundle = realBundlePath, let list = Proc.list() else { return false }
+        let prefix = bundle.hasSuffix("/") ? bundle : bundle + "/"
+        return list.resolved.contains { proc in
+            proc.path.hasPrefix(prefix) && excludePID(proc.pid)
+        }
     }
 
     var bundleExecutable: String? {
@@ -162,7 +193,10 @@ public final class MacApp: AppController {
     public func launch() throws {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        p.arguments = ["-b", bundleID]
+        // When a parallel sandbox window of this same bundle is already running, `-n` tells
+        // LaunchServices to start a fresh main instance instead of merely focusing the sandbox.
+        let needNewInstance = hasExcludedRunningProcess && !isRunning
+        p.arguments = needNewInstance ? ["-n", "-b", bundleID] : ["-b", bundleID]
         try p.run()
         p.waitUntilExit()
         if p.terminationStatus != 0 { throw SwitcherError.message("could not open \(name)") }
@@ -170,6 +204,9 @@ public final class MacApp: AppController {
 }
 
 enum Proc {
+    static let sandboxEnvKey = "SWITCHER_AGY_SANDBOX"
+    static let sandboxRoleEnvKey = "SWITCHER_AGY_SANDBOX_ROLE"
+
     /// Every process and its program; nil when the list can't be read.
     static func all() -> [(pid: pid_t, path: String)]? { list()?.resolved }
 
@@ -186,6 +223,96 @@ enum Proc {
         let r = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size))
         if r <= 0 { return errno == ESRCH }
         return info.pbi_status == UInt32(SZOMB) // a zombie holds no files
+    }
+
+    /// Parses a raw Darwin `KERN_PROCARGS2` buffer into `argv` and `env`.
+    static func parseProcArgs2(_ data: Data) -> (argv: [String], env: [String: String])? {
+        let bytes = Array(data)
+        guard bytes.count >= MemoryLayout<Int32>.size else { return nil }
+        let argc: Int = bytes.withUnsafeBytes { Int($0.loadUnaligned(as: Int32.self)) }
+        guard argc >= 0, argc <= 65_536 else { return nil }
+
+        var idx = MemoryLayout<Int32>.size
+        let end = bytes.count
+
+        func nextCString() -> String? {
+            guard idx < end else { return nil }
+            let start = idx
+            while idx < end, bytes[idx] != 0 { idx += 1 }
+            let s = String(decoding: bytes[start..<idx], as: UTF8.self)
+            if idx < end { idx += 1 }
+            return s
+        }
+
+        // 1. Skip exec_path and NUL alignment padding before argv[0].
+        guard nextCString() != nil else { return nil }
+        while idx < end, bytes[idx] == 0 { idx += 1 }
+
+        // 2. Read argc command-line arguments.
+        var argv: [String] = []
+        argv.reserveCapacity(min(argc, 64))
+        for _ in 0..<argc {
+            guard let arg = nextCString() else { break }
+            argv.append(arg)
+        }
+
+        // 3. Read KEY=VALUE environment entries.
+        var env: [String: String] = [:]
+        while idx < end {
+            if bytes[idx] == 0 {
+                idx += 1
+                continue
+            }
+            guard let entry = nextCString(), !entry.isEmpty else { break }
+            if let eq = entry.firstIndex(of: "=") {
+                let key = String(entry[..<eq])
+                if env[key] == nil {
+                    env[key] = String(entry[entry.index(after: eq)...])
+                }
+            }
+        }
+        return (argv, env)
+    }
+
+    /// Reads argv and envp for a process owned by the current user via `KERN_PROCARGS2`.
+    static func argsAndEnv(pid: pid_t) -> (argv: [String], env: [String: String])? {
+        var argmax: Int32 = 0
+        var argmaxSize = MemoryLayout<Int32>.size
+        var mibMax: [Int32] = [CTL_KERN, KERN_ARGMAX]
+        guard sysctl(&mibMax, 2, &argmax, &argmaxSize, nil, 0) == 0, argmax > 0 else { return nil }
+
+        var buf = Data(count: Int(argmax))
+        var size = buf.count
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        let rc: Int32 = buf.withUnsafeMutableBytes { ptr in
+            sysctl(&mib, 3, ptr.baseAddress, &size, nil, 0)
+        }
+        guard rc == 0, size >= MemoryLayout<Int32>.size else { return nil }
+        return parseProcArgs2(buf.prefix(size))
+    }
+
+    /// Extracts the sandbox name from argv/env when a process belongs to an Antigravity parallel sandbox.
+    static func antigravitySandboxName(argv: [String], env: [String: String]) -> String? {
+        if let name = env[sandboxEnvKey], !name.isEmpty { return name }
+        for arg in argv {
+            let prefix = "--user-data-dir="
+            guard arg.hasPrefix(prefix) else { continue }
+            let path = String(arg.dropFirst(prefix.count))
+            if let range = path.range(of: "/.antigravity-sandboxes/") {
+                let tail = path[range.upperBound...]
+                if let slash = tail.firstIndex(of: "/") {
+                    let name = String(tail[..<slash])
+                    if !name.isEmpty { return name }
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Fail-safe: returns true ONLY when we can positively identify `pid` as a parallel sandbox process.
+    static func isAntigravitySandbox(pid: pid_t) -> Bool {
+        guard let info = argsAndEnv(pid: pid) else { return false }
+        return antigravitySandboxName(argv: info.argv, env: info.env) != nil
     }
 
     static func list() -> Listing? {

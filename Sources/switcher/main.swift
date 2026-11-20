@@ -354,11 +354,263 @@ func runCLIUsage(_ args: [String]) async -> Never {
     exit(0)
 }
 
+// MARK: - switcher sandbox / switcher agy
+
+let sandboxUsage = """
+switcher sandbox: run multiple Antigravity desktop windows & `agy` CLIs side-by-side on separate accounts.
+
+  switcher sandbox [list] [--json]               list all parallel sandboxes, running state, email and quota
+  switcher sandbox add [<name>] [--alias <label>] [--links minimal|full|none] [--no-inherit] [--workspace <path>] [--launch]
+                                                 create an isolated sandbox (default links: minimal, hides ~/.ssh)
+  switcher sandbox launch <who> [<workspace>]    launch an isolated Antigravity desktop window
+  switcher sandbox stop <who> [--force]          stop only this sandbox's Antigravity desktop window
+  switcher sandbox agy <who> [-- <agy-args...>]  run `agy` CLI isolated inside this sandbox (shortcut: `switcher agy <who>`)
+  switcher sandbox alias <who> <label|->         set or clear a display alias
+  switcher sandbox links <who> <minimal|full|none>
+                                                 change which host files are symlinked into the sandbox home
+  switcher sandbox heal [<who>] [--force]        clean stale locks, refresh caches & keyring bypass markers
+  switcher sandbox logs <who>                    print the path and last lines of the sandbox's latest launch log
+  switcher sandbox remove <who> [--yes]          stop if running and move the sandbox folder to the Trash
+
+<who> is a 1-based number, sandbox name, alias, or signed-in email.
+"""
+
+func sandboxEnv() -> Env {
+    let homePath = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+    return Env(home: URL(fileURLWithPath: homePath, isDirectory: true))
+}
+
+func resolveSandbox(_ sandboxes: AntigravitySandboxes, _ query: String?) -> AntigravitySandbox {
+    guard let query else { fail("say which sandbox: a number, name, alias or email (see `switcher sandbox list`)") }
+    guard let sb = sandboxes.resolve(query) else {
+        fail("no Antigravity sandbox matches \"\(query)\" (create one with `switcher sandbox add \(query)`)")
+    }
+    return sb
+}
+
+func execSandboxAgy(sandboxes: AntigravitySandboxes, query: String?, agyArgs: [String]) -> Never {
+    let sb = resolveSandbox(sandboxes, query)
+    let home = sandboxes.env.home.path
+    guard let binary = sandboxes.processControl.agyBinary(home: home, path: ProcessInfo.processInfo.environment["PATH"]) else {
+        fail("no `agy` binary found on PATH (or set AGY_BIN)")
+    }
+    let isolatedEnv: [String: String]
+    do {
+        isolatedEnv = try sandboxes.agyEnvironment(for: sb.name, base: ProcessInfo.processInfo.environment)
+    } catch {
+        fail(error.localizedDescription)
+    }
+    for (k, v) in isolatedEnv { setenv(k, v, 1) }
+    var forwarded = agyArgs
+    if forwarded.first == "--" { forwarded.removeFirst() }
+    let argv = [binary] + forwarded
+    var cargs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) } + [nil]
+    execvp(argv[0], &cargs)
+    let why = String(cString: strerror(errno))
+    FileHandle.standardError.write(Data("switcher: cannot run \(argv[0]): \(why)\n".utf8))
+    exit(127)
+}
+
+func printSandboxList(_ sandboxes: AntigravitySandboxes, usage: AntigravityUsage, asJSON: Bool) throws {
+    let items = sandboxes.list(quotas: usage.cached())
+    if asJSON {
+        let out = items.map { s -> [String: Any] in
+            var d: [String: Any] = [
+                "name": s.name,
+                "alias": s.alias as Any,
+                "email": s.email as Any,
+                "signedIn": s.signedIn,
+                "running": s.running,
+                "pid": s.pid as Any,
+                "linkPolicy": s.linkPolicy.rawValue,
+                "path": s.path.path,
+                "homePath": s.homePath.path,
+                "dataPath": s.dataPath.path,
+                "defaultWorkspace": s.defaultWorkspace as Any,
+            ]
+            if let q = s.quota {
+                d["quota"] = [
+                    "plan": q.plan as Any,
+                    "fetchedAt": q.fetchedAt.timeIntervalSince1970,
+                    "problem": q.problem as Any,
+                    "buckets": q.buckets.map { b -> [String: Any] in
+                        ["pool": b.pool.rawValue, "used": b.used, "resetsAt": b.resetsAt?.timeIntervalSince1970 as Any]
+                    },
+                ]
+            }
+            return d
+        }
+        let data = try JSONSerialization.data(withJSONObject: out, options: [.prettyPrinted, .sortedKeys])
+        print(String(decoding: data, as: UTF8.self))
+        return
+    }
+    if items.isEmpty {
+        print("No Antigravity parallel sandboxes yet.")
+        print("Create one: `switcher sandbox add acc2 --launch`")
+        return
+    }
+    for (i, s) in items.enumerated() {
+        let dot = s.running ? "●" : "○"
+        var parts = ["  \(dot) \(i + 1). \(s.label)"]
+        if let secondary = s.secondaryLabel { parts.append("(\(secondary))") }
+        if s.running, let pid = s.pid { parts.append("[running, pid \(pid)]") }
+        if !s.signedIn { parts.append("[not signed in]") }
+        parts.append("links:\(s.linkPolicy.rawValue)")
+        print(parts.joined(separator: "  "))
+    }
+}
+
+func runSandbox(_ args: [String]) -> Never {
+    let env = sandboxEnv()
+    let sandboxes = AntigravitySandboxes(env: env)
+    let usageStore = AntigravityUsage(env: env)
+    var args = args
+    let sub = args.isEmpty ? "list" : args.removeFirst()
+
+    do {
+        switch sub {
+        case "list", "ls":
+            try printSandboxList(sandboxes, usage: usageStore, asJSON: args.contains("--json"))
+        case "add", "create", "new":
+            var name: String?
+            var alias: String?
+            var policy: SandboxLinkPolicy = .minimal
+            var inherit = true
+            var workspace: String?
+            var shouldLaunch = false
+            var i = 0
+            while i < args.count {
+                let a = args[i]
+                switch a {
+                case "--alias":
+                    guard i + 1 < args.count else { fail("--alias needs a value") }
+                    alias = args[i + 1]; i += 2
+                case "--links":
+                    guard i + 1 < args.count else { fail("--links needs minimal, full, or none") }
+                    guard let parsed = SandboxLinkPolicy(rawValue: args[i + 1].lowercased()) else {
+                        fail("unknown link policy \"\(args[i + 1])\" (use minimal, full, or none)")
+                    }
+                    policy = parsed; i += 2
+                case "--workspace", "-w":
+                    guard i + 1 < args.count else { fail("--workspace needs a path") }
+                    workspace = (args[i + 1] as NSString).expandingTildeInPath; i += 2
+                case "--no-inherit":
+                    inherit = false; i += 1
+                case "--launch":
+                    shouldLaunch = true; i += 1
+                default:
+                    if a.hasPrefix("--") { fail("unknown flag \"\(a)\"") }
+                    if name == nil { name = a } else { fail("unexpected argument \"\(a)\"") }
+                    i += 1
+                }
+            }
+            let targetName = name ?? sandboxes.suggestedName()
+            let sb = try sandboxes.create(name: targetName, alias: alias, linkPolicy: policy, inheritHostConfig: inherit, defaultWorkspace: workspace)
+            print("Created Antigravity sandbox \"\(sb.name)\" at \(sb.path.path) (links: \(sb.linkPolicy.rawValue)).")
+            if shouldLaunch {
+                let pid = try sandboxes.launch(sb.name, workspace: workspace)
+                print("Launched Antigravity window for \"\(sb.name)\" (pid \(pid)). Sign in there to bind an account.")
+            } else {
+                print("Launch desktop window: `switcher sandbox launch \(sb.name)`")
+                print("Run agy CLI:           `switcher agy \(sb.name)`")
+            }
+        case "launch", "open", "start":
+            guard !args.isEmpty else { fail("say which sandbox to launch") }
+            let sb = resolveSandbox(sandboxes, args[0])
+            let workspace = args.count > 1 ? (args[1] as NSString).expandingTildeInPath : nil
+            let wasRunning = sb.running
+            let pid = try sandboxes.launch(sb.name, workspace: workspace)
+            if wasRunning {
+                print("Sandbox \"\(sb.label)\" is already running (pid \(pid)).")
+            } else {
+                print("Launched Antigravity window for \"\(sb.label)\" (pid \(pid)).")
+            }
+        case "stop":
+            let force = args.contains("--force")
+            let rest = args.filter { !$0.hasPrefix("--") }
+            let sb = resolveSandbox(sandboxes, rest.first)
+            let stopped = try sandboxes.stop(sb.name, force: force)
+            print(stopped ? "Stopped Antigravity sandbox \"\(sb.label)\"." : "Sandbox \"\(sb.label)\" was not running.")
+        case "agy":
+            guard !args.isEmpty else { fail("say which sandbox: `switcher agy <name> [agy-args...]`") }
+            execSandboxAgy(sandboxes: sandboxes, query: args[0], agyArgs: Array(args.dropFirst()))
+        case "alias":
+            let sb = resolveSandbox(sandboxes, args.first)
+            guard args.count > 1 else { fail("say the alias, or - to clear it") }
+            try sandboxes.setAlias(sb.name, args[1] == "-" ? nil : args[1])
+        case "links":
+            let sb = resolveSandbox(sandboxes, args.first)
+            guard args.count > 1, let policy = SandboxLinkPolicy(rawValue: args[1].lowercased()) else {
+                fail("say the link policy: minimal, full, or none")
+            }
+            try sandboxes.setLinkPolicy(sb.name, policy)
+            print("Updated link policy for \"\(sb.label)\" to \(policy.rawValue).")
+        case "heal":
+            let force = args.contains("--force")
+            let rest = args.filter { !$0.hasPrefix("--") }
+            let targets: [AntigravitySandbox] = rest.isEmpty ? sandboxes.list() : [resolveSandbox(sandboxes, rest[0])]
+            if targets.isEmpty { print("No Antigravity sandboxes to heal."); exit(0) }
+            for sb in targets {
+                let r = try sandboxes.heal(sb.name, force: force)
+                var notes: [String] = []
+                if !r.locksCleaned.isEmpty { notes.append("cleaned locks: \(r.locksCleaned.joined(separator: ", "))") }
+                if !r.cachesPurged.isEmpty { notes.append("purged caches: \(r.cachesPurged.count)") }
+                if r.versionChanged { notes.append("updated version \(r.oldVersion ?? "?") -> \(r.newVersion ?? "?")") }
+                if notes.isEmpty { notes.append("ok") }
+                print("  \(sb.label): \(notes.joined(separator: "; "))")
+            }
+        case "logs":
+            let sb = resolveSandbox(sandboxes, args.first)
+            guard let logURL = sandboxes.latestLogURL(for: sb.name) else {
+                print("No launch logs yet for \"\(sb.label)\".")
+                exit(0)
+            }
+            print("Log: \(logURL.path)")
+            if let text = try? String(contentsOf: logURL, encoding: .utf8), !text.isEmpty {
+                let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+                print(lines.suffix(40).joined(separator: "\n"))
+            }
+        case "remove", "rm", "delete":
+            let yes = args.contains("--yes")
+            let rest = args.filter { !$0.hasPrefix("--") }
+            let sb = resolveSandbox(sandboxes, rest.first)
+            if !yes {
+                guard isatty(0) == 1 else { fail("add --yes to remove \"\(sb.label)\" without asking") }
+                let answer = ask("Stop \"\(sb.label)\" if running and move its sandbox folder to the Trash? [y/N] ")?.lowercased() ?? ""
+                guard answer.hasPrefix("y") else { print("Nothing was removed."); exit(0) }
+            }
+            try sandboxes.remove(sb.name)
+            print("Removed Antigravity sandbox \"\(sb.label)\".")
+        case "help", "-h", "--help":
+            print(sandboxUsage)
+        default:
+            fail("unknown sandbox command \"\(sub)\"\n\n\(sandboxUsage)")
+        }
+    } catch {
+        fail(error.localizedDescription)
+    }
+    exit(0)
+}
+
 let board = Switchboard()
 var args = Array(CommandLine.arguments.dropFirst())
 let command = args.isEmpty ? "list" : args.removeFirst()
 if command == "cli", args.first == "usage" { await runCLIUsage(Array(args.dropFirst())) }
 if command == "cli" { runCLI(args) }
+if command == "sandbox" || command == "sb" { runSandbox(args) }
+if command == "agy" {
+    let env = sandboxEnv()
+    let sandboxes = AntigravitySandboxes(env: env)
+    if args.isEmpty || args.first == "list" || args.first == "ls" {
+        do { try printSandboxList(sandboxes, usage: AntigravityUsage(env: env), asJSON: args.contains("--json")) } catch { fail(error.localizedDescription) }
+        exit(0)
+    }
+    if args.first == "help" || args.first == "-h" || args.first == "--help" {
+        print(sandboxUsage)
+        exit(0)
+    }
+    execSandboxAgy(sandboxes: sandboxes, query: args[0], agyArgs: Array(args.dropFirst()))
+}
 
 func who(_ p: ProviderID, _ q: String?) -> Slot {
     guard let q else { fail("say which account") }
@@ -417,6 +669,17 @@ do {
                 }
                 if b.interrupted { print("  a switch was cut short; it is finished or undone when \(b.provider.displayName) is quit") }
             }
+            let sbList = board.sandboxBoard()
+            if !sbList.isEmpty {
+                let runningCount = sbList.filter(\.running).count
+                print("Antigravity Sandboxes (\(runningCount) running)")
+                for (i, s) in sbList.enumerated() {
+                    var line = "  \(s.running ? "●" : "○") \(i + 1). \(s.label)"
+                    if let secondary = s.secondaryLabel { line += " (\(secondary))" }
+                    if !s.signedIn { line += "  [not signed in]" }
+                    print(line)
+                }
+            }
             if let found = board.ccSameImport() {
                 print("\nCC Same has \(found.logins.count) saved Claude sign-in(s): run `switcher import-cc-same`\(found.running ? " after quitting CC Same" : "").")
             }
@@ -452,12 +715,27 @@ do {
         guard args.count > 2, let n = Int(args[2]) else { fail("say the number") }
         try Roster.edit(board.env) { try $0.move(p, slot.account, to: n) }
     case "usage":
-        // Antigravity: read every account's quota from Google now (Claude's numbers come from Claude).
+        // Antigravity: read every account's quota from Google now (main/saved + parallel sandboxes).
         let quotas = await board.refreshAntigravityUsage()
         let roster = Roster.load(board.env)
+        let sandboxesByKey = Dictionary(uniqueKeysWithValues: board.sandboxBoard().map { (AntigravitySandboxes.quotaCacheKey(for: $0.name), $0) })
         let names: [QuotaBucket.Pool: String] = [.gemini5h: "Gemini 5h", .geminiWeekly: "Gemini week", .argonWeekly: "Argon week", .claude5h: "Claude 5h", .claudeWeekly: "Claude week"]
-        for (account, q) in quotas.sorted(by: { (roster.slot(.antigravity, $0.key)?.number ?? 99) < (roster.slot(.antigravity, $1.key)?.number ?? 99) }) {
-            print("\(roster.slot(.antigravity, account)?.label ?? account)\(q.plan.map { "  (\($0))" } ?? "")")
+        let ordered = quotas.sorted { a, b in
+            let aIsSB = a.key.hasPrefix("sandbox:")
+            let bIsSB = b.key.hasPrefix("sandbox:")
+            if aIsSB != bIsSB { return !aIsSB }
+            if aIsSB { return a.key < b.key }
+            return (roster.slot(.antigravity, a.key)?.number ?? 99) < (roster.slot(.antigravity, b.key)?.number ?? 99)
+        }
+        for (account, q) in ordered {
+            let heading: String
+            if let sb = sandboxesByKey[account] {
+                let extra = sb.secondaryLabel.map { " · \($0)" } ?? ""
+                heading = "[sandbox] \(sb.label)\(extra)"
+            } else {
+                heading = roster.slot(.antigravity, account)?.label ?? account
+            }
+            print("\(heading)\(q.plan.map { "  (\($0))" } ?? "")")
             for b in q.buckets { print("    \(names[b.pool]!): \(b.used)% used\(b.resetsAt.map { "  resets \(ago(Date(timeIntervalSince1970: 2 * Date().timeIntervalSince1970 - $0.timeIntervalSince1970)).replacingOccurrences(of: " ago", with: "")) from now" } ?? "")") }
             if let p = q.problem { print("    ! \(p)") }
         }

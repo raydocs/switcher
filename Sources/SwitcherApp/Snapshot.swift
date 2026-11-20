@@ -199,18 +199,47 @@ enum Snapshot {
         var foundRunning = found
         foundRunning.running = true
 
-        func model(_ boards: [AppBoard], ccSame: CCSameImport.Found? = nil, job: SwitchJob? = nil, banner: Banner? = nil,
+        func model(_ boards: [AppBoard], sandboxes: [AntigravitySandbox] = [], ccSame: CCSameImport.Found? = nil, job: SwitchJob? = nil, banner: Banner? = nil,
                    selected: MenuTab = .claude, cli: [CLIBoard] = [], cliJustInstalled: Bool = false, hideEmails: Bool = false,
                    quotaMode: QuotaDisplayMode = .used, menuBarStyle: MenuBarStyle = .bars,
                    menuBarSource: MenuBarSource = .auto, globalHotkey: GlobalHotkeyPreset = .off,
                    updateResult: UpdateCheckResult? = nil, terminalStatus: TerminalSetupStatus? = nil,
                    doctorFindings: [DoctorFinding] = []) -> AppModel {
-            AppModel(preview: boards, ccSame: ccSame, job: job, banner: banner, cli: cli,
+            AppModel(preview: boards, sandboxes: sandboxes, ccSame: ccSame, job: job, banner: banner, cli: cli,
                      cliJustInstalled: cliJustInstalled, hideEmails: hideEmails, selectedTab: selected,
                      quotaDisplayMode: quotaMode, menuBarStyle: menuBarStyle, menuBarSource: menuBarSource,
                      globalHotkey: globalHotkey, updateResult: updateResult,
                      terminalStatus: terminalStatus, doctorFindings: doctorFindings)
         }
+
+        let sampleSandboxes: [AntigravitySandbox] = [
+            AntigravitySandbox(
+                name: "acc2",
+                alias: "Work 2",
+                linkPolicy: .minimal,
+                path: URL(fileURLWithPath: "/Users/ada/.antigravity-sandboxes/acc2", isDirectory: true),
+                homePath: URL(fileURLWithPath: "/Users/ada/.antigravity-sandboxes/acc2/home", isDirectory: true),
+                dataPath: URL(fileURLWithPath: "/Users/ada/.antigravity-sandboxes/acc2/data", isDirectory: true),
+                email: "ada.work2@gmail.com",
+                signedIn: true,
+                running: true,
+                pid: 48210,
+                quota: s.quota(plan: "Google AI Pro", gemini: (18, 32), claude: (12, 24), argon: 0, resetHours: 4.2, minutesAgo: 3)
+            ),
+            AntigravitySandbox(
+                name: "acc3",
+                alias: nil,
+                linkPolicy: .minimal,
+                path: URL(fileURLWithPath: "/Users/ada/.antigravity-sandboxes/acc3", isDirectory: true),
+                homePath: URL(fileURLWithPath: "/Users/ada/.antigravity-sandboxes/acc3/home", isDirectory: true),
+                dataPath: URL(fileURLWithPath: "/Users/ada/.antigravity-sandboxes/acc3/data", isDirectory: true),
+                email: nil,
+                signedIn: false,
+                running: false,
+                pid: nil,
+                quota: nil
+            ),
+        ]
 
         // The terminal accounts: two of each CLI, one sign-in about to run out, one not signed in.
         func cli(installed: Bool = true, renew: Bool = false) -> [CLIBoard] {
@@ -257,9 +286,9 @@ enum Snapshot {
         ]
 
         return [
-            Fixture(name: "00-overview", model: model(boards(), selected: .overview, cli: tight)),
+            Fixture(name: "00-overview", model: model(boards(), sandboxes: sampleSandboxes, selected: .overview, cli: tight)),
             Fixture(name: "01-claude", model: model(boards(), cli: cli())),
-            Fixture(name: "02-antigravity", model: model(boards(), selected: .antigravity, cli: cli())),
+            Fixture(name: "02-antigravity", model: model(boards(), sandboxes: sampleSandboxes, selected: .antigravity, cli: cli())),
             Fixture(name: "03-ccsame-offer", model: model(boards(), ccSame: found)),
             Fixture(name: "04-ccsame-running", model: model(boards(), ccSame: foundRunning)),
             Fixture(name: "05-switching-asked", model: model(boards(), job: SwitchJob(
