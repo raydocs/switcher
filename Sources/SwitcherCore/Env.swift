@@ -14,6 +14,8 @@ public struct Env: Sendable {
     public var antigravityData: URL
     /// `~/.gemini`, where Antigravity keeps its fallback token file.
     public var gemini: URL
+    /// `~/.antigravity-sandboxes`, where parallel Antigravity App & `agy` sandboxes live.
+    public var antigravitySandboxes: URL
     /// cc-same's state folder, for importing its saved sign-ins.
     public var ccSame: URL
 
@@ -25,6 +27,7 @@ public struct Env: Sendable {
         self.claudeJSON = home.appendingPathComponent(".claude.json")
         self.antigravityData = support.appendingPathComponent("Antigravity", isDirectory: true)
         self.gemini = home.appendingPathComponent(".gemini", isDirectory: true)
+        self.antigravitySandboxes = home.appendingPathComponent(".antigravity-sandboxes", isDirectory: true)
         self.ccSame = support.appendingPathComponent("cc-same", isDirectory: true)
     }
 

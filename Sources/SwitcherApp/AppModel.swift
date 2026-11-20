@@ -163,6 +163,10 @@ final class AppModel {
     static let hiddenToolsKey = "hiddenTools"
 
     private(set) var boards: [AppBoard] = []
+    /// Parallel Antigravity sandboxes (independent App windows & concurrent `agy` CLI profiles).
+    private(set) var sandboxes: [AntigravitySandbox] = []
+    /// Names of sandboxes currently launching, stopping, or healing.
+    private(set) var sandboxBusy: Set<String> = []
     private(set) var job: SwitchJob?
     private(set) var ccSame: CCSameImport.Found?
     /// Claude Code and Codex in the terminal: their accounts, apart from the desktop apps.
@@ -294,7 +298,7 @@ final class AppModel {
     @ObservationIgnored private let hotkeyController = GlobalHotkeyController()
 
     /// Fixed data for previews and screenshots: touches nothing on disk.
-    init(preview boards: [AppBoard], ccSame: CCSameImport.Found? = nil, job: SwitchJob? = nil, banner: Banner? = nil,
+    init(preview boards: [AppBoard], sandboxes: [AntigravitySandbox] = [], ccSame: CCSameImport.Found? = nil, job: SwitchJob? = nil, banner: Banner? = nil,
          cli cliBoards: [CLIBoard] = [], cliJustInstalled: Bool = false, hideEmails: Bool = false,
          selectedTab: MenuTab = .claude, quotaDisplayMode: QuotaDisplayMode = .used,
          menuBarStyle: MenuBarStyle = .bars, menuBarSource: MenuBarSource = .auto,
@@ -307,8 +311,14 @@ final class AppModel {
         self.cliKeychain = MemoryCLIKeychain()
         self.cliBoards = cliBoards
         self.cliJustInstalled = cliJustInstalled
-        self.board = Switchboard(env: env, claude: .claude(env: env, app: FakeApp(), keychain: MemorySecrets()), antigravity: .antigravity(env: env, app: FakeApp(), keychain: MemorySecrets()))
+        self.board = Switchboard(
+            env: env,
+            claude: .claude(env: env, app: FakeApp(), keychain: MemorySecrets()),
+            antigravity: .antigravity(env: env, app: FakeApp(), keychain: MemorySecrets()),
+            sandboxes: AntigravitySandboxes(env: env, processControl: FakeSandboxProcessControl())
+        )
         self.boards = boards
+        self.sandboxes = sandboxes
         self.ccSame = ccSame
         self.job = job
         self.banner = banner
@@ -566,16 +576,39 @@ final class AppModel {
         displayCLILabel(row).title
     }
 
+    var runningSandboxCount: Int { sandboxes.filter(\.running).count }
+
+    func displaySandboxLabel(_ sandbox: AntigravitySandbox) -> (title: String, subtitle: String?) {
+        let shownEmail = displayEmail(sandbox.email)
+        if let alias = sandbox.alias, !alias.isEmpty {
+            let showFolder = alias.lowercased() != sandbox.name.lowercased()
+            if let shownEmail {
+                return (alias, showFolder ? "\(shownEmail) · \(sandbox.name)" : shownEmail)
+            }
+            return (alias, showFolder ? sandbox.name : nil)
+        }
+        return (sandbox.name, shownEmail)
+    }
+
+    func suggestedSandboxName() -> String {
+        let taken = Set(sandboxes.map { $0.name.lowercased() })
+        var n = 2
+        while taken.contains("acc\(n)") { n += 1 }
+        return "acc\(n)"
+    }
+
     /// Re-read every app. Cheap: run when the menu opens and every 15 seconds while it is open.
     func refresh() {
         if isPreview { return }
         let board = self.board
         queue.async {
             let boards = board.board()
+            let sandboxes = board.sandboxBoard()
             let found = board.ccSameImport()
             Task { @MainActor in
                 // Assign only what changed, so a quiet 15-second tick redraws nothing.
                 if self.boards != boards { self.boards = boards }
+                if self.sandboxes != sandboxes { self.sandboxes = sandboxes }
                 if self.ccSame != found { self.ccSame = found }
                 self.refreshQuotasIfDue()
             }
@@ -610,10 +643,12 @@ final class AppModel {
         Task.detached {
             await board.refreshAntigravityUsage()
             let boards = board.board()
+            let sandboxes = board.sandboxBoard()
             await MainActor.run {
                 self.readingQuotas = false
                 self.quotasReadAt = Date()
                 if self.boards != boards { self.boards = boards }
+                if self.sandboxes != sandboxes { self.sandboxes = sandboxes }
                 self.evaluateAlerts()
             }
         }
@@ -1437,6 +1472,231 @@ final class AppModel {
         NSPasteboard.general.setString(text, forType: .string)
     }
 
+    // MARK: Antigravity parallel sandboxes
+
+    func createSandbox(name: String, alias: String?, linkPolicy: SandboxLinkPolicy, inheritHostConfig: Bool, launchImmediately: Bool) {
+        if isPreview { return }
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetName = trimmedName.isEmpty ? suggestedSandboxName() : trimmedName
+        sandboxBusy.insert(targetName)
+        let board = self.board
+        queue.async {
+            let result = Result<(AntigravitySandbox, pid_t?), Error> {
+                let sb = try board.sandboxes.create(
+                    name: targetName,
+                    alias: alias,
+                    linkPolicy: linkPolicy,
+                    inheritHostConfig: inheritHostConfig
+                )
+                let pid = launchImmediately ? try board.sandboxes.launch(sb.name) : nil
+                return (sb, pid)
+            }
+            let updated = board.sandboxBoard()
+            Task { @MainActor in
+                self.sandboxBusy.remove(targetName)
+                self.sandboxes = updated
+                switch result {
+                case .success(let (sb, pid)):
+                    if pid != nil {
+                        self.banner = Banner(kind: .success, text: L.sandboxLaunched(sb.label))
+                    } else {
+                        self.banner = Banner(kind: .success, text: L.sandboxCreated(sb.label))
+                    }
+                case .failure(let error):
+                    self.banner = Banner(kind: .error, text: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    func launchSandbox(_ sandbox: AntigravitySandbox, workspace: String? = nil) {
+        if isPreview || sandboxBusy.contains(sandbox.name) { return }
+        sandboxBusy.insert(sandbox.name)
+        let board = self.board
+        let label = displaySandboxLabel(sandbox).title
+        let name = sandbox.name
+        queue.async {
+            let result = Result { try board.sandboxes.launch(name, workspace: workspace) }
+            let updated = board.sandboxBoard()
+            Task { @MainActor in
+                self.sandboxBusy.remove(name)
+                self.sandboxes = updated
+                switch result {
+                case .success:
+                    self.banner = Banner(kind: .success, text: L.sandboxLaunched(label))
+                case .failure(let error):
+                    self.banner = Banner(kind: .error, text: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    func stopSandbox(_ sandbox: AntigravitySandbox, force: Bool = false) {
+        if isPreview || sandboxBusy.contains(sandbox.name) { return }
+        sandboxBusy.insert(sandbox.name)
+        let board = self.board
+        let label = displaySandboxLabel(sandbox).title
+        let name = sandbox.name
+        queue.async {
+            let result = Result { try board.sandboxes.stop(name, force: force) }
+            let updated = board.sandboxBoard()
+            Task { @MainActor in
+                self.sandboxBusy.remove(name)
+                self.sandboxes = updated
+                switch result {
+                case .success(let stopped):
+                    self.banner = Banner(kind: stopped ? .success : .info, text: stopped ? L.sandboxStopped(label) : L.sandboxAlreadyStopped(label))
+                case .failure(let error):
+                    self.banner = Banner(kind: .error, text: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// Prompts for a project folder (e.g. a dedicated `git worktree`) and launches the sandbox on it.
+    func openSandboxFolderPicker(_ sandbox: AntigravitySandbox) {
+        if isPreview { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.message = L.t(
+            "Choose a project folder or git worktree to open in \(displaySandboxLabel(sandbox).title).",
+            "选择要在 \(displaySandboxLabel(sandbox).title) 中打开的项目目录（建议独立 git worktree）。")
+        panel.prompt = L.t("Open", "打开")
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK, let url = panel.url {
+            launchSandbox(sandbox, workspace: url.path)
+        }
+    }
+
+    /// Opens a fresh macOS Terminal window running `agy` inside this sandbox's isolated environment.
+    func openSandboxAgyInTerminal(_ sandbox: AntigravitySandbox) {
+        if isPreview { return }
+        let board = self.board
+        let cliEnv = self.cli.env
+        let name = sandbox.name
+        let bundled = Bundle.main.resourceURL?.appendingPathComponent("switcher").path
+        queue.async {
+            let result = Result<URL, Error> {
+                // Ensure keyring-bypass markers and symlinks are current before Terminal starts.
+                _ = try board.sandboxes.agyEnvironment(for: name)
+                let command: String
+                if let bundled, FileManager.default.isExecutableFile(atPath: bundled) {
+                    command = "exec \(shellQuote(bundled)) agy \(shellQuote(name))"
+                } else {
+                    command = "exec " + board.sandboxes.standaloneAgyCommand(for: name)
+                }
+                let dir = FileManager.default.temporaryDirectory.appendingPathComponent("switcher-agy", isDirectory: true)
+                let url = dir.appendingPathComponent("agy-\(name)-\(UUID().uuidString.prefix(8)).command")
+                try FS.makePrivateDir(dir)
+                let pathExport = "export PATH=\(shellQuote(CLIShim.enrichedPath(env: cliEnv)))\n"
+                let script = "#!/bin/sh\nrm -f \"$0\"\nclear\n\(pathExport)\(command)\n"
+                try FS.atomicWrite(Data(script.utf8), to: url)
+                guard chmod(url.path, 0o700) == 0 else {
+                    throw SwitcherError.message("cannot make \(url.path) executable")
+                }
+                return url
+            }
+            Task { @MainActor in
+                switch result {
+                case .success(let url):
+                    NSWorkspace.shared.open(url)
+                case .failure(let error):
+                    self.banner = Banner(kind: .error, text: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// Copies a self-contained `agy` launch command for this sandbox to the clipboard (after ensuring markers exist).
+    func copySandboxAgyCommand(_ sandbox: AntigravitySandbox) {
+        if isPreview { return }
+        let board = self.board
+        let name = sandbox.name
+        let label = displaySandboxLabel(sandbox).title
+        queue.async {
+            _ = try? board.sandboxes.agyEnvironment(for: name)
+            let cmd = board.sandboxes.standaloneAgyCommand(for: name)
+            Task { @MainActor in
+                self.copy(cmd)
+                self.banner = Banner(kind: .success, text: L.sandboxAgyCopied(label))
+            }
+        }
+    }
+
+    func renameSandbox(_ sandbox: AntigravitySandbox, alias: String?) {
+        edit { try $0.sandboxes.setAlias(sandbox.name, alias) }
+    }
+
+    func setSandboxLinkPolicy(_ sandbox: AntigravitySandbox, policy: SandboxLinkPolicy) {
+        let label = displaySandboxLabel(sandbox).title
+        let name = sandbox.name
+        let board = self.board
+        queue.async {
+            let result = Result { try board.sandboxes.setLinkPolicy(name, policy) }
+            let updated = board.sandboxBoard()
+            Task { @MainActor in
+                self.sandboxes = updated
+                switch result {
+                case .success:
+                    self.banner = Banner(kind: .success, text: L.sandboxPolicyUpdated(label, policy))
+                case .failure(let error):
+                    self.banner = Banner(kind: .error, text: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    func healSandbox(_ sandbox: AntigravitySandbox, force: Bool = true) {
+        if isPreview || sandboxBusy.contains(sandbox.name) { return }
+        sandboxBusy.insert(sandbox.name)
+        let board = self.board
+        let label = displaySandboxLabel(sandbox).title
+        let name = sandbox.name
+        queue.async {
+            let result = Result { try board.sandboxes.heal(name, force: force) }
+            let updated = board.sandboxBoard()
+            Task { @MainActor in
+                self.sandboxBusy.remove(name)
+                self.sandboxes = updated
+                switch result {
+                case .success(let report):
+                    self.banner = Banner(kind: .success, text: L.sandboxHealed(label, locks: report.locksCleaned.count, caches: report.cachesPurged.count))
+                case .failure(let error):
+                    self.banner = Banner(kind: .error, text: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    func revealSandboxInFinder(_ sandbox: AntigravitySandbox) {
+        if isPreview { return }
+        NSWorkspace.shared.activateFileViewerSelecting([sandbox.path])
+    }
+
+    func removeSandbox(_ sandbox: AntigravitySandbox) {
+        if isPreview || sandboxBusy.contains(sandbox.name) { return }
+        sandboxBusy.insert(sandbox.name)
+        let board = self.board
+        let label = displaySandboxLabel(sandbox).title
+        let name = sandbox.name
+        queue.async {
+            let result = Result { try board.sandboxes.remove(name) }
+            let updated = board.sandboxBoard()
+            Task { @MainActor in
+                self.sandboxBusy.remove(name)
+                self.sandboxes = updated
+                switch result {
+                case .success:
+                    self.banner = Banner(kind: .success, text: L.sandboxRemoved(label))
+                case .failure(let error):
+                    self.banner = Banner(kind: .error, text: error.localizedDescription)
+                }
+            }
+        }
+    }
+
     // MARK: Account list
 
     func setAlias(_ p: ProviderID, _ account: String, _ alias: String?) {
@@ -1543,5 +1803,50 @@ enum L {
 
     static var doctorReportCopied: String {
         t("Copied redacted diagnostic report to clipboard.", "已复制脱敏诊断报告到剪贴板。")
+    }
+
+    static func sandboxLinkPolicyName(_ policy: SandboxLinkPolicy) -> String {
+        switch policy {
+        case .minimal: t("Minimal", "精简")
+        case .full: t("Full", "完整")
+        case .none: t("None", "无")
+        }
+    }
+
+    static func sandboxCreated(_ label: String) -> String {
+        t("Created sandbox \(label).", "已创建并行分身 \(label)。")
+    }
+
+    static func sandboxLaunched(_ label: String) -> String {
+        t("Launched Antigravity window for \(label).", "已启动 \(label) 的独立 Antigravity 窗口。")
+    }
+
+    static func sandboxStopped(_ label: String) -> String {
+        t("Stopped Antigravity window for \(label).", "已停止 \(label) 的独立 Antigravity 窗口。")
+    }
+
+    static func sandboxAlreadyStopped(_ label: String) -> String {
+        t("\(label) is already stopped.", "\(label) 当前未运行。")
+    }
+
+    static func sandboxAgyCopied(_ label: String) -> String {
+        t("Copied `agy` launch command for \(label).", "已复制 \(label) 的 agy 启动命令。")
+    }
+
+    static func sandboxPolicyUpdated(_ label: String, _ policy: SandboxLinkPolicy) -> String {
+        t("Updated link policy for \(label) to \(sandboxLinkPolicyName(policy)).",
+          "已将 \(label) 的软链策略更新为「\(sandboxLinkPolicyName(policy))」。")
+    }
+
+    static func sandboxHealed(_ label: String, locks: Int, caches: Int) -> String {
+        if locks == 0 && caches == 0 {
+            return t("Checked \(label): locks and markers look good.", "已检查 \(label)：锁文件与隔离标记均正常。")
+        }
+        return t("Healed \(label) (cleaned \(locks) lock(s), \(caches) cache(s)).",
+                 "已自愈 \(label)（清理 \(locks) 个锁文件、\(caches) 个缓存）。")
+    }
+
+    static func sandboxRemoved(_ label: String) -> String {
+        t("Moved sandbox \(label) to the Trash.", "已将分身 \(label) 移入废纸篓。")
     }
 }

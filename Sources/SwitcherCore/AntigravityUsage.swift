@@ -179,30 +179,70 @@ public final class AntigravityUsage: @unchecked Sendable {
 
     // MARK: Reading
 
-    /// A keychain value as go-keyring stores it: `go-keyring-base64:<JSON>`.
+    /// A keychain value (`go-keyring-base64:<JSON>`) or a file-backed OAuth token JSON
+    /// (either `{"token": {...}}` or flat `{"access_token": ..., "refresh_token": ...}`).
     struct Credential {
         var accessToken: String?
         var refreshToken: String?
         var expiry: Date?
 
         init?(keyring value: String) {
-            var body = value
+            var body = value.trimmingCharacters(in: .whitespacesAndNewlines)
             let prefix = "go-keyring-base64:"
             if body.hasPrefix(prefix) {
                 guard let data = Data(base64Encoded: String(body.dropFirst(prefix.count))) else { return nil }
                 body = String(decoding: data, as: UTF8.self)
             }
-            guard let obj = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any],
-                  let token = obj["token"] as? [String: Any] else { return nil }
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any] else { return nil }
+            let token = (obj["token"] as? [String: Any]) ?? obj
             accessToken = token["access_token"] as? String
             refreshToken = token["refresh_token"] as? String
             if let e = token["expiry"] as? String {
                 let f = ISO8601DateFormatter()
                 f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
                 expiry = f.date(from: e) ?? ISO8601DateFormatter().date(from: e)
+            } else if let n = (token["expiry_date"] as? NSNumber)?.doubleValue ?? (token["expiry"] as? NSNumber)?.doubleValue, n > 0 {
+                // Google OAuth JS libraries store epoch ms (> 1e12); Go/Python sometimes store epoch seconds.
+                expiry = Date(timeIntervalSince1970: n > 1e12 ? n / 1000.0 : n)
             }
             if refreshToken == nil && accessToken == nil { return nil }
         }
+    }
+
+    /// Extracts an account email from a file-backed or keyring Antigravity OAuth token payload
+    /// (`id_token_email`, or the `email` claim inside an `id_token` JWT).
+    public static func extractEmail(fromTokenPayload raw: String) -> String? {
+        var body = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = "go-keyring-base64:"
+        if body.hasPrefix(prefix) {
+            guard let data = Data(base64Encoded: String(body.dropFirst(prefix.count))) else { return nil }
+            body = String(decoding: data, as: UTF8.self)
+        }
+        guard let obj = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any] else { return nil }
+        let nested = obj["token"] as? [String: Any]
+        for candidate in [obj["id_token_email"] as? String, nested?["id_token_email"] as? String, obj["email"] as? String] {
+            if let email = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), email.contains("@") {
+                return email
+            }
+        }
+        for jwt in [obj["id_token"] as? String, nested?["id_token"] as? String] {
+            if let jwt, let email = decodeJWTEmail(jwt) { return email }
+        }
+        return nil
+    }
+
+    private static func decodeJWTEmail(_ jwt: String) -> String? {
+        let parts = jwt.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+        var b64 = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let rem = b64.count % 4
+        if rem != 0 { b64 += String(repeating: "=", count: 4 - rem) }
+        guard let data = Data(base64Encoded: b64),
+              let claims = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let email = claims["email"] as? String, email.contains("@") else { return nil }
+        return email
     }
 
     /// Read `account`'s quota with its keychain value, cache it, and return it. A failure keeps the

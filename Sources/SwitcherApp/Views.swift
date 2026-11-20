@@ -19,6 +19,7 @@ struct MenuView: View {
     @State private var removing: String?
     @State private var renaming: String?
     @State private var confirmingAdd: Bool
+    @State private var creatingSandbox = false
     @State private var listHeight: CGFloat = 0
     @AppStorage("ccSameOfferDismissed") private var ccSameDismissed = false
     @Environment(\.staticRender) private var staticRender
@@ -79,6 +80,7 @@ struct MenuView: View {
             removing = nil
             renaming = nil
             confirmingAdd = false
+            creatingSandbox = false
             listHeight = 0
         }
         .task(id: model.banner?.id) {
@@ -149,14 +151,37 @@ struct MenuView: View {
                         "有一次切换被中断，下次退出 \(app) 时会自动完成或撤销。"), tint: .orange)
                         .padding(.horizontal, Metrics.rowH)
                 }
-                if board.rows.isEmpty {
+                if board.rows.isEmpty && board.provider != .antigravity {
                     EmptyState(
                         symbol: "person.crop.circle.badge.plus",
                         title: L.t("No accounts yet", "还没有账号"),
                         text: L.t("Sign in to \(app). The account appears here, and Add Account brings in the next one.",
                                   "登录 \(app) 后账号会出现在这里，再用“添加账号…”加入下一个。"))
                 } else {
-                    singleScroll { desktopRows(board) }
+                    singleScroll {
+                        VStack(alignment: .leading, spacing: 6) {
+                            if board.rows.isEmpty {
+                                EmptyState(
+                                    symbol: "person.crop.circle.badge.plus",
+                                    title: L.t("No accounts yet", "还没有账号"),
+                                    text: L.t("Sign in to \(app). The account appears here, and Add Account brings in the next one.",
+                                              "登录 \(app) 后账号会出现在这里，再用“添加账号…”加入下一个。"))
+                            } else {
+                                desktopRows(board)
+                            }
+                            if board.provider == .antigravity {
+                                AntigravitySandboxesSection(
+                                    model: model,
+                                    creating: $creatingSandbox,
+                                    removing: $removing,
+                                    renaming: $renaming,
+                                    forcedHover: staged.hover
+                                )
+                                .disabled(busy)
+                                .allowsHitTesting(!busy)
+                            }
+                        }
+                    }
                 }
             }
             desktopActions(board)
@@ -439,7 +464,7 @@ struct ToolTabs: View {
                 if st == .out { return .red }
                 if st == .low { return .orange }
             }
-            return model.board(.antigravity)?.running == true ? .green : nil
+            return (model.board(.antigravity)?.running == true || model.runningSandboxCount > 0) ? .green : nil
         case .claudeCode:
             return cliDot(.claude)
         case .codex:
@@ -630,7 +655,10 @@ private struct OverviewToolCard: View {
             if !b.installed {
                 Tag(text: L.t("Not installed", "未安装"))
             } else {
-                StatusDot(running: b.running)
+                StatusDot(running: b.running || (p == .antigravity && model.runningSandboxCount > 0))
+                if p == .antigravity && model.runningSandboxCount > 0 {
+                    Tag(text: L.t("+\(model.runningSandboxCount) parallel", "+\(model.runningSandboxCount) 并行"))
+                }
             }
         } else if let k = tool.cliKind, let b = model.cliBoard(k) {
             if !b.shimInstalled && b.commandFound {

@@ -8,6 +8,7 @@ Antigravity, and shows each Antigravity account's quota. SwiftPM, Swift 6 toolch
   - `SignInVault.swift`: journaled, all-or-nothing swap of one app's sign-in; `recover()` after a crash.
   - `Providers.swift`: what each app's sign-in is (`claudeLayout`, `antigravityLayout`) and the switch flow.
   - `Switchboard.swift`: the facade the app and CLI use.
+  - `AntigravitySandboxes.swift`: parallel Antigravity App & `agy` CLI sandboxes (`~/.antigravity-sandboxes/<name>`, isolated `HOME` + `--user-data-dir` + file-backed token fallback + auto-healing).
   - `CLIProfiles.swift`: Claude Code / Codex profile folders, the pointer, shared-item symlinks, `CLIEnv`, the keychain service name.
   - `CLIShim.swift`: the PATH shim scripts and the `~/.zshrc` block (`switcher cli install` / `uninstall`).
   - `CLIAccounts.swift`: who each profile is signed in as, the read-only keychain reader and `doctor`.
@@ -18,14 +19,17 @@ Antigravity, and shows each Antigravity account's quota. SwiftPM, Swift 6 toolch
 - `scripts/bundle.sh`: builds `dist/Switcher.app`.
 
 ## Rules
-- Tests run only on temp dirs (`Sandbox` in `Tests/SwitcherCoreTests/SwitchTests.swift`) with `FakeApp`
-  and `MemorySecrets`. Never `Env.live`, the real keychain or real app processes from a test.
+- Tests run only on temp dirs (`Sandbox` in `Tests/SwitcherCoreTests/SwitchTests.swift`) with `FakeApp`,
+  `FakeSandboxProcessControl` and `MemorySecrets`. Never `Env.live`, the real keychain or real app processes from a test.
 - Never run a real switch, import or sync against the owner's data without their explicit go.
 - Sign-ins move (rename), never copy: a saved copy is put back at most once.
 - Claude's sign-in format must stay compatible with cc-same's `logins/<uuid>` folders.
 - Antigravity sign-in = keychain `gemini`/`antigravity` (go-keyring) + `app_storage.json` onboarding keys
   (`agy.onboarding.*` since 2.3x, `jetski.onboarding.*` before) + the 2.30 token file
   `~/.gemini/jetski-standalone-oauth-token`. Verified by live switches on 2.31; re-check after updates.
+- Parallel Antigravity sandboxes never copy host tokens/credentials and use `SWITCHER_AGY_SANDBOX` /
+  `SWITCHER_AGY_SANDBOX_ROLE` so switching the main Antigravity app never stops running sandboxes, and
+  stopping a sandbox window never stops concurrent `agy` CLI terminals.
 - CLI accounts never move credentials: switching only rewrites the pointer file.
 - CLI paths are Strings end to end, never URL round trips. Claude Code's keychain name is sha256 of the
   raw `CLAUDE_CONFIG_DIR` string, so a symlink or trailing slash changes it; the default account leaves

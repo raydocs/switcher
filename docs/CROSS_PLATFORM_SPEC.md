@@ -30,6 +30,7 @@ This document freezes the on-disk state schemas, security invariants, and CLI JS
 | CLI PATH shims | `~/.local/share/switcher/bin` (`claude`, `codex`) | `%LOCALAPPDATA%\Switcher\bin` (`claude.cmd`, `codex.cmd`) |
 | Claude Code profiles | `~/.claude` (default), `~/.claude-profiles/<name>` | `%USERPROFILE%\.claude`, `%USERPROFILE%\.claude-profiles\<name>` |
 | Codex profiles | `~/.codex` (default), `~/.codex-profiles/<name>` | `%USERPROFILE%\.codex`, `%USERPROFILE%\.codex-profiles\<name>` |
+| Antigravity parallel sandboxes | `~/.antigravity-sandboxes/<name>` (`home/`, `data/`, `sandbox.json`) | `%USERPROFILE%\.antigravity-sandboxes\<name>` (`home\`, `data\`, `sandbox.json`) |
 | Desktop secrets | macOS Login Keychain (`security` / SecItem) | Windows Credential Manager (`CredWriteW` / DPAPI) |
 
 ---
@@ -148,6 +149,21 @@ Map of `<lowercased-email>` → `AntigravityQuota`:
 - `resetBucket` is rounded to 5-minute increments (`300s`) to prevent duplicate notifications from minor clock jitter.
 - Entries older than 30 days are automatically pruned.
 
+### 3.7 Antigravity Parallel Sandboxes (`~/.antigravity-sandboxes/<name>/sandbox.json`)
+```json
+{
+  "alias": "Work 2",
+  "createdAt": "2026-11-19T22:00:00Z",
+  "defaultWorkspace": null,
+  "lastAppVersion": "2.31.0",
+  "linkPolicy": "minimal",
+  "name": "acc2"
+}
+```
+- Valid `<name>`: `1...64` of `[A-Za-z0-9._-]`, not starting with `.` or `-`, and not `"default"` or `"main"`.
+- Quota cache entries for sandboxes live in `<state>/antigravity-usage.json` under key `"sandbox:<name>"`.
+- Process isolation tags: `SWITCHER_AGY_SANDBOX=<name>` and `SWITCHER_AGY_SANDBOX_ROLE=app|cli` (plus `SSH_CONNECTION`, `SSH_CLIENT`, `WSL_INTEROP=1`, and far-future `antigravity-keyring-unavailable` cache markers).
+
 ---
 
 ## 4. Machine-Readable CLI Contract (`switcher.usage.v1`)
@@ -168,3 +184,4 @@ To share logic cleanly when building Switcher for Windows (Swift on Windows or R
 2. **`AppController`**: abstract `NSRunningApplication` graceful quit/launch behind Win32 `WM_CLOSE` → process exit wait → `ShellExecuteExW` / `CreateProcessW`.
 3. **`CLIShim`**: generate lightweight `.cmd` + PowerShell wrapper shims in `%LOCALAPPDATA%\Switcher\bin` prepended to User `PATH`, honoring identical `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `SWITCHER_BYPASS=1` semantics.
 4. **Shared CLI links**: use NTFS directory junctions (`mklink /J`) and file hardlinks/symlinks (without requiring Developer Mode where junctions suffice) for shared CLI config folders, keeping auth files strictly per-profile.
+5. **Antigravity parallel sandboxes**: mirror `HOME` isolation with `USERPROFILE`, `APPDATA`, and `LOCALAPPDATA` pointed into `<sandbox>\home\`, pass `--user-data-dir=<sandbox>\data`, set `SSH_CONNECTION` / `SSH_CLIENT` / `WSL_INTEROP=1` + `antigravity-keyring-unavailable` markers, and use `SWITCHER_AGY_SANDBOX` / `SWITCHER_AGY_SANDBOX_ROLE` for process matching.

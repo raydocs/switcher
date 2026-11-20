@@ -10,6 +10,7 @@ struct AccountsSettings: View {
     @State private var renaming: String?
     @State private var dragging: String?
     @State private var dropTarget: String?
+    @State private var creatingSandbox = false
 
     init(model: AppModel, staged: SettingsPage.Staged = .init()) {
         self.model = model
@@ -19,6 +20,9 @@ struct AccountsSettings: View {
     }
 
     private var visibleCLIBoards: [CLIBoard] { model.cliBoards.filter { !$0.isAbsent } }
+    private var showSandboxes: Bool {
+        !model.sandboxes.isEmpty || (model.board(.antigravity)?.installed == true)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Metrics.settingsGap) {
@@ -38,6 +42,9 @@ struct AccountsSettings: View {
                     "拖动桌面应用账号可以调整顺序。这里的顺序就是菜单里的顺序，也是“下一个账号”依次切换的顺序。"))
                     .padding(.horizontal, Metrics.cardPad)
             }
+            if showSandboxes {
+                sandboxesSection
+            }
             ForEach(visibleCLIBoards) { board in
                 cliSection(board)
             }
@@ -48,6 +55,53 @@ struct AccountsSettings: View {
             model.refreshCLI()
         }
         .onDisappear { model.surfaceDisappeared() }
+    }
+
+    @ViewBuilder private var sandboxesSection: some View {
+        let n = model.sandboxes.count
+        VStack(alignment: .leading, spacing: 6) {
+            SectionHeader(
+                symbol: "square.on.square",
+                title: L.t("Antigravity Parallel Sandboxes", "Antigravity 并行分身"),
+                detail: n == 0 ? nil : (n == 1 ? L.t("1 sandbox", "1 个分身") : L.t("\(n) sandboxes", "\(n) 个分身"))
+            ) {
+                if !creatingSandbox {
+                    Button {
+                        removing = nil
+                        renaming = nil
+                        creatingSandbox = true
+                    } label: {
+                        Label(L.t("New…", "新建…"), systemImage: "plus")
+                    }
+                    .buttonStyle(QuietButtonStyle())
+                    .font(.subheadline)
+                }
+            }
+            if creatingSandbox {
+                NewSandboxCard(model: model, creating: $creatingSandbox)
+            }
+            SettingsCard {
+                if model.sandboxes.isEmpty {
+                    EmptyState(
+                        symbol: "square.on.square",
+                        title: L.t("No parallel sandboxes yet", "还没有并行分身"),
+                        text: L.t(
+                            "Create a sandbox to run extra Antigravity desktop windows and `agy` CLI terminals side-by-side on separate accounts.",
+                            "创建分身后，可同时运行多个独立账号的 Antigravity 桌面窗口与 agy 终端。"))
+                } else {
+                    ForEach(Array(model.sandboxes.enumerated()), id: \.element.id) { index, sandbox in
+                        if index > 0 { RowDivider() }
+                        SandboxRowView(
+                            model: model,
+                            sandbox: sandbox,
+                            removing: $removing,
+                            renaming: $renaming,
+                            forcedHover: staged.hover == AntigravitySandboxesSection.rowKey(sandbox)
+                        )
+                    }
+                }
+            }
+        }
     }
 
     @ViewBuilder private func cliSection(_ board: CLIBoard) -> some View {

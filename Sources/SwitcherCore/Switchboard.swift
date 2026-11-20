@@ -56,12 +56,15 @@ public final class Switchboard {
     /// Whether cc-same's app or agent runs (replaced in tests).
     public var ccSameRunning: () -> Bool = CCSameImport.isRunning
     public let antigravityUsage: AntigravityUsage
+    public let sandboxes: AntigravitySandboxes
 
-    public init(env: Env = .live, claude: Provider? = nil, antigravity: Provider? = nil) {
+    public init(env: Env = .live, claude: Provider? = nil, antigravity: Provider? = nil,
+                sandboxes: AntigravitySandboxes? = nil, antigravityUsage: AntigravityUsage? = nil) {
         self.env = env
         self.claude = claude ?? .claude(env: env)
         self.antigravity = antigravity ?? .antigravity(env: env)
-        self.antigravityUsage = AntigravityUsage(env: env)
+        self.antigravityUsage = antigravityUsage ?? AntigravityUsage(env: env)
+        self.sandboxes = sandboxes ?? AntigravitySandboxes(env: env)
     }
 
     public func provider(_ id: ProviderID) -> Provider {
@@ -127,6 +130,11 @@ public final class Switchboard {
         }
     }
 
+    /// Parallel Antigravity sandboxes with their live running state and last cached quotas.
+    public func sandboxBoard() -> [AntigravitySandbox] {
+        sandboxes.list(quotas: antigravityUsage.cached())
+    }
+
     /// Every Antigravity account's keychain value: the live one for the account in use, the saved
     /// copy for the others.
     public func antigravityKeyrings() -> [(account: String, value: String)] {
@@ -142,13 +150,19 @@ public final class Switchboard {
         return out
     }
 
-    /// Read every Antigravity account's quota from Google, a few at a time.
+    /// Read every Antigravity account's quota from Google (both main/saved accounts and parallel
+    /// sandboxes), concurrently.
     @discardableResult
     public func refreshAntigravityUsage() async -> [String: AntigravityQuota] {
         let usage = antigravityUsage
+        let mainTokens = antigravityKeyrings()
+        let sandboxTokens = sandboxes.allTokenPayloads()
         return await withTaskGroup(of: (String, AntigravityQuota).self) { group in
-            for (account, value) in antigravityKeyrings() {
+            for (account, value) in mainTokens {
                 group.addTask { (account, await usage.refresh(account: account, keyring: value)) }
+            }
+            for item in sandboxTokens {
+                group.addTask { (item.key, await usage.refresh(account: item.key, keyring: item.payload)) }
             }
             var out: [String: AntigravityQuota] = [:]
             for await (a, q) in group { out[a] = q }
